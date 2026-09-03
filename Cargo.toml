@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/api",
+    "crates/cli",
+    "crates/crypto",
+    "crates/storage",
+    "crates/audit",
+    "crates/hardware",
+    "crates/consensus",
+    "crates/anomaly",
+    "crates/sim",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+authors = ["MuaazTasawar"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "unwind"
