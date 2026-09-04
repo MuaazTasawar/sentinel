@@ -8,6 +8,10 @@ pub enum StorageError {
     Backend(String),
 }
 
+/// Pluggable storage backend for encrypted secret blobs. The vault only
+/// ever stores ciphertext through this trait — encryption/decryption
+/// happens one layer up (in the `api` crate, using `sentinel-crypto`),
+/// so a storage backend can never see plaintext even if it's compromised.
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError>;
@@ -16,4 +20,5 @@ pub trait Storage: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
 }
 
-// mod sled_backend;   // Phase 2
+mod sled_backend;
+pub use sled_backend::SledStorage;
