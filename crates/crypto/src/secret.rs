@@ -4,7 +4,8 @@ use zeroize::Zeroize;
 /// A byte buffer holding sensitive key material.
 ///
 /// Two protections are applied:
-/// 1. The memory is `mlock`'d so the OS never pages it to swap/disk.
+/// 1. The memory is locked (`mlock` on Unix, `VirtualLock` on Windows) so
+///    the OS never pages it to swap/disk.
 /// 2. The buffer is zeroized on drop so freed memory doesn't leave secrets
 ///    lingering on the heap for a later allocation to read.
 pub struct SecretBytes {
@@ -15,9 +16,9 @@ pub struct SecretBytes {
 impl SecretBytes {
     pub fn new(mut buf: Vec<u8>) -> Self {
         // Shrink first so the allocation is exactly `buf.len()` bytes —
-        // mlock covers exactly this range, and shrinking after locking
-        // could trigger a reallocation that silently moves the secret
-        // to an unlocked page.
+        // the lock covers exactly this range, and shrinking after locking
+        // could trigger a reallocation that silently moves the secret to
+        // an unlocked page.
         buf.shrink_to_fit();
         let locked = Self::lock(&buf);
         Self { buf, locked }
@@ -27,6 +28,7 @@ impl SecretBytes {
         Self::new(vec![0u8; len])
     }
 
+    #[cfg(unix)]
     fn lock(buf: &[u8]) -> bool {
         if buf.is_empty() {
             return false;
@@ -42,6 +44,39 @@ impl SecretBytes {
         ret == 0
     }
 
+    #[cfg(windows)]
+    fn lock(buf: &[u8]) -> bool {
+        if buf.is_empty() {
+            return false;
+        }
+        // SAFETY: same argument as the Unix branch — `buf` is valid for
+        // `buf.len()` bytes and stable for the duration of this call.
+        // `VirtualLock` (like `mlock`) only pins the pages against paging
+        // to disk; it does not read or write through the pointer, so the
+        // call is sound regardless of whether Windows grants the lock
+        // (checked via the returned BOOL, not assumed). Windows requires
+        // the process's working-set minimum to accommodate the locked
+        // range; on failure we fall back to zeroize-only protection
+        // rather than panicking, since a missed mlock is a defense-in-
+        // depth gap, not a memory-safety violation.
+        let ret = unsafe {
+            windows_sys::Win32::System::Memory::VirtualLock(
+                buf.as_ptr() as *const core::ffi::c_void,
+                buf.len(),
+            )
+        };
+        ret != 0
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn lock(_buf: &[u8]) -> bool {
+        // No mlock-equivalent wired up for this target yet; zeroize-on-drop
+        // still applies, so this is a reduced-defense fallback, not a
+        // silent no-op pretending to be full protection.
+        false
+    }
+
+    #[cfg(unix)]
     fn unlock(buf: &[u8]) {
         if buf.is_empty() {
             return;
@@ -56,6 +91,25 @@ impl SecretBytes {
             libc::munlock(buf.as_ptr() as *const libc::c_void, buf.len());
         }
     }
+
+    #[cfg(windows)]
+    fn unlock(buf: &[u8]) {
+        if buf.is_empty() {
+            return;
+        }
+        // SAFETY: mirrors the Windows `lock` branch. Called from
+        // `Drop::drop` on the exact range previously passed to
+        // `VirtualLock`, before `buf` is deallocated.
+        unsafe {
+            windows_sys::Win32::System::Memory::VirtualUnlock(
+                buf.as_ptr() as *const core::ffi::c_void,
+                buf.len(),
+            );
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn unlock(_buf: &[u8]) {}
 
     pub fn expose(&self) -> &[u8] {
         &self.buf
@@ -96,9 +150,6 @@ impl Drop for SecretBytes {
     }
 }
 
-// Never let SecretBytes be printed or logged with its contents — this is
-// the type-level guard against a stray `tracing::debug!(?secret)` leaking
-// key material into logs.
 impl std::fmt::Debug for SecretBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretBytes")
