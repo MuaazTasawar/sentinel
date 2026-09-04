@@ -4,5 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+sentinel-crypto = { version = "0.1.0", path = "../crypto" }
 thiserror = "2.0.20"
 yubikey = { version = "0.8.0", features = ["untested"] }
+
+[dev-dependencies]
+rand = "0.8"
