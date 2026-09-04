@@ -1996,6 +1996,7 @@ dependencies = [
  "sentinel-audit",
  "sentinel-crypto",
  "sentinel-hardware",
+ "serde_json",
 ]
 
 [[package]]
