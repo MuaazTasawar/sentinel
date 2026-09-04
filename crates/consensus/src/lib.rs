@@ -1,3 +1,11 @@
+pub mod log;
+pub mod rpc;
+pub mod state;
+
+pub use log::{LogEntry, LogError, ReplicatedLog};
+pub use rpc::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
+pub use state::{RaftState, Role};
+
 #[derive(thiserror::Error, Debug)]
 pub enum ConsensusError {
     #[error("not the leader")]
@@ -5,9 +13,3 @@ pub enum ConsensusError {
     #[error("term mismatch: local {local}, remote {remote}")]
     TermMismatch { local: u64, remote: u64 },
 }
-
-// mod log;        // Phase 5
-// mod rpc;        // Phase 5
-// mod state;      // Phase 5
-// mod election;   // Phase 6
-// mod actor;      // Phase 6
