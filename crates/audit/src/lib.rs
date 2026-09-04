@@ -1,7 +1,2 @@
-#[derive(thiserror::Error, Debug)]
-pub enum AuditError {
-    #[error("chain integrity violation at index {0}: hash mismatch")]
-    ChainBroken(u64),
-}
-
-// mod chain;   // Phase 3
+mod chain;
+pub use chain::{AuditChain, AuditEntry, AuditError, GENESIS_HASH};

@@ -1,3 +1,7 @@
+mod verify;
+
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -11,15 +15,21 @@ struct Cli {
 enum Commands {
     /// Unseal a node using a quorum of hardware keys (Phase 4).
     Unseal,
-    /// Verify the tamper-evident audit log chain (Phase 3).
-    Verify,
+    /// Verify the tamper-evident audit log chain.
+    Verify {
+        /// Path to the JSON-encoded audit log to check.
+        #[arg(default_value = "audit-log.json")]
+        path: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Unseal => println!("unseal: not yet implemented (Phase 4)"),
-        Commands::Verify => println!("verify: not yet implemented (Phase 3)"),
+        Commands::Unseal => {
+            println!("unseal: not yet implemented (Phase 4)");
+            Ok(())
+        }
+        Commands::Verify { path } => verify::run(path),
     }
-    Ok(())
 }
