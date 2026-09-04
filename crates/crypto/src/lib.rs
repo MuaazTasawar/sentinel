@@ -1,8 +1,9 @@
 mod error;
+pub mod envelope;
+pub mod kdf;
+pub mod secret;
 
 pub use error::CryptoError;
+pub use secret::SecretBytes;
 
-// mod envelope;   // Phase 1
-// mod kdf;        // Phase 1
-// mod secret;     // Phase 1
-// mod shamir;     // Phase 2
+// mod shamir;   // Phase 2
