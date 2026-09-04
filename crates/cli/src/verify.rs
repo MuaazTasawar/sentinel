@@ -49,8 +49,8 @@ mod tests {
         chain.append("node started");
         chain.append("secret written: db-password");
 
-        let dir = tempfile_dir();
-        let path = dir.join("audit.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.json");
         write_chain(&path, &chain);
 
         assert!(run(path).is_ok());
@@ -62,20 +62,15 @@ mod tests {
         chain.append("node started");
         chain.append("secret written: db-password");
 
+        // Simulate a tampered file: parse back, mutate, re-write.
         let json = serde_json::to_string(chain.entries()).unwrap();
         let mut entries: Vec<sentinel_audit::AuditEntry> = serde_json::from_str(&json).unwrap();
         entries[1].event = "secret written: something-else".to_string();
 
-        let dir = tempfile_dir();
-        let path = dir.join("audit.json");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.json");
         std::fs::write(&path, serde_json::to_string_pretty(&entries).unwrap()).unwrap();
 
         assert!(run(path).is_err());
-    }
-
-    fn tempfile_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("sentinel-cli-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 }

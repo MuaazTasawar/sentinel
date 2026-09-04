@@ -1997,6 +1997,7 @@ dependencies = [
  "sentinel-crypto",
  "sentinel-hardware",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
