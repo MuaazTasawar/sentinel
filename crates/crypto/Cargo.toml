@@ -8,6 +8,7 @@ aes-gcm = "0.10.3"
 argon2 = "0.5.3"
 hkdf = "0.12.4"
 rand = "0.8.8"
+serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.10.9"
 thiserror = "2.0.20"
 vsss-rs = "6.0.1"

@@ -1,10 +1,11 @@
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 
 /// A single Shamir share: an x-coordinate and the y-value for every byte
 /// of the split secret (so an N-byte secret produces shares whose `y` is
 /// also N bytes — each byte is a separate, independent GF(256) polynomial
 /// evaluation).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShamirShare {
     pub x: u8,
     pub y: Vec<u8>,
@@ -26,10 +27,6 @@ pub enum ShamirError {
     DuplicateShare(u8),
 }
 
-// GF(2^8) multiplication using the AES/Rijndael reduction polynomial
-// x^8 + x^4 + x^3 + x + 1 (0x11B), via peasant multiplication with
-// reduction on overflow. This is the standard finite field used by
-// Shamir's Secret Sharing implementations (e.g. Schneier's `ssss`).
 fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut product: u8 = 0;
     for _ in 0..8 {
@@ -46,9 +43,6 @@ fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     product
 }
 
-// a^254 = a^-1 in GF(256), since the multiplicative group has order 255.
-// Computed via repeated squaring so it's O(log n) multiplications rather
-// than a 255-step loop.
 fn gf_inv(a: u8) -> u8 {
     debug_assert!(a != 0, "zero has no multiplicative inverse in GF(256)");
     let a2 = gf_mul(a, a);
@@ -58,7 +52,6 @@ fn gf_inv(a: u8) -> u8 {
     let a32 = gf_mul(a16, a16);
     let a64 = gf_mul(a32, a32);
     let a128 = gf_mul(a64, a64);
-    // 254 = 128 + 64 + 32 + 16 + 8 + 4 + 2 = 0b11111110
     let mut r = a128;
     r = gf_mul(r, a64);
     r = gf_mul(r, a32);
@@ -70,8 +63,6 @@ fn gf_inv(a: u8) -> u8 {
 }
 
 fn split_byte(secret_byte: u8, threshold: u8, total_shares: u8, rng: &mut impl RngCore) -> Vec<(u8, u8)> {
-    // Random polynomial of degree (threshold - 1) whose constant term is
-    // the secret byte: p(x) = secret + c1*x + c2*x^2 + ... + c_{t-1}*x^{t-1}.
     let mut coeffs = Vec::with_capacity(threshold as usize);
     coeffs.push(secret_byte);
     let mut rand_byte = [0u8; 1];
@@ -83,7 +74,7 @@ fn split_byte(secret_byte: u8, threshold: u8, total_shares: u8, rng: &mut impl R
     (1..=total_shares)
         .map(|x| {
             let mut y = 0u8;
-            let mut x_pow = 1u8; // x^0
+            let mut x_pow = 1u8;
             for &c in &coeffs {
                 y ^= gf_mul(c, x_pow);
                 x_pow = gf_mul(x_pow, x);
@@ -94,9 +85,6 @@ fn split_byte(secret_byte: u8, threshold: u8, total_shares: u8, rng: &mut impl R
 }
 
 fn combine_byte(points: &[(u8, u8)]) -> u8 {
-    // Lagrange interpolation evaluated at x = 0: secret = sum_i y_i * L_i(0),
-    // where in GF(2) arithmetic "0 - x_j" is just "x_j" and subtraction is
-    // XOR, so L_i(0) = product_{j != i} x_j / (x_i XOR x_j).
     let mut secret = 0u8;
     for (i, &(xi, yi)) in points.iter().enumerate() {
         let mut numerator = 1u8;
@@ -113,11 +101,6 @@ fn combine_byte(points: &[(u8, u8)]) -> u8 {
     secret
 }
 
-/// Splits `secret` into `total_shares` shares such that any `threshold`
-/// of them reconstruct it exactly, and any fewer reveal nothing about it
-/// (information-theoretic security, not just computational — this is
-/// Shamir's classic guarantee). Each byte of the secret is split with an
-/// independent random polynomial.
 pub fn split_secret(
     secret: &[u8],
     threshold: u8,
@@ -134,8 +117,6 @@ pub fn split_secret(
         return Err(ShamirError::TooManyShares(0));
     }
 
-    // x-coordinates run 1..=total_shares (0 is reserved: that's the point
-    // that encodes the secret itself, and must never be handed out).
     let mut per_share_bytes: Vec<Vec<u8>> = (0..total_shares).map(|_| Vec::with_capacity(secret.len())).collect();
     for &byte in secret {
         let points = split_byte(byte, threshold, total_shares, rng);
@@ -150,12 +131,6 @@ pub fn split_secret(
         .collect())
 }
 
-/// Reconstructs the original secret from `shares`. Any `threshold` (or
-/// more) correct shares reproduce the exact secret; fewer than that, or
-/// the wrong shares, silently produce garbage — Shamir provides no
-/// integrity check on its own, which is why Sentinel always verifies the
-/// reconstructed KEK against the audit-log HMAC before trusting an
-/// unseal (Phase 4).
 pub fn combine_shares(shares: &[ShamirShare]) -> Result<Vec<u8>, ShamirError> {
     if shares.len() < 2 {
         return Err(ShamirError::InsufficientSharesToCombine(shares.len()));
@@ -214,8 +189,6 @@ mod tests {
     fn below_threshold_does_not_reconstruct_correctly() {
         let secret = b"12345678901234567890123456789012";
         let shares = split_secret(secret, 3, 5, &mut OsRng).unwrap();
-        // Only 2 of the required 3 shares — Shamir gives no integrity
-        // signal here, it just silently produces the wrong bytes.
         let recovered = combine_shares(&shares[..2]).unwrap();
         assert_ne!(recovered, secret);
     }
