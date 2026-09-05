@@ -29,16 +29,19 @@ pub trait Transport: Send + Sync {
 enum RaftMessage {
     RequestVote(RequestVoteRequest, oneshot::Sender<RequestVoteResponse>),
     AppendEntries(AppendEntriesRequest, oneshot::Sender<AppendEntriesResponse>),
+    /// Submit a new command for replication. Only succeeds if this node
+    /// is currently the leader.
     Propose(Vec<u8>, oneshot::Sender<Result<u64, ConsensusError>>),
+    /// Internal: a vote response arriving from a spawned RPC task. This
+    /// is what lets the actor collect votes without ever awaiting a
+    /// peer's response inside its own message loop — see the comment
+    /// on the election-timeout arm below for why that distinction is
+    /// load-bearing, not stylistic.
+    VoteResult(RequestVoteResponse, u64),
+    /// Test/ops inspection hook: current (role, term, commit_index).
     Inspect(oneshot::Sender<(Role, u64, u64)>),
 }
 
-/// A cheap, cloneable reference to a running actor's mailbox. Talking to
-/// the actor always means sending a message and awaiting the reply —
-/// there is no shared, lockable `RaftState` anywhere outside the actor
-/// task itself, which is the whole point of the actor model here: no
-/// mutex means no risk of a caller observing or mutating state the
-/// actor's own timer logic isn't expecting.
 #[derive(Clone)]
 pub struct RaftHandle {
     sender: mpsc::Sender<RaftMessage>,
@@ -77,10 +80,6 @@ pub struct ElectionTimeoutRange {
 }
 
 impl Default for ElectionTimeoutRange {
-    /// The Raft paper's own reference range (§5.2, §9.3): wide enough
-    /// relative to heartbeat interval and network latency that split
-    /// votes are rare, narrow enough that a leader failure is noticed
-    /// quickly.
     fn default() -> Self {
         Self { min_ms: 150, max_ms: 300 }
     }
@@ -91,11 +90,6 @@ fn random_election_timeout(range: ElectionTimeoutRange) -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Spawns the actor task and returns a handle to talk to it. Every timer
-/// and every piece of message-passing lives here; every decision about
-/// *what* a message or a timeout should do is delegated to `RaftState`
-/// (Phase 5), which stays fully synchronous, lock-free, and unit-
-/// testable without any of this async machinery.
 pub fn spawn_raft_actor(
     node_id: u64,
     peers: Vec<u64>,
@@ -104,6 +98,7 @@ pub fn spawn_raft_actor(
     election_timeout_range: ElectionTimeoutRange,
 ) -> RaftHandle {
     let (tx, mut rx) = mpsc::channel(64);
+    let self_tx = tx.clone();
 
     tokio::spawn(async move {
         let mut state = RaftState::new(node_id);
@@ -138,6 +133,12 @@ pub fn spawn_raft_actor(
                                 let _ = reply.send(Ok(index));
                             }
                         }
+                        RaftMessage::VoteResult(resp, peer) => {
+                            let cluster_size = peers.len() + 1;
+                            if state.record_vote(resp, peer, cluster_size) {
+                                state.become_leader();
+                            }
+                        }
                         RaftMessage::Inspect(reply) => {
                             let _ = reply.send((state.role, state.current_term, state.commit_index));
                         }
@@ -147,21 +148,29 @@ pub fn spawn_raft_actor(
                 _ = tokio::time::sleep_until(election_deadline), if state.role != Role::Leader => {
                     let vote_req = state.become_candidate();
                     election_deadline = Instant::now() + random_election_timeout(election_timeout_range);
-                    let cluster_size = peers.len() + 1;
 
-                    let mut votes = tokio::task::JoinSet::new();
+                    // CRITICAL: these RPCs are spawned, not awaited here.
+                    // Awaiting peer responses directly inside this
+                    // select! arm would block this actor's own rx.recv()
+                    // branch for as long as the election takes — and if
+                    // two nodes' timers fire close together, each would
+                    // be blocked waiting on the other's vote while unable
+                    // to answer the other's RequestVote, deadlocking both
+                    // (this is not hypothetical: an earlier version of
+                    // this file did exactly that and hung real clusters
+                    // under real timing). Reporting results back through
+                    // our own mailbox as a `VoteResult` message is what
+                    // keeps the actor responsive to incoming RPCs for the
+                    // entire duration of its own campaign.
                     for &peer in &peers {
                         let transport = transport.clone();
                         let vote_req = vote_req.clone();
-                        votes.spawn(async move { (peer, transport.send_request_vote(peer, vote_req).await) });
-                    }
-                    while let Some(joined) = votes.join_next().await {
-                        let Ok((peer, result)) = joined else { continue };
-                        if let Ok(resp) = result {
-                            if state.role == Role::Candidate && state.record_vote(resp, peer, cluster_size) {
-                                state.become_leader();
+                        let reply_tx = self_tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(resp) = transport.send_request_vote(peer, vote_req).await {
+                                let _ = reply_tx.send(RaftMessage::VoteResult(resp, peer)).await;
                             }
-                        }
+                        });
                     }
                 }
 
@@ -291,6 +300,47 @@ mod tests {
             final_terms.iter().all(|&t| t == term_after_first_election),
             "term should be stable once a leader is established, got {final_terms:?} (was {term_after_first_election})"
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_elections_do_not_deadlock_under_tight_simultaneous_timeouts() {
+        // A narrow, tight election-timeout window makes near-simultaneous
+        // candidacies far more likely than the wider default range — this
+        // is deliberately adversarial timing designed to reproduce the
+        // mutual-deadlock failure mode (two nodes each campaigning and
+        // each blocked awaiting the other's vote) rather than avoid it.
+        // Every iteration is wrapped in a hard timeout: if the deadlock
+        // this test targets ever regresses, this test fails in ~1s
+        // instead of hanging the whole suite indefinitely the way the
+        // original bug did against a real cluster.
+        for _ in 0..20 {
+            let ids = [1, 2, 3];
+            let (_transport, handles) = spawn_cluster(
+                &ids,
+                Duration::from_millis(5),
+                ElectionTimeoutRange { min_ms: 10, max_ms: 12 },
+            )
+            .await;
+
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let mut leaders = 0;
+                    for &id in &ids {
+                        let (role, _, _) = handles[&id].inspect().await;
+                        if role == Role::Leader {
+                            leaders += 1;
+                        }
+                    }
+                    if leaders == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+
+            assert!(result.is_ok(), "cluster failed to elect a leader within 1s — likely deadlocked");
+        }
     }
 
     #[tokio::test]
