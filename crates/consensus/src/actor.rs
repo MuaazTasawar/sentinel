@@ -136,6 +136,11 @@ pub fn spawn_raft_actor(
                     let vote_req = state.become_candidate();
                     election_deadline = Instant::now() + random_election_timeout(election_timeout_range);
 
+                    if peers.is_empty() {
+                        state.become_leader();
+                        continue;
+                    }
+
                     for &peer in &peers {
                         let transport = transport.clone();
                         let vote_req = vote_req.clone();
@@ -226,6 +231,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_node_cluster_should_elect_itself_leader() {
+        let ids = [1u64];
+        let (_transport, handles) = spawn_cluster(&ids, Duration::from_millis(20), ElectionTimeoutRange { min_ms: 80, max_ms: 150 }).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (role, _, _) = handles[&1].inspect().await;
+        assert_eq!(role, Role::Leader, "a lone node with no peers must still become its own leader");
+    }
+
+    #[tokio::test]
     async fn three_node_cluster_elects_exactly_one_leader() {
         let ids = [1, 2, 3];
         let (_transport, handles) = spawn_cluster(
@@ -278,21 +292,6 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_elections_do_not_deadlock_under_tight_simultaneous_timeouts() {
-        // Tighter than the other tests' timing, to make near-simultaneous
-        // candidacies more likely than usual — but NOT so tight that
-        // split-vote livelock becomes the expected outcome rather than an
-        // edge case. An election-timeout range needs real spread (Raft's
-        // own guidance: meaningfully wider than scheduling/RPC jitter) or
-        // ties become near-guaranteed and every node just re-collides
-        // forever, which is a genuine Raft liveness property (rare split
-        // votes are expected; the algorithm doesn't promise zero), not a
-        // deadlock. An earlier version of this test used a 10-12ms range
-        // (three possible millisecond values) and failed on a real
-        // machine — not because the deadlock fix regressed, but because
-        // that range was pathological enough to make repeated ties the
-        // likely case, especially against Windows' coarser timer
-        // granularity. 30-60ms keeps this adversarial while staying
-        // within the range Raft's design actually expects to work.
         for _ in 0..20 {
             let ids = [1, 2, 3];
             let (_transport, handles) = spawn_cluster(
