@@ -1,8 +1,4 @@
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
 use serde_json::json;
 
 #[derive(thiserror::Error, Debug)]
@@ -13,8 +9,8 @@ pub enum AppError {
     Sealed,
     #[error("unauthorized: {0}")]
     Unauthorized(String),
-    #[error("not the raft leader; redirect to: {0:?}")]
-    NotLeader(Option<String>),
+    #[error("not the raft leader; redirect to node {0:?}")]
+    NotLeader(Option<u64>),
     #[error("storage error: {0}")]
     Storage(#[from] sentinel_storage::StorageError),
     #[error("crypto error: {0}")]

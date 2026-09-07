@@ -5,9 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 axum = "0.8.9"
+bincode = "1.3"
 config = "0.15.25"
 dotenvy = "0.15.7"
+hyper-util = { version = "0.1.20", features = ["tokio", "server", "server-auto"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = "0.23.43"
 rustls-pemfile = "2.2.0"
 sentinel-anomaly = { version = "0.1.0", path = "../anomaly" }
@@ -25,3 +29,9 @@ tower = "0.5.3"
 tower-http = { version = "0.7.1", features = ["trace", "cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+x509-parser = "0.16"
+
+[dev-dependencies]
+pem = "3"
+rcgen = "0.13"
+tempfile = "3"

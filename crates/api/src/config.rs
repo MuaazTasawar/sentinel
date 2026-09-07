@@ -2,21 +2,13 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
-    /// This node's unique id within the Raft cluster.
     pub node_id: u64,
-    /// Address the client-facing mTLS API binds to.
     pub api_bind_addr: String,
-    /// Address the Raft peer RPC listener binds to.
     pub raft_bind_addr: String,
-    /// Static list of peer addresses for cluster bootstrap.
     pub peers: Vec<String>,
-    /// Path to the sled storage directory.
     pub storage_path: String,
-    /// Path to this node's TLS certificate.
     pub tls_cert_path: String,
-    /// Path to this node's TLS private key.
     pub tls_key_path: String,
-    /// Path to the CA cert used to verify client/peer certs (mTLS).
     pub ca_cert_path: String,
 }
 
@@ -27,5 +19,24 @@ impl NodeConfig {
             .add_source(config::File::with_name(".env").required(false))
             .build()?;
         Ok(cfg.try_deserialize()?)
+    }
+
+    /// Parses `peers` (each entry formatted `"<node_id>=<base_url>"`,
+    /// e.g. `"2=https://10.0.0.2:8443"`) into a lookup table for
+    /// `HttpTransport`. Fails loudly at startup on a malformed entry
+    /// rather than silently dropping a peer, since a dropped peer is the
+    /// kind of misconfiguration that's easy to miss until an election
+    /// mysteriously can't reach quorum.
+    pub fn parse_peer_addrs(&self) -> anyhow::Result<std::collections::HashMap<u64, String>> {
+        self.peers
+            .iter()
+            .map(|entry| {
+                let (id_str, addr) = entry
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("malformed peer entry {entry:?}, expected \"<node_id>=<url>\""))?;
+                let id: u64 = id_str.parse().map_err(|_| anyhow::anyhow!("invalid node id in peer entry {entry:?}"))?;
+                Ok((id, addr.to_string()))
+            })
+            .collect()
     }
 }

@@ -11,6 +11,7 @@ pub const KEY_LEN: usize = 32;
 /// Result of an envelope-encryption operation: a Data Encryption Key
 /// (DEK) that was generated fresh, encrypted under the caller's Key
 /// Encryption Key, plus the ciphertext that DEK protects.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct EnvelopeCiphertext {
     pub encrypted_dek: Vec<u8>,
     pub dek_nonce: [u8; NONCE_LEN],
