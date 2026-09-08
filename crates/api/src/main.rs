@@ -51,7 +51,20 @@ async fn main() -> anyhow::Result<()> {
         sentinel_consensus::ElectionTimeoutRange::default(),
     );
 
-    let app_state = AppState { storage, raft, audit, kek };
+    // 1 bucket/second, 60-second rolling baseline, flag anything more
+    // than 3 standard deviations above recent normal traffic. These are
+    // reasonable starting defaults, not values proven optimal for any
+    // particular deployment's real traffic shape — an operator running
+    // this in production should expect to tune bucket width and
+    // threshold against their own access patterns before trusting it to
+    // seal automatically.
+    let anomaly_detector = Arc::new(tokio::sync::Mutex::new(sentinel_anomaly::AnomalyDetector::new(
+        Duration::from_secs(1),
+        60,
+        3.0,
+    )));
+
+    let app_state = AppState { storage, raft, audit, kek, anomaly_detector };
     let router = routes::build_router(app_state);
 
     let tls_config = mtls::build_server_config(
@@ -73,10 +86,6 @@ async fn main() -> anyhow::Result<()> {
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
-                    // Includes the "no client cert" and "untrusted CA"
-                    // cases verified earlier — rustls refuses the
-                    // handshake itself, so there is nothing further for
-                    // this code to check or enforce.
                     tracing::warn!(peer = %peer_addr, error = %e, "mTLS handshake failed");
                     return;
                 }
@@ -90,9 +99,6 @@ async fn main() -> anyhow::Result<()> {
                     .map(ClientIdentity)
             };
             let Some(identity) = identity else {
-                // The handshake succeeded (so a CA-signed cert WAS
-                // presented) but its CN couldn't be parsed. Fail closed
-                // rather than serve the request with no identity.
                 tracing::warn!(peer = %peer_addr, "handshake succeeded but client cert had no readable CN; refusing connection");
                 return;
             };

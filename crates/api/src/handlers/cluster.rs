@@ -57,6 +57,11 @@ mod tests {
             raft,
             audit: Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new())),
             kek: Arc::new(tokio::sync::Mutex::new(None)),
+            anomaly_detector: Arc::new(tokio::sync::Mutex::new(sentinel_anomaly::AnomalyDetector::new(
+                std::time::Duration::from_secs(3600),
+                20,
+                3.0,
+            ))),
         };
         let router = Router::new().route("/cluster/status", get(cluster_status)).with_state(state);
 

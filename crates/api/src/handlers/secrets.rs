@@ -1,6 +1,7 @@
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use std::time::Instant;
 
 use sentinel_consensus::ConsensusError;
 use sentinel_crypto::envelope;
@@ -60,7 +61,37 @@ pub async fn put_secret(
 /// for a "read your own writes isn't guaranteed on a stale follower"
 /// tradeoff; a future phase could add a leader-only strict-read mode for
 /// callers that need linearizable reads.
+///
+/// Every read is recorded against the node's anomaly detector *before*
+/// anything else happens. If the resulting access rate is a statistical
+/// outlier against this node's own recent baseline, the vault seals
+/// itself immediately — including refusing the very request that
+/// triggered the detection — and proposes the seal decision to the Raft
+/// log so the rest of the cluster converges on the same sealed state
+/// rather than leaving other nodes exploitable. See `SealCommand`'s doc
+/// comment for why this is Raft-replicated rather than a purely local
+/// decision.
 pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) -> Result<Bytes, AppError> {
+    let anomaly = state.anomaly_detector.lock().await.record_access(Instant::now());
+    if let Some(report) = anomaly {
+        let seal_cmd = sentinel_anomaly::SealCommand::from_report("access rate anomaly", &report);
+        // Best-effort: propose so the rest of the cluster hears about
+        // it too, but don't let a stalled/unreachable Raft leader delay
+        // sealing locally — a node that can detect the anomaly must be
+        // able to protect itself even if replication is currently
+        // degraded, which is exactly the kind of moment replication is
+        // most likely to be degraded in.
+        if let Ok(bytes) = seal_cmd.encode() {
+            let _ = state.raft.propose(bytes).await;
+        }
+        *state.kek.lock().await = None;
+        state.audit.lock().await.append(format!(
+            "AUTO-SEAL triggered: access rate anomaly (count={}, baseline_mean={:.1}, z_score={:.1})",
+            report.current_count, report.baseline_mean, report.z_score
+        ));
+        return Err(AppError::Sealed);
+    }
+
     let kek_guard = state.kek.lock().await;
     let kek = kek_guard.as_ref().ok_or(AppError::Sealed)?;
 
@@ -129,6 +160,15 @@ mod tests {
     }
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
+        test_state_with_detector(sentinel_anomaly::AnomalyDetector::new(
+            std::time::Duration::from_secs(3600), // effectively never fires in normal fast tests
+            20,
+            3.0,
+        ))
+        .await
+    }
+
+    async fn test_state_with_detector(detector: sentinel_anomaly::AnomalyDetector) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(SledStorage::open(dir.path().to_str().unwrap()).unwrap());
         let raft = spawn_raft_actor(
@@ -147,6 +187,7 @@ mod tests {
             raft,
             audit: Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new())),
             kek: Arc::new(tokio::sync::Mutex::new(Some(kek))),
+            anomaly_detector: Arc::new(tokio::sync::Mutex::new(detector)),
         };
         (state, dir)
     }
@@ -261,5 +302,64 @@ mod tests {
         let events: Vec<&str> = chain.entries().iter().map(|e| e.event.as_str()).collect();
         assert!(events.contains(&"secret written: k"));
         assert!(events.contains(&"secret read: k"));
+    }
+
+    #[tokio::test]
+    async fn sudden_read_burst_triggers_auto_seal_and_is_audit_logged() {
+        // Fast bucket duration (20ms) so this test runs in well under a
+        // second while still exercising the exact same code path a real
+        // deployment's anomaly detection would use — this is not a
+        // mocked-out version of the check, it's the real detector with
+        // compressed timing.
+        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
+        let (state, _dir) = test_state_with_detector(detector).await;
+        let audit = state.audit.clone();
+        let kek = state.kek.clone();
+        let router = app(state);
+
+        let put_req = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/secrets/db-password")
+            .body(axum::body::Body::from("hunter2"))
+            .unwrap();
+        router.clone().oneshot(put_req).await.unwrap();
+
+        // Establish a quiet baseline: one read every 20ms for 200ms
+        // (enough closed buckets to clear min_history_for_detection).
+        for _ in 0..10 {
+            let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "baseline reads should succeed normally");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // Now a burst: many reads with no delay between them, landing in
+        // the same (or very next) bucket.
+        let mut sealed = false;
+        for _ in 0..40 {
+            let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
+                sealed = true;
+                break;
+            }
+        }
+        assert!(sealed, "a sudden read burst should trigger auto-seal");
+        assert!(kek.lock().await.is_none(), "KEK should be cleared once auto-seal fires");
+
+        let chain = audit.lock().await;
+        assert!(chain.verify().is_ok(), "audit chain must remain internally consistent even after an auto-seal event");
+        assert!(
+            chain.entries().iter().any(|e| e.event.starts_with("AUTO-SEAL triggered")),
+            "the seal event itself must be audit-logged, not just silently applied"
+        );
+
+        // And now that it's sealed, a fresh request must also be refused
+        // — the seal has to actually stick, not just apply to the
+        // request that triggered it.
+        drop(chain);
+        let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
