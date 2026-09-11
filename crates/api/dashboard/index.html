@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sentinel — Cluster Console</title>
+<style>
+  :root {
+    --color-primary: #1E3A5F;
+    --color-accent: #059669;
+    --color-background: #0F172A;
+    --color-foreground: #FFFFFF;
+    --color-card: #192134;
+    --color-card-foreground: #FFFFFF;
+    --color-muted: #10192E;
+    --color-muted-foreground: #94A3B8;
+    --color-border: rgba(255, 255, 255, 0.08);
+    --color-destructive: #DC2626;
+    --color-ring: #FFFFFF;
+    --space-1: 8px;
+    --space-2: 12px;
+    --space-3: 16px;
+    --space-4: 24px;
+    --space-5: 32px;
+    --radius: 10px;
+    --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --mono: "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font);
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a, button { font-family: inherit; }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  .shell {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: var(--space-4) var(--space-3) var(--space-5);
+  }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: var(--space-4);
+    margin-bottom: var(--space-4);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    background: var(--color-primary);
+    border-radius: 8px;
+    color: #fff;
+  }
+
+  .brand-name {
+    font-weight: 600;
+    font-size: 17px;
+    letter-spacing: 0.02em;
+  }
+
+  .brand-sub {
+    color: var(--color-muted-foreground);
+    font-size: 13px;
+    margin-left: var(--space-1);
+    padding-left: var(--space-1);
+    border-left: 1px solid var(--color-border);
+  }
+
+  .conn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--color-muted-foreground);
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--color-muted-foreground);
+    flex-shrink: 0;
+  }
+  .dot[data-state="ok"] { background: var(--color-accent); box-shadow: 0 0 0 3px rgba(5,150,105,0.18); }
+  .dot[data-state="error"] { background: var(--color-destructive); box-shadow: 0 0 0 3px rgba(220,38,38,0.18); }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .dot[data-state="ok"] { animation: pulse 2s ease-in-out infinite; }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-3);
+  }
+  .span-2 { grid-column: span 2; }
+  .span-3 { grid-column: span 3; }
+
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: 1fr; }
+    .span-2, .span-3 { grid-column: span 1; }
+  }
+
+  .card {
+    background: var(--color-card);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius);
+    padding: var(--space-3);
+  }
+
+  .card-label {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-muted-foreground);
+    margin: 0 0 var(--space-2) 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .card-label svg { flex-shrink: 0; opacity: 0.7; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid transparent;
+  }
+  .pill[data-tone="good"] { background: rgba(5,150,105,0.15); color: #34D399; border-color: rgba(5,150,105,0.3); }
+  .pill[data-tone="bad"] { background: rgba(220,38,38,0.15); color: #F87171; border-color: rgba(220,38,38,0.3); }
+  .pill[data-tone="neutral"] { background: rgba(148,163,184,0.15); color: #CBD5E1; border-color: rgba(148,163,184,0.25); }
+  .pill[data-tone="warn"] { background: rgba(217,119,6,0.15); color: #FBBF24; border-color: rgba(217,119,6,0.3); }
+
+  .kpi-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-top: var(--space-2);
+  }
+  .kpi-row:first-of-type { margin-top: 0; }
+  .kpi-label { font-size: 13px; color: var(--color-muted-foreground); }
+  .kpi-value { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .kpi-value.mono { font-family: var(--mono); font-weight: 500; font-size: 13px; }
+
+  .big-status {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+  }
+  .big-status-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+  }
+  .big-status-icon[data-tone="good"] { background: rgba(5,150,105,0.15); color: #34D399; }
+  .big-status-icon[data-tone="bad"] { background: rgba(220,38,38,0.15); color: #F87171; }
+  .big-status-text { font-size: 16px; font-weight: 600; }
+  .big-status-sub { font-size: 12px; color: var(--color-muted-foreground); margin-top: 1px; }
+
+  .chart-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: var(--space-2);
+  }
+  .chart-current {
+    font-size: 24px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .chart-current-unit {
+    font-size: 12px;
+    color: var(--color-muted-foreground);
+    font-weight: 400;
+    margin-left: 4px;
+  }
+  canvas#rateChart {
+    width: 100%;
+    height: 140px;
+    display: block;
+  }
+  .chart-legend {
+    display: flex;
+    gap: var(--space-3);
+    margin-top: var(--space-2);
+    font-size: 12px;
+    color: var(--color-muted-foreground);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 10px; height: 2px; border-radius: 1px; }
+
+  .audit-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .audit-item {
+    display: flex;
+    gap: var(--space-2);
+    padding: 8px 0;
+    border-bottom: 1px solid var(--color-border);
+    font-size: 13px;
+  }
+  .audit-item:last-child { border-bottom: none; }
+  .audit-index {
+    color: var(--color-muted-foreground);
+    font-family: var(--mono);
+    font-size: 11px;
+    flex-shrink: 0;
+    width: 28px;
+    padding-top: 2px;
+  }
+  .audit-body { min-width: 0; }
+  .audit-event {
+    color: var(--color-card-foreground);
+    word-break: break-word;
+  }
+  .audit-event.seal { color: #F87171; font-weight: 600; }
+  .audit-time {
+    color: var(--color-muted-foreground);
+    font-size: 11px;
+    margin-top: 2px;
+    font-family: var(--mono);
+  }
+  .empty-state {
+    color: var(--color-muted-foreground);
+    font-size: 13px;
+    padding: var(--space-2) 0;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0,0,0,0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  footer {
+    margin-top: var(--space-4);
+    color: var(--color-muted-foreground);
+    font-size: 12px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.4 8.4-8 10-4.6-1.6-8-5-8-10V6l8-4z"/></svg>
+        </span>
+        <span class="brand-name">SENTINEL</span>
+        <span class="brand-sub">Cluster Console</span>
+      </div>
+      <div class="conn" role="status" aria-live="polite">
+        <span class="dot" id="connDot" data-state="neutral" aria-hidden="true"></span>
+        <span id="connText">Connecting…</span>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="card" aria-labelledby="clusterLabel">
+        <p class="card-label" id="clusterLabel">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+          Cluster
+        </p>
+        <div class="kpi-row">
+          <span class="kpi-label">Role</span>
+          <span class="pill" id="roleValue" data-tone="neutral">—</span>
+        </div>
+        <div class="kpi-row">
+          <span class="kpi-label">Term</span>
+          <span class="kpi-value" id="termValue">—</span>
+        </div>
+        <div class="kpi-row">
+          <span class="kpi-label">Commit index</span>
+          <span class="kpi-value" id="commitValue">—</span>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="sealLabel">
+        <p class="card-label" id="sealLabel">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          Vault Seal
+        </p>
+        <div class="big-status">
+          <span class="big-status-icon" id="sealIcon" data-tone="bad" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          </span>
+          <div>
+            <div class="big-status-text" id="sealText">—</div>
+            <div class="big-status-sub" id="sealSub">Waiting for status…</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="auditIntegrityLabel">
+        <p class="card-label" id="auditIntegrityLabel">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+          Audit Chain
+        </p>
+        <div class="big-status">
+          <span class="big-status-icon" id="auditIcon" data-tone="good" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
+          </span>
+          <div>
+            <div class="big-status-text" id="auditText">—</div>
+            <div class="big-status-sub" id="auditSub">—</div>
+          </div>
+        </div>
+        <div class="kpi-row" style="margin-top: var(--space-3);">
+          <span class="kpi-label">Tip hash</span>
+          <span class="kpi-value mono" id="tipHashValue">—</span>
+        </div>
+      </section>
+
+      <section class="card span-2" aria-labelledby="rateLabel">
+        <div class="chart-head">
+          <p class="card-label" id="rateLabel" style="margin:0;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l2-7 4 14 2-7h6"/></svg>
+            Read Access Rate
+          </p>
+          <div>
+            <span class="chart-current" id="rateCurrentValue">—</span>
+            <span class="chart-current-unit">req / bucket</span>
+          </div>
+        </div>
+        <canvas id="rateChart" role="img" aria-label="Recent read access counts per time bucket, with the rolling baseline mean shown as a reference line"></canvas>
+        <div class="chart-legend">
+          <span class="legend-item"><span class="legend-swatch" style="background:#34D399;"></span>Access count</span>
+          <span class="legend-item"><span class="legend-swatch" style="background:#94A3B8; opacity:.6;"></span>Baseline mean</span>
+        </div>
+        <table class="sr-only" id="rateTable">
+          <caption>Recent read-access counts per time bucket</caption>
+          <thead><tr><th scope="col">Bucket</th><th scope="col">Count</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="card span-3" aria-labelledby="eventsLabel">
+        <p class="card-label" id="eventsLabel">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+          Recent Audit Events
+        </p>
+        <ul class="audit-list" id="auditList">
+          <li class="empty-state">Waiting for status…</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      Sentinel — data refreshes every 2s. All requests to this console are served over the same mTLS listener as the rest of the API.
+    </footer>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  const POLL_MS = 2000;
+  const els = {
+    connDot: document.getElementById("connDot"),
+    connText: document.getElementById("connText"),
+    roleValue: document.getElementById("roleValue"),
+    termValue: document.getElementById("termValue"),
+    commitValue: document.getElementById("commitValue"),
+    sealIcon: document.getElementById("sealIcon"),
+    sealText: document.getElementById("sealText"),
+    sealSub: document.getElementById("sealSub"),
+    auditIcon: document.getElementById("auditIcon"),
+    auditText: document.getElementById("auditText"),
+    auditSub: document.getElementById("auditSub"),
+    tipHashValue: document.getElementById("tipHashValue"),
+    rateCurrentValue: document.getElementById("rateCurrentValue"),
+    auditList: document.getElementById("auditList"),
+    rateTableBody: document.querySelector("#rateTable tbody"),
+  };
+
+  const LOCK_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>';
+  const UNLOCK_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V9a4 4 0 0 1 7.2-2.4"/></svg>';
+  const CHECK_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>';
+  const XCIRCLE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 9l6 6M15 9l-6 6"/><circle cx="12" cy="12" r="9"/></svg>';
+
+  function setConn(state, text) {
+    els.connDot.setAttribute("data-state", state);
+    els.connText.textContent = text;
+  }
+
+  function roleTone(role) {
+    if (role === "Leader") return "good";
+    if (role === "Candidate") return "warn";
+    return "neutral";
+  }
+
+  function timeAgo(iso) {
+    const then = new Date(iso).getTime();
+    const diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (diffSec < 5) return "just now";
+    if (diffSec < 60) return diffSec + "s ago";
+    const min = Math.round(diffSec / 60);
+    return min + "m ago";
+  }
+
+  function renderAuditList(events) {
+    if (!events || events.length === 0) {
+      els.auditList.innerHTML = '<li class="empty-state">No audit events yet.</li>';
+      return;
+    }
+    els.auditList.innerHTML = events.map(function (e) {
+      const isSeal = e.event.indexOf("AUTO-SEAL") === 0;
+      const safeEvent = e.event.replace(/[&<>]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c];
+      });
+      return (
+        '<li class="audit-item">' +
+          '<span class="audit-index" aria-hidden="true">#' + e.index + '</span>' +
+          '<div class="audit-body">' +
+            '<div class="audit-event' + (isSeal ? ' seal' : '') + '">' + safeEvent + '</div>' +
+            '<div class="audit-time">' + timeAgo(e.timestamp) + '</div>' +
+          '</div>' +
+        '</li>'
+      );
+    }).join("");
+  }
+
+  function drawChart(history, currentCount, baselineMean) {
+    const canvas = document.getElementById("rateChart");
+    const dpr = window.devicePixelRatio || 1;
+    const cssWidth = canvas.clientWidth || 400;
+    const cssHeight = 140;
+    canvas.width = cssWidth * dpr;
+    canvas.height = cssHeight * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+    const points = history.concat([currentCount]);
+    const maxVal = Math.max(1, baselineMean * 2, Math.max.apply(null, points));
+    const padding = 8;
+    const chartW = cssWidth - padding * 2;
+    const chartH = cssHeight - padding * 2;
+    const stepX = points.length > 1 ? chartW / (points.length - 1) : 0;
+
+    function yFor(v) {
+      return padding + chartH - (v / maxVal) * chartH;
+    }
+
+    if (baselineMean > 0) {
+      ctx.strokeStyle = "rgba(148,163,184,0.5)";
+      ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      const y = yFor(baselineMean);
+      ctx.moveTo(padding, y);
+      ctx.lineTo(cssWidth - padding, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    if (points.length > 1) {
+      ctx.strokeStyle = "#34D399";
+      ctx.lineWidth = 2;
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      points.forEach(function (v, i) {
+        const x = padding + i * stepX;
+        const y = yFor(v);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      ctx.lineTo(padding + (points.length - 1) * stepX, cssHeight - padding);
+      ctx.lineTo(padding, cssHeight - padding);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(52,211,153,0.08)";
+      ctx.fill();
+    }
+
+    if (points.length > 0) {
+      const lastX = padding + (points.length - 1) * stepX;
+      const lastY = yFor(points[points.length - 1]);
+      ctx.fillStyle = "#34D399";
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    els.rateTableBody.innerHTML = points.map(function (v, i) {
+      const label = i === points.length - 1 ? "current" : "t-" + (points.length - 1 - i);
+      return "<tr><td>" + label + "</td><td>" + v + "</td></tr>";
+    }).join("");
+  }
+
+  async function poll() {
+    try {
+      const resp = await fetch("/api/status", { cache: "no-store" });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const data = await resp.json();
+
+      setConn("ok", "Connected");
+
+      els.roleValue.textContent = data.role;
+      els.roleValue.setAttribute("data-tone", roleTone(data.role));
+      els.termValue.textContent = data.term;
+      els.commitValue.textContent = data.commit_index;
+
+      if (data.sealed) {
+        els.sealIcon.setAttribute("data-tone", "bad");
+        els.sealIcon.innerHTML = LOCK_ICON;
+        els.sealText.textContent = "Sealed";
+        els.sealSub.textContent = "No secrets can be read or written";
+      } else {
+        els.sealIcon.setAttribute("data-tone", "good");
+        els.sealIcon.innerHTML = UNLOCK_ICON;
+        els.sealText.textContent = "Unsealed";
+        els.sealSub.textContent = "Vault is operational";
+      }
+
+      const audit = data.audit;
+      if (audit.verified) {
+        els.auditIcon.setAttribute("data-tone", "good");
+        els.auditIcon.innerHTML = CHECK_ICON;
+        els.auditText.textContent = "Verified";
+      } else {
+        els.auditIcon.setAttribute("data-tone", "bad");
+        els.auditIcon.innerHTML = XCIRCLE_ICON;
+        els.auditText.textContent = "INTEGRITY VIOLATION";
+      }
+      els.auditSub.textContent = audit.entry_count + " entries";
+      els.tipHashValue.textContent = audit.tip_hash ? audit.tip_hash.slice(0, 16) + "…" : "—";
+      els.tipHashValue.title = audit.tip_hash || "";
+
+      renderAuditList(audit.recent_events);
+
+      const anomaly = data.anomaly;
+      els.rateCurrentValue.textContent = anomaly.current_count;
+      drawChart(anomaly.recent_history, anomaly.current_count, anomaly.baseline_mean);
+    } catch (err) {
+      setConn("error", "Disconnected — retrying…");
+    }
+  }
+
+  poll();
+  setInterval(poll, POLL_MS);
+})();
+</script>
+</body>
+</html>

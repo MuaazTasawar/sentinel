@@ -13,6 +13,20 @@ pub struct AnomalyReport {
     pub z_score: f64,
 }
 
+/// A read-only, display-oriented view of a detector's current state —
+/// separate from `AnomalyReport` because a snapshot is taken on demand
+/// for observability (e.g. a dashboard poll) and always returns
+/// something, even during warm-up before enough history exists to ever
+/// flag an anomaly; `AnomalyReport` only ever exists at the moment a
+/// real detection fires.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DetectorSnapshot {
+    pub current_count: u32,
+    pub recent_history: Vec<u32>,
+    pub baseline_mean: f64,
+    pub baseline_stddev: f64,
+}
+
 /// A rolling-window anomaly detector for access-pattern rates. Time is
 /// divided into fixed-size buckets; each closed bucket's count feeds a
 /// rolling history, and the *current, still-open* bucket is flagged the
@@ -91,6 +105,29 @@ impl AnomalyDetector {
         self.history.push_back(count);
     }
 
+    /// A point-in-time view for display purposes — safe to call as often
+    /// as needed (e.g. every dashboard poll), and never mutates state or
+    /// affects detection logic. Always returns real numbers, even before
+    /// `min_history_for_detection` buckets have accumulated (mean/stddev
+    /// are simply computed over however much history exists so far,
+    /// which may be zero, in which case both are 0.0).
+    pub fn snapshot(&self) -> DetectorSnapshot {
+        let n = self.history.len() as f64;
+        let (mean, stddev) = if n == 0.0 {
+            (0.0, 0.0)
+        } else {
+            let mean = self.history.iter().map(|&c| c as f64).sum::<f64>() / n;
+            let variance = self.history.iter().map(|&c| { let d = c as f64 - mean; d * d }).sum::<f64>() / n;
+            (mean, variance.sqrt())
+        };
+        DetectorSnapshot {
+            current_count: self.current_count,
+            recent_history: self.history.iter().copied().collect(),
+            baseline_mean: mean,
+            baseline_stddev: stddev,
+        }
+    }
+
     fn check_anomaly(&self) -> Option<AnomalyReport> {
         if self.history.len() < self.min_history_for_detection {
             return None;
@@ -101,11 +138,6 @@ impl AnomalyDetector {
         let stddev = variance.sqrt();
 
         if stddev == 0.0 {
-            // A perfectly flat history (e.g. always exactly the same
-            // count per bucket) makes the z-score formula divide by
-            // zero. Any deviation at all from a flat baseline is
-            // treated as anomalous rather than computing an undefined
-            // ratio.
             return if self.current_count as f64 > mean {
                 Some(AnomalyReport { current_count: self.current_count, baseline_mean: mean, baseline_stddev: stddev, z_score: f64::INFINITY })
             } else {
@@ -262,5 +294,29 @@ mod tests {
         assert_eq!(report.baseline_mean, 3.0);
         assert!(report.baseline_stddev > 0.0);
         assert!(report.z_score > 2.0);
+    }
+
+    #[test]
+    fn snapshot_reflects_current_state_without_mutating_it() {
+        let mut d = AnomalyDetector::new(Duration::from_secs(1), 10, 3.0);
+        let t0 = base();
+        d.record_access(t0);
+        d.record_access(t0);
+
+        let snap = d.snapshot();
+        assert_eq!(snap.current_count, 2);
+        assert!(snap.recent_history.is_empty(), "current (still-open) bucket isn't in history yet");
+
+        let snap2 = d.snapshot();
+        assert_eq!(snap.current_count, snap2.current_count);
+    }
+
+    #[test]
+    fn snapshot_before_any_access_is_all_zeros_not_a_panic() {
+        let d = AnomalyDetector::new(Duration::from_secs(1), 10, 3.0);
+        let snap = d.snapshot();
+        assert_eq!(snap.current_count, 0);
+        assert_eq!(snap.baseline_mean, 0.0);
+        assert_eq!(snap.baseline_stddev, 0.0);
     }
 }
