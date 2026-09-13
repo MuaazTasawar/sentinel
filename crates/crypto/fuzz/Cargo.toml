@@ -34,3 +34,11 @@ path = "fuzz_targets/kdf.rs"
 test = false
 doc = false
 bench = false
+
+# Deliberately isolated from the workspace at D:\Goooo\sentinel\Cargo.toml.
+# Fuzz crates conventionally pin different (often nightly-only) versions
+# of shared dependencies than the rest of the project, so they're kept
+# out of the unified workspace resolution entirely -- this empty table
+# is what tells Cargo "don't treat this as a member, and don't look for
+# a workspace root above it."
+[workspace]
