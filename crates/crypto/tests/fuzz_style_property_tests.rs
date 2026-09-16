@@ -82,6 +82,29 @@ proptest! {
         let _ = shamir::combine_shares(&shares);
     }
 
+    /// HKDF must never panic regardless of master/info length, including
+    /// zero-length inputs, or output-length requests within a
+    /// reasonable range.
+    #[test]
+    fn hkdf_never_panics_on_arbitrary_master_and_info(
+        master in proptest::collection::vec(any::<u8>(), 0..64),
+        info in proptest::collection::vec(any::<u8>(), 0..64),
+        out_len in 0usize..128,
+    ) {
+        let _ = kdf::derive_key_hkdf(&master, &info, out_len);
+    }
+}
+
+proptest! {
+    // Fewer cases than the properties above, deliberately — each case
+    // here can exercise up to 255x255 threshold/total combinations
+    // against the real GF(256) polynomial math (not a stub), which adds
+    // up fast: 256 cases took ~2 minutes in CI for coverage that 40
+    // cases already saturates (the property is a simple invariant --
+    // share count and length consistency -- not something that needs
+    // deep exploration to falsify if it's ever going to).
+    #![proptest_config(ProptestConfig::with_cases(40))]
+
     /// `split_secret` must never panic for any in-range threshold/total
     /// combination and any secret content, and whatever it returns (Ok
     /// or Err) must be internally consistent — an Ok result must always
@@ -101,18 +124,6 @@ proptest! {
                 prop_assert_eq!(share.y.len(), secret.len());
             }
         }
-    }
-
-    /// HKDF must never panic regardless of master/info length, including
-    /// zero-length inputs, or output-length requests within a
-    /// reasonable range.
-    #[test]
-    fn hkdf_never_panics_on_arbitrary_master_and_info(
-        master in proptest::collection::vec(any::<u8>(), 0..64),
-        info in proptest::collection::vec(any::<u8>(), 0..64),
-        out_len in 0usize..128,
-    ) {
-        let _ = kdf::derive_key_hkdf(&master, &info, out_len);
     }
 }
 
