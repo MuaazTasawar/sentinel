@@ -4,7 +4,6 @@ use serde::Deserialize;
 pub struct NodeConfig {
     pub node_id: u64,
     pub api_bind_addr: String,
-    pub raft_bind_addr: String,
     pub peers: Vec<String>,
     pub storage_path: String,
     pub tls_cert_path: String,

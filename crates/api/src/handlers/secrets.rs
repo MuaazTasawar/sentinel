@@ -1,7 +1,10 @@
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::Extension;
 use std::time::Instant;
+
+use crate::middleware::mtls::ClientIdentity;
 
 use sentinel_consensus::ConsensusError;
 use sentinel_crypto::envelope;
@@ -21,6 +24,7 @@ fn storage_key(key: &str) -> String {
 /// rather than a claimed guarantee — see the note below).
 pub async fn put_secret(
     State(state): State<AppState>,
+    Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
@@ -51,7 +55,7 @@ pub async fn put_secret(
 
     state.storage.put(&storage_key(&key), serialized).await?;
 
-    state.audit.lock().await.append(format!("secret written: {key}"));
+    state.audit.lock().await.append(format!("secret written: {key} (by {})", identity.0));
 
     Ok(StatusCode::OK)
 }
@@ -68,10 +72,12 @@ pub async fn put_secret(
 /// itself immediately — including refusing the very request that
 /// triggered the detection — and proposes the seal decision to the Raft
 /// log so the rest of the cluster converges on the same sealed state
-/// rather than leaving other nodes exploitable. See `SealCommand`'s doc
-/// comment for why this is Raft-replicated rather than a purely local
-/// decision.
-pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) -> Result<Bytes, AppError> {
+/// rather than leaving other nodes exploitable.
+pub async fn get_secret(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ClientIdentity>,
+    Path(key): Path<String>,
+) -> Result<Bytes, AppError> {
     let anomaly = state.anomaly_detector.lock().await.record_access(Instant::now());
     if let Some(report) = anomaly {
         let seal_cmd = sentinel_anomaly::SealCommand::from_report("access rate anomaly", &report);
@@ -86,8 +92,8 @@ pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) 
         }
         *state.kek.lock().await = None;
         state.audit.lock().await.append(format!(
-            "AUTO-SEAL triggered: access rate anomaly (count={}, baseline_mean={:.1}, z_score={:.1})",
-            report.current_count, report.baseline_mean, report.z_score
+            "AUTO-SEAL triggered by {}: access rate anomaly (count={}, baseline_mean={:.1}, z_score={:.1})",
+            identity.0, report.current_count, report.baseline_mean, report.z_score
         ));
         return Err(AppError::Sealed);
     }
@@ -101,14 +107,18 @@ pub async fn get_secret(State(state): State<AppState>, Path(key): Path<String>) 
     let plaintext = envelope::decrypt(kek, &ciphertext)?;
     drop(kek_guard);
 
-    state.audit.lock().await.append(format!("secret read: {key}"));
+    state.audit.lock().await.append(format!("secret read: {key} (by {})", identity.0));
 
     Ok(Bytes::from(plaintext))
 }
 
 /// Deletes a secret. Same leadership requirement and the same
 /// propose-then-apply simplification as `put_secret`.
-pub async fn delete_secret(State(state): State<AppState>, Path(key): Path<String>) -> Result<StatusCode, AppError> {
+pub async fn delete_secret(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ClientIdentity>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, AppError> {
     let command = format!("delete:{key}").into_bytes();
     state.raft.propose(command).await.map_err(|e| match e {
         ConsensusError::NotLeader => AppError::NotLeader(None),
@@ -116,7 +126,7 @@ pub async fn delete_secret(State(state): State<AppState>, Path(key): Path<String
     })?;
 
     state.storage.delete(&storage_key(&key)).await?;
-    state.audit.lock().await.append(format!("secret deleted: {key}"));
+    state.audit.lock().await.append(format!("secret deleted: {key} (by {})", identity.0));
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -161,7 +171,7 @@ mod tests {
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
         test_state_with_detector(sentinel_anomaly::AnomalyDetector::new(
-            std::time::Duration::from_secs(3600), // effectively never fires in normal fast tests
+            std::time::Duration::from_secs(3600),
             20,
             3.0,
         ))
@@ -173,12 +183,11 @@ mod tests {
         let storage = Arc::new(SledStorage::open(dir.path().to_str().unwrap()).unwrap());
         let raft = spawn_raft_actor(
             1,
-            vec![], // no peers -> becomes its own leader immediately (Phase 6 fix)
+            vec![],
             Arc::new(NoopTransport),
             std::time::Duration::from_millis(20),
             sentinel_consensus::ElectionTimeoutRange { min_ms: 30, max_ms: 60 },
         );
-        // Give the single-node election time to complete.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let kek = sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN]);
@@ -196,6 +205,7 @@ mod tests {
         Router::new()
             .route("/secrets/{key}", get(get_secret).put(put_secret).delete(delete_secret))
             .route("/secrets", get(list_secrets))
+            .layer(axum::Extension(ClientIdentity("test-client".to_string())))
             .with_state(state)
     }
 
@@ -231,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn read_while_sealed_returns_503() {
         let (state, _dir) = test_state().await;
-        *state.kek.lock().await = None; // reseal
+        *state.kek.lock().await = None;
         let router = app(state);
         let req = axum::http::Request::builder().uri("/secrets/anything").body(axum::body::Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
@@ -300,17 +310,12 @@ mod tests {
         let chain = audit.lock().await;
         assert!(chain.verify().is_ok());
         let events: Vec<&str> = chain.entries().iter().map(|e| e.event.as_str()).collect();
-        assert!(events.contains(&"secret written: k"));
-        assert!(events.contains(&"secret read: k"));
+        assert!(events.contains(&"secret written: k (by test-client)"));
+        assert!(events.contains(&"secret read: k (by test-client)"));
     }
 
     #[tokio::test]
     async fn sudden_read_burst_triggers_auto_seal_and_is_audit_logged() {
-        // Fast bucket duration (20ms) so this test runs in well under a
-        // second while still exercising the exact same code path a real
-        // deployment's anomaly detection would use — this is not a
-        // mocked-out version of the check, it's the real detector with
-        // compressed timing.
         let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
         let (state, _dir) = test_state_with_detector(detector).await;
         let audit = state.audit.clone();
@@ -324,8 +329,6 @@ mod tests {
             .unwrap();
         router.clone().oneshot(put_req).await.unwrap();
 
-        // Establish a quiet baseline: one read every 20ms for 200ms
-        // (enough closed buckets to clear min_history_for_detection).
         for _ in 0..10 {
             let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
             let resp = router.clone().oneshot(req).await.unwrap();
@@ -333,8 +336,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        // Now a burst: many reads with no delay between them, landing in
-        // the same (or very next) bucket.
         let mut sealed = false;
         for _ in 0..40 {
             let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
@@ -354,9 +355,6 @@ mod tests {
             "the seal event itself must be audit-logged, not just silently applied"
         );
 
-        // And now that it's sealed, a fresh request must also be refused
-        // — the seal has to actually stick, not just apply to the
-        // request that triggered it.
         drop(chain);
         let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
