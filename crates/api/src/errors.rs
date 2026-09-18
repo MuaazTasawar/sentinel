@@ -7,6 +7,14 @@ pub enum AppError {
     NotFound,
     #[error("vault is sealed")]
     Sealed,
+    // Reserved for a future fine-grained authorization layer. mTLS
+    // (`ClientIdentity`) proves WHO is calling with cryptographic
+    // certainty; it does not yet gate WHICH secrets that identity is
+    // allowed to touch. Every current handler treats any successfully
+    // authenticated client as authorized for every operation. This
+    // variant exists so that gap has a typed place to land in rather
+    // than being bolted on as a stringly-typed error later.
+    #[allow(dead_code)]
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("not the raft leader; redirect to node {0:?}")]
