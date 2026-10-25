@@ -1,4 +1,5 @@
 mod error;
+pub mod canary;
 pub mod envelope;
 pub mod kdf;
 pub mod secret;

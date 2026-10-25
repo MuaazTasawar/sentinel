@@ -30,12 +30,15 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = Arc::new(sentinel_storage::SledStorage::open(&cfg.storage_path)?);
     let audit = Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new()));
-    // Sealed at startup, always — nothing in this bootstrap path ever
-    // populates the KEK. Unsealing is an explicit, separate operation
-    // (Phase 4's hardware-quorum flow) that a future phase wires to an
-    // admin-only endpoint or local socket; a node that can unseal itself
-    // just by starting up would defeat the entire point of the quorum.
+    // Sealed at startup, always: nothing in this bootstrap path ever
+    // populates the KEK. A node that could unseal itself just by starting
+    // up would defeat the entire point of the quorum. Unsealing is an
+    // explicit operation: key holders submit their shares to
+    // `POST /sys/unseal` (see `sentinel-cli unseal`).
     let kek = Arc::new(tokio::sync::Mutex::new(None));
+    if cfg.unseal_threshold < 2 {
+        anyhow::bail!("unseal_threshold must be at least 2 (got {}); a threshold of 1 is not a quorum", cfg.unseal_threshold);
+    }
 
     let peer_addrs = cfg.parse_peer_addrs()?;
     let peer_ids: Vec<u64> = peer_addrs.keys().copied().collect();
@@ -54,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     // 1 bucket/second, 60-second rolling baseline, flag anything more
     // than 3 standard deviations above recent normal traffic. These are
     // reasonable starting defaults, not values proven optimal for any
-    // particular deployment's real traffic shape — an operator running
+    // particular deployment's real traffic shape - an operator running
     // this in production should expect to tune bucket width and
     // threshold against their own access patterns before trusting it to
     // seal automatically.
@@ -64,7 +67,8 @@ async fn main() -> anyhow::Result<()> {
         3.0,
     )));
 
-    let app_state = AppState { storage, raft, audit, kek, anomaly_detector };
+    let unseal = handlers::unseal::UnsealState::new(cfg.unseal_threshold);
+    let app_state = AppState { storage, raft, audit, kek, anomaly_detector, unseal };
     let router = routes::build_router(app_state);
 
     let tls_config = mtls::build_server_config(
@@ -119,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 /// Builds the `reqwest::Client` this node uses to call peers, presenting
 /// this node's own cert/key as its client identity (peer nodes verify it
 /// exactly the same way the API's own mTLS listener verifies any other
-/// client — cluster RPCs are not a trusted-by-default side channel).
+/// client - cluster RPCs are not a trusted-by-default side channel).
 fn build_mtls_reqwest_client(cfg: &NodeConfig) -> anyhow::Result<reqwest::Client> {
     let mut identity_pem = std::fs::read(&cfg.tls_cert_path)?;
     identity_pem.extend_from_slice(&std::fs::read(&cfg.tls_key_path)?);

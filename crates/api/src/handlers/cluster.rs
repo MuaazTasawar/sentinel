@@ -16,53 +16,13 @@ pub async fn cluster_status(State(state): State<AppState>) -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::test_support::sealed_state;
     use axum::{routing::get, Router};
-    use std::sync::Arc;
     use tower::ServiceExt;
-
-    struct NoopTransport;
-    #[async_trait::async_trait]
-    impl sentinel_consensus::Transport for NoopTransport {
-        async fn send_request_vote(
-            &self,
-            _peer_id: u64,
-            _req: sentinel_consensus::RequestVoteRequest,
-        ) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError> {
-            unreachable!()
-        }
-        async fn send_append_entries(
-            &self,
-            _peer_id: u64,
-            _req: sentinel_consensus::AppendEntriesRequest,
-        ) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError> {
-            unreachable!()
-        }
-    }
 
     #[tokio::test]
     async fn status_reports_leader_role_for_a_single_node_cluster() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(sentinel_storage::SledStorage::open(dir.path().to_str().unwrap()).unwrap());
-        let raft = sentinel_consensus::spawn_raft_actor(
-            1,
-            vec![],
-            Arc::new(NoopTransport),
-            std::time::Duration::from_millis(20),
-            sentinel_consensus::ElectionTimeoutRange { min_ms: 30, max_ms: 60 },
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        let state = AppState {
-            storage,
-            raft,
-            audit: Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new())),
-            kek: Arc::new(tokio::sync::Mutex::new(None)),
-            anomaly_detector: Arc::new(tokio::sync::Mutex::new(sentinel_anomaly::AnomalyDetector::new(
-                std::time::Duration::from_secs(3600),
-                20,
-                3.0,
-            ))),
-        };
+        let (state, _dir) = sealed_state().await;
         let router = Router::new().route("/cluster/status", get(cluster_status)).with_state(state);
 
         let req = axum::http::Request::builder().uri("/cluster/status").body(axum::body::Body::empty()).unwrap();

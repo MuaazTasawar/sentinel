@@ -7,6 +7,10 @@ pub enum AppError {
     NotFound,
     #[error("vault is sealed")]
     Sealed,
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     // Reserved for a future fine-grained authorization layer. mTLS
     // (`ClientIdentity`) proves WHO is calling with cryptographic
     // certainty; it does not yet gate WHICH secrets that identity is
@@ -32,6 +36,8 @@ impl IntoResponse for AppError {
         let (status, message) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::Sealed => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             AppError::Unauthorized(_) => (StatusCode::FORBIDDEN, self.to_string()),
             AppError::NotLeader(_) => (StatusCode::MISDIRECTED_REQUEST, self.to_string()),
             AppError::Storage(_) | AppError::Crypto(_) | AppError::Internal(_) => {

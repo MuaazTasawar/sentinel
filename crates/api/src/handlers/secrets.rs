@@ -16,12 +16,24 @@ fn storage_key(key: &str) -> String {
     format!("secrets/{key}")
 }
 
+/// Every operation that touches the secret store, including listing and
+/// deleting, must refuse while sealed. A sealed vault is supposed to be
+/// inert: it must not reveal which keys exist, nor accept destructive
+/// operations, until a quorum has unsealed it.
+async fn require_unsealed(state: &AppState) -> Result<(), AppError> {
+    if state.kek.lock().await.is_none() {
+        Err(AppError::Sealed)
+    } else {
+        Ok(())
+    }
+}
+
 /// Writes a secret. Requires the vault to be unsealed and this node to
-/// be the current Raft leader — the write is proposed to the log before
+/// be the current Raft leader - the write is proposed to the log before
 /// it's applied to storage, so a write that succeeds has at least been
 /// accepted into the leader's log (not yet proof of majority
 /// replication, which is why this stays a documented simplification
-/// rather than a claimed guarantee — see the note below).
+/// rather than a claimed guarantee - see the note below).
 pub async fn put_secret(
     State(state): State<AppState>,
     Extension(identity): Extension<ClientIdentity>,
@@ -39,7 +51,7 @@ pub async fn put_secret(
     // a fully correct Raft-backed vault applies a write to storage only
     // once its log index is confirmed committed (replicated to a
     // majority), via an "apply loop" that watches commit_index and
-    // applies entries in order. That apply loop doesn't exist yet — this
+    // applies entries in order. That apply loop doesn't exist yet - this
     // skeleton proposes the write (which fails closed with NotLeader if
     // this node isn't the leader, so at least only a leader can write)
     // and then applies it directly. That means a leader that's about to
@@ -61,7 +73,7 @@ pub async fn put_secret(
 }
 
 /// Reads a secret. Requires the vault to be unsealed. Does not require
-/// leadership — reads are served locally, which is standard practice
+/// leadership - reads are served locally, which is standard practice
 /// for a "read your own writes isn't guaranteed on a stale follower"
 /// tradeoff; a future phase could add a leader-only strict-read mode for
 /// callers that need linearizable reads.
@@ -69,8 +81,8 @@ pub async fn put_secret(
 /// Every read is recorded against the node's anomaly detector *before*
 /// anything else happens. If the resulting access rate is a statistical
 /// outlier against this node's own recent baseline, the vault seals
-/// itself immediately — including refusing the very request that
-/// triggered the detection — and proposes the seal decision to the Raft
+/// itself immediately - including refusing the very request that
+/// triggered the detection - and proposes the seal decision to the Raft
 /// log so the rest of the cluster converges on the same sealed state
 /// rather than leaving other nodes exploitable.
 pub async fn get_secret(
@@ -83,7 +95,7 @@ pub async fn get_secret(
         let seal_cmd = sentinel_anomaly::SealCommand::from_report("access rate anomaly", &report);
         // Best-effort: propose so the rest of the cluster hears about
         // it too, but don't let a stalled/unreachable Raft leader delay
-        // sealing locally — a node that can detect the anomaly must be
+        // sealing locally - a node that can detect the anomaly must be
         // able to protect itself even if replication is currently
         // degraded, which is exactly the kind of moment replication is
         // most likely to be degraded in.
@@ -112,13 +124,16 @@ pub async fn get_secret(
     Ok(Bytes::from(plaintext))
 }
 
-/// Deletes a secret. Same leadership requirement and the same
-/// propose-then-apply simplification as `put_secret`.
+/// Deletes a secret. Requires the vault to be unsealed, plus the same
+/// leadership requirement and propose-then-apply simplification as
+/// `put_secret`.
 pub async fn delete_secret(
     State(state): State<AppState>,
     Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    require_unsealed(&state).await?;
+
     let command = format!("delete:{key}").into_bytes();
     state.raft.propose(command).await.map_err(|e| match e {
         ConsensusError::NotLeader => AppError::NotLeader(None),
@@ -131,10 +146,11 @@ pub async fn delete_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Lists secret keys under an optional prefix (the storage layer already
-/// namespaces everything under `secrets/`, so callers see plain key
-/// names without that prefix).
+/// Lists secret keys. Requires the vault to be unsealed. (The storage
+/// layer namespaces everything under `secrets/`, so callers see plain key
+/// names without that prefix.)
 pub async fn list_secrets(State(state): State<AppState>) -> Result<axum::Json<Vec<String>>, AppError> {
+    require_unsealed(&state).await?;
     let full_keys = state.storage.list("secrets/").await?;
     let keys = full_keys.into_iter().map(|k| k.trim_start_matches("secrets/").to_string()).collect();
     Ok(axum::Json(keys))
@@ -143,62 +159,19 @@ pub async fn list_secrets(State(state): State<AppState>) -> Result<axum::Json<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::test_support::{sealed_state, state_with, unsealed_state};
+    use crate::handlers::unseal::UnsealState;
     use axum::{routing::get, Router};
-    use sentinel_consensus::spawn_raft_actor;
     use sentinel_crypto::envelope::KEY_LEN;
-    use sentinel_storage::SledStorage;
-    use std::sync::Arc;
     use tower::ServiceExt;
 
-    struct NoopTransport;
-    #[async_trait::async_trait]
-    impl sentinel_consensus::Transport for NoopTransport {
-        async fn send_request_vote(
-            &self,
-            _peer_id: u64,
-            _req: sentinel_consensus::RequestVoteRequest,
-        ) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError> {
-            unreachable!("single-node test cluster has no peers")
-        }
-        async fn send_append_entries(
-            &self,
-            _peer_id: u64,
-            _req: sentinel_consensus::AppendEntriesRequest,
-        ) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError> {
-            unreachable!("single-node test cluster has no peers")
-        }
-    }
-
     async fn test_state() -> (AppState, tempfile::TempDir) {
-        test_state_with_detector(sentinel_anomaly::AnomalyDetector::new(
-            std::time::Duration::from_secs(3600),
-            20,
-            3.0,
-        ))
-        .await
+        unsealed_state().await
     }
 
     async fn test_state_with_detector(detector: sentinel_anomaly::AnomalyDetector) -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = Arc::new(SledStorage::open(dir.path().to_str().unwrap()).unwrap());
-        let raft = spawn_raft_actor(
-            1,
-            vec![],
-            Arc::new(NoopTransport),
-            std::time::Duration::from_millis(20),
-            sentinel_consensus::ElectionTimeoutRange { min_ms: 30, max_ms: 60 },
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
         let kek = sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN]);
-        let state = AppState {
-            storage,
-            raft,
-            audit: Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new())),
-            kek: Arc::new(tokio::sync::Mutex::new(Some(kek))),
-            anomaly_detector: Arc::new(tokio::sync::Mutex::new(detector)),
-        };
-        (state, dir)
+        state_with(Some(kek), detector, UnsealState::new(2)).await
     }
 
     fn app(state: AppState) -> Router {
@@ -359,5 +332,34 @@ mod tests {
         let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn list_while_sealed_returns_503() {
+        let (state, _dir) = sealed_state().await;
+        state.storage.put("secrets/hidden", vec![1]).await.unwrap();
+        let router = app(state);
+        let req = axum::http::Request::builder().uri("/secrets").body(axum::body::Body::empty()).unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "a sealed vault must not reveal key names");
+    }
+
+    #[tokio::test]
+    async fn delete_while_sealed_returns_503_and_leaves_the_secret_intact() {
+        let (state, _dir) = test_state().await;
+        let kek_handle = state.kek.clone();
+        let router = app(state);
+
+        let put_req = axum::http::Request::builder().method("PUT").uri("/secrets/keep-me").body(axum::body::Body::from("v")).unwrap();
+        assert_eq!(router.clone().oneshot(put_req).await.unwrap().status(), StatusCode::OK);
+
+        let saved_kek = kek_handle.lock().await.take();
+        let del_req = axum::http::Request::builder().method("DELETE").uri("/secrets/keep-me").body(axum::body::Body::empty()).unwrap();
+        assert_eq!(router.clone().oneshot(del_req).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        *kek_handle.lock().await = saved_kek;
+        let get_req = axum::http::Request::builder().uri("/secrets/keep-me").body(axum::body::Body::empty()).unwrap();
+        let resp = router.oneshot(get_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the sealed-state delete must not have removed anything");
     }
 }

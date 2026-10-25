@@ -23,6 +23,15 @@ pub struct NodeConfig {
     pub tls_cert_path: String,
     pub tls_key_path: String,
     pub ca_cert_path: String,
+    /// How many distinct key holders must submit a share before this node
+    /// unseals ("2" means a 2-of-N quorum). It must match the threshold the
+    /// shares were created with. Shamir needs at least 2.
+    #[serde(default = "default_unseal_threshold")]
+    pub unseal_threshold: u8,
+}
+
+fn default_unseal_threshold() -> u8 {
+    2
 }
 
 impl NodeConfig {
@@ -144,6 +153,16 @@ mod tests {
         assert_eq!(cfg.node_id, 4, "env must beat the file");
         assert_eq!(cfg.storage_path, "file-data", "file values not overridden by env still apply");
         assert_eq!(cfg.parse_peer_addrs().unwrap()[&2], "https://file:1");
+    }
+
+    #[test]
+    fn unseal_threshold_defaults_to_two_and_can_be_overridden() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert_eq!(cfg.unseal_threshold, 2);
+
+        let mut env = base_env();
+        env.insert("SENTINEL__UNSEAL_THRESHOLD".into(), "3".into());
+        assert_eq!(NodeConfig::build(None, Some(env)).unwrap().unseal_threshold, 3);
     }
 
     #[test]
