@@ -12,11 +12,14 @@ members = [
     "crates/sim",
 ]
 
+# Every member inherits these with `field.workspace = true`, so the
+# edition, version and license can never drift between crates again.
 [workspace.package]
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 license = "MIT"
 authors = ["MuaazTasawar"]
+rust-version = "1.85"
 
 [profile.release]
 lto = true

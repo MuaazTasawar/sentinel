@@ -1,9 +1,23 @@
+use std::collections::HashMap;
+use std::path::Path;
+
 use serde::Deserialize;
+
+/// Name of the optional config file, looked up in the working directory.
+/// It is always parsed as TOML. (Earlier versions asked the `config` crate
+/// to resolve the bare name `.env`, which silently meant "`.env.toml`" and
+/// confused everyone; the name is now spelled out.)
+pub const CONFIG_FILE: &str = ".env.toml";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeConfig {
     pub node_id: u64,
     pub api_bind_addr: String,
+    /// Peer entries formatted `"<node_id>=<base_url>"`. From the config
+    /// file this is a TOML array; from the environment it is a
+    /// comma-separated list, e.g.
+    /// `SENTINEL__PEERS="2=https://10.0.0.2:8443,3=https://10.0.0.3:8443"`.
+    #[serde(default)]
     pub peers: Vec<String>,
     pub storage_path: String,
     pub tls_cert_path: String,
@@ -12,12 +26,30 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// Loads `.env.toml` (if present) and then the process environment.
+    /// Precedence: **environment overrides the file**, which is what every
+    /// twelve-factor-style deployment expects. (The previous version had
+    /// this backwards: the file silently beat the environment.)
     pub fn load() -> anyhow::Result<Self> {
-        let cfg = config::Config::builder()
-            .add_source(config::Environment::with_prefix("SENTINEL").separator("__"))
-            .add_source(config::File::with_name(".env").required(false))
-            .build()?;
-        Ok(cfg.try_deserialize()?)
+        Self::build(Some(Path::new(CONFIG_FILE)), None)
+    }
+
+    /// Testable core of `load`. `env_override` replaces the real process
+    /// environment when `Some`, so tests never have to mutate global state.
+    pub(crate) fn build(file: Option<&Path>, env_override: Option<HashMap<String, String>>) -> anyhow::Result<Self> {
+        let mut builder = config::Config::builder();
+        if let Some(path) = file {
+            builder = builder.add_source(config::File::new(&path.to_string_lossy(), config::FileFormat::Toml).required(false));
+        }
+        let env = config::Environment::with_prefix("SENTINEL")
+            .prefix_separator("__")
+            .separator("__")
+            .list_separator(",")
+            .with_list_parse_key("peers")
+            .try_parsing(true)
+            .source(env_override);
+        builder = builder.add_source(env);
+        Ok(builder.build()?.try_deserialize()?)
     }
 
     /// Parses `peers` (each entry formatted `"<node_id>=<base_url>"`,
@@ -26,16 +58,110 @@ impl NodeConfig {
     /// rather than silently dropping a peer, since a dropped peer is the
     /// kind of misconfiguration that's easy to miss until an election
     /// mysteriously can't reach quorum.
-    pub fn parse_peer_addrs(&self) -> anyhow::Result<std::collections::HashMap<u64, String>> {
-        self.peers
-            .iter()
-            .map(|entry| {
-                let (id_str, addr) = entry
-                    .split_once('=')
-                    .ok_or_else(|| anyhow::anyhow!("malformed peer entry {entry:?}, expected \"<node_id>=<url>\""))?;
-                let id: u64 = id_str.parse().map_err(|_| anyhow::anyhow!("invalid node id in peer entry {entry:?}"))?;
-                Ok((id, addr.to_string()))
-            })
-            .collect()
+    pub fn parse_peer_addrs(&self) -> anyhow::Result<HashMap<u64, String>> {
+        let mut out = HashMap::new();
+        for entry in &self.peers {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (id_str, addr) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("malformed peer entry {entry:?}, expected \"<node_id>=<url>\""))?;
+            let id: u64 = id_str
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid node id in peer entry {entry:?}"))?;
+            if id == self.node_id {
+                anyhow::bail!("peer entry {entry:?} lists this node's own id ({id}); a node must not be its own peer");
+            }
+            if out.insert(id, addr.trim().to_string()).is_some() {
+                anyhow::bail!("duplicate peer id {id} in config");
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn base_env() -> HashMap<String, String> {
+        [
+            ("SENTINEL__NODE_ID", "1"),
+            ("SENTINEL__API_BIND_ADDR", "127.0.0.1:8443"),
+            ("SENTINEL__STORAGE_PATH", "data"),
+            ("SENTINEL__TLS_CERT_PATH", "pki/node.crt"),
+            ("SENTINEL__TLS_KEY_PATH", "pki/node.key"),
+            ("SENTINEL__CA_CERT_PATH", "pki/ca.crt"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn peers_can_come_from_a_comma_separated_env_var() {
+        let mut env = base_env();
+        env.insert("SENTINEL__PEERS".into(), "2=https://10.0.0.2:8443,3=https://10.0.0.3:8443".into());
+        let cfg = NodeConfig::build(None, Some(env)).unwrap();
+        let peers = cfg.parse_peer_addrs().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[&2], "https://10.0.0.2:8443");
+        assert_eq!(peers[&3], "https://10.0.0.3:8443");
+    }
+
+    #[test]
+    fn a_single_peer_in_env_still_parses_as_a_list() {
+        let mut env = base_env();
+        env.insert("SENTINEL__PEERS".into(), "2=https://10.0.0.2:8443".into());
+        let cfg = NodeConfig::build(None, Some(env)).unwrap();
+        assert_eq!(cfg.parse_peer_addrs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_peers_means_a_single_node_cluster() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert!(cfg.parse_peer_addrs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn environment_overrides_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "node_id = 9\napi_bind_addr = \"0.0.0.0:1\"\npeers = [\"2=https://file:1\"]\nstorage_path = \"file-data\"\ntls_cert_path = \"c\"\ntls_key_path = \"k\"\nca_cert_path = \"ca\""
+        )
+        .unwrap();
+
+        let mut env = HashMap::new();
+        env.insert("SENTINEL__NODE_ID".to_string(), "4".to_string());
+        let cfg = NodeConfig::build(Some(&path), Some(env)).unwrap();
+        assert_eq!(cfg.node_id, 4, "env must beat the file");
+        assert_eq!(cfg.storage_path, "file-data", "file values not overridden by env still apply");
+        assert_eq!(cfg.parse_peer_addrs().unwrap()[&2], "https://file:1");
+    }
+
+    #[test]
+    fn malformed_peer_entry_fails_loudly() {
+        let mut env = base_env();
+        env.insert("SENTINEL__PEERS".into(), "not-a-valid-entry".into());
+        let cfg = NodeConfig::build(None, Some(env)).unwrap();
+        assert!(cfg.parse_peer_addrs().is_err());
+    }
+
+    #[test]
+    fn a_node_cannot_list_itself_or_a_peer_twice() {
+        let mut env = base_env();
+        env.insert("SENTINEL__PEERS".into(), "1=https://self:1".into());
+        assert!(NodeConfig::build(None, Some(env)).unwrap().parse_peer_addrs().is_err());
+
+        let mut env = base_env();
+        env.insert("SENTINEL__PEERS".into(), "2=https://a:1,2=https://b:1".into());
+        assert!(NodeConfig::build(None, Some(env)).unwrap().parse_peer_addrs().is_err());
     }
 }
