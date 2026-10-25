@@ -7,6 +7,16 @@ pub struct LogEntry {
     pub command: Vec<u8>,
 }
 
+impl LogEntry {
+    /// A new leader appends an empty "no-op" entry at the start of its term
+    /// so that entries from earlier terms can be committed (Raft only
+    /// commits by counting replicas for entries of the *current* term).
+    /// No-ops occupy a log slot but carry no command for the state machine.
+    pub fn is_noop(&self) -> bool {
+        self.command.is_empty()
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum LogError {
     #[error("log is missing the entry at index {0} needed to check prev_log_term")]
@@ -16,7 +26,7 @@ pub enum LogError {
 }
 
 /// The replicated log. Indices are 1-based, matching the Raft paper's
-/// convention — index 0 is the sentinel "before the log began" position,
+/// convention - index 0 is the sentinel "before the log began" position,
 /// so `prev_log_index == 0` always trivially satisfies the consistency
 /// check (there's nothing to compare against for the very first entry).
 #[derive(Debug, Default, Clone)]
@@ -68,9 +78,16 @@ impl ReplicatedLog {
         self.entries.iter().filter(|e| e.index >= index).cloned().collect()
     }
 
-    /// Follower-side: the Raft AppendEntries consistency check (§5.3) —
+    /// At most `max` entries starting at `index`, in order. Used to bound
+    /// the size of a single AppendEntries message.
+    pub fn entries_range(&self, index: u64, max: usize) -> Vec<LogEntry> {
+        let start = index.max(1) as usize - 1;
+        self.entries.iter().skip(start).take(max).cloned().collect()
+    }
+
+    /// Follower-side: the Raft AppendEntries consistency check (section 5.3) -
     /// reject if the entry immediately before `new_entries` doesn't
-    /// match what the leader thinks is there — followed by the
+    /// match what the leader thinks is there - followed by the
     /// "delete-conflicting-entries-then-append" rule for entries that do
     /// pass the check. `new_entries` must be contiguous, starting at
     /// `prev_log_index + 1`.
@@ -189,6 +206,25 @@ mod tests {
         assert_eq!(suffix.len(), 2);
         assert_eq!(suffix[0].index, 2);
         assert_eq!(suffix[1].index, 3);
+    }
+
+    #[test]
+    fn entries_range_is_bounded_and_ordered() {
+        let mut log = ReplicatedLog::new();
+        for i in 0..5u8 {
+            log.append_new(1, vec![i + 1]);
+        }
+        let r = log.entries_range(2, 2);
+        assert_eq!(r.iter().map(|e| e.index).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(log.entries_range(4, 10).len(), 2);
+        assert!(log.entries_range(6, 10).is_empty());
+        assert_eq!(log.entries_range(0, 1)[0].index, 1, "index 0 is treated as 'from the start'");
+    }
+
+    #[test]
+    fn a_log_entry_with_no_command_is_a_noop() {
+        assert!(LogEntry { term: 1, index: 1, command: vec![] }.is_noop());
+        assert!(!LogEntry { term: 1, index: 1, command: vec![0] }.is_noop());
     }
 
     #[test]

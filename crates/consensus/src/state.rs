@@ -1,7 +1,23 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::log::ReplicatedLog;
+use crate::log::{LogEntry, ReplicatedLog};
 use crate::rpc::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
+use crate::ConsensusError;
+
+/// Upper bound on entries carried by one AppendEntries message, so a
+/// far-behind follower is caught up in bounded chunks rather than one
+/// enormous request.
+pub const MAX_ENTRIES_PER_APPEND: usize = 64;
+
+/// What the actor should do after the leader processed a follower's reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplicationOutcome {
+    /// Send this follower another AppendEntries right away (it either
+    /// rejected the last one, so we backed up, or it is still behind).
+    pub retry_now: bool,
+    /// `commit_index` moved forward as a result of this reply.
+    pub commit_advanced: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -12,7 +28,7 @@ pub enum Role {
 
 /// The deterministic core of Raft: given an RPC (or a locally-triggered
 /// election), what should this node's state become, and what should it
-/// reply? Nothing here touches the network, a clock, or storage —
+/// reply? Nothing here touches the network, a clock, or storage -
 /// Phase 6's Tokio actor owns timers and message passing and calls into
 /// this type, which makes the actual consensus logic testable without
 /// spinning up any async runtime or simulating real time.
@@ -26,6 +42,10 @@ pub struct RaftState {
     pub commit_index: u64,
     pub last_applied: u64,
     votes_received: HashSet<u64>,
+    /// Leader-only: the next log index to send to each peer.
+    next_index: HashMap<u64, u64>,
+    /// Leader-only: the highest index known to be replicated on each peer.
+    match_index: HashMap<u64, u64>,
 }
 
 impl RaftState {
@@ -39,6 +59,8 @@ impl RaftState {
             commit_index: 0,
             last_applied: 0,
             votes_received: HashSet::new(),
+            next_index: HashMap::new(),
+            match_index: HashMap::new(),
         }
     }
 
@@ -128,6 +150,147 @@ impl RaftState {
     pub fn become_leader(&mut self) {
         debug_assert_eq!(self.role, Role::Candidate, "only a candidate can become leader");
         self.role = Role::Leader;
+    }
+
+    /// Called by the actor right after winning an election (after
+    /// `become_leader`). Resets per-peer replication progress and appends a
+    /// no-op entry for the new term, which is what lets entries inherited
+    /// from earlier terms become committed.
+    pub fn on_elected(&mut self, peers: &[u64]) {
+        debug_assert_eq!(self.role, Role::Leader);
+        let next = self.log.last_index() + 1;
+        self.next_index = peers.iter().map(|&p| (p, next)).collect();
+        self.match_index = peers.iter().map(|&p| (p, 0)).collect();
+        self.log.append_new(self.current_term, Vec::new());
+        self.advance_commit_index();
+    }
+
+    /// Number of nodes in the cluster, as known to a leader (peers + self).
+    pub fn cluster_size(&self) -> usize {
+        self.match_index.len() + 1
+    }
+
+    /// Leader-only: appends a client command to the local log. Returns its
+    /// index. It is **not** committed yet unless this is a single-node
+    /// cluster; the entry commits once a majority has replicated it.
+    pub fn append_as_leader(&mut self, command: Vec<u8>) -> Result<u64, ConsensusError> {
+        if self.role != Role::Leader {
+            return Err(ConsensusError::NotLeader);
+        }
+        if command.is_empty() {
+            return Err(ConsensusError::EmptyCommand);
+        }
+        let index = self.log.append_new(self.current_term, command);
+        self.advance_commit_index();
+        Ok(index)
+    }
+
+    /// Leader-only: builds the next AppendEntries message for `peer`
+    /// (starting at that peer's `next_index`), or `None` if this node is not
+    /// the leader or `peer` is unknown.
+    pub fn build_append_entries(&self, peer: u64) -> Option<AppendEntriesRequest> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        let next = *self.next_index.get(&peer)?;
+        let prev_log_index = next.saturating_sub(1);
+        Some(AppendEntriesRequest {
+            term: self.current_term,
+            leader_id: self.node_id,
+            prev_log_index,
+            prev_log_term: self.log.term_at(prev_log_index),
+            entries: self.log.entries_range(next, MAX_ENTRIES_PER_APPEND),
+            leader_commit: self.commit_index,
+        })
+    }
+
+    /// Leader-only: folds a follower's reply into replication progress.
+    ///
+    /// `sent_term`, `sent_prev_index` and `sent_len` describe the request the
+    /// reply answers, so replies that arrive late, duplicated or reordered
+    /// are handled correctly (progress only ever moves forward on success,
+    /// and a rejection only backs up once per request).
+    pub fn handle_append_entries_response(
+        &mut self,
+        peer: u64,
+        sent_term: u64,
+        sent_prev_index: u64,
+        sent_len: u64,
+        resp: AppendEntriesResponse,
+    ) -> ReplicationOutcome {
+        let mut outcome = ReplicationOutcome::default();
+
+        // A higher term anywhere means we are no longer the leader.
+        self.step_down_if_stale(resp.term);
+        if self.role != Role::Leader || sent_term != self.current_term || resp.term != self.current_term {
+            return outcome;
+        }
+        let (Some(matched), Some(next)) = (self.match_index.get_mut(&peer), self.next_index.get_mut(&peer)) else {
+            return outcome;
+        };
+
+        if resp.success {
+            let acked = sent_prev_index + sent_len;
+            if acked > *matched {
+                *matched = acked;
+            }
+            if *matched + 1 > *next {
+                *next = *matched + 1;
+            }
+            let matched_now = *matched;
+            outcome.commit_advanced = self.advance_commit_index();
+            outcome.retry_now = self.log.last_index() > matched_now;
+        } else if sent_prev_index + 1 == *next && *next > 1 {
+            // The follower's log doesn't contain our prev entry: back up one
+            // step and try again. (Only if this reply answers the request we
+            // most recently built, so duplicates don't over-decrement.)
+            *next -= 1;
+            outcome.retry_now = true;
+        }
+        outcome
+    }
+
+    /// Leader-only: moves `commit_index` to the highest index replicated on
+    /// a majority **whose entry is from the current term**. (Counting
+    /// replicas of an older-term entry is not safe; the no-op appended by
+    /// `on_elected` is what unlocks committing those.) Returns whether the
+    /// index advanced.
+    pub fn advance_commit_index(&mut self) -> bool {
+        if self.role != Role::Leader {
+            return false;
+        }
+        let majority = self.cluster_size() / 2 + 1;
+        let mut n = self.log.last_index();
+        while n > self.commit_index {
+            if self.log.term_at(n) == self.current_term {
+                let replicas = 1 + self.match_index.values().filter(|&&m| m >= n).count();
+                if replicas >= majority {
+                    self.commit_index = n;
+                    return true;
+                }
+            }
+            n -= 1;
+        }
+        false
+    }
+
+    /// Entries that became committed since the last call, in log order,
+    /// exactly once each. Advances `last_applied`. This is the "apply loop"
+    /// the state machine (the API's storage) consumes.
+    pub fn take_newly_committed(&mut self) -> Vec<LogEntry> {
+        let mut out = Vec::new();
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            if let Some(entry) = self.log.get(self.last_applied) {
+                out.push(entry.clone());
+            }
+        }
+        out
+    }
+
+    /// Leader-only progress for `peer`, exposed for tests and diagnostics.
+    pub fn replication_progress(&self, peer: u64) -> Option<(u64, u64)> {
+        Some((*self.next_index.get(&peer)?, *self.match_index.get(&peer)?))
     }
 }
 
@@ -302,5 +465,228 @@ mod tests {
 
         assert!(!resp_a.vote_granted);
         assert!(!resp_b.vote_granted);
+    }
+
+    // ---- Phase 14: leader replication ----
+
+    fn leader_of(node_id: u64, term: u64, peers: &[u64]) -> RaftState {
+        let mut s = RaftState::new(node_id);
+        s.current_term = term - 1;
+        s.become_candidate();
+        s.become_leader();
+        s.on_elected(peers);
+        s
+    }
+
+    fn ok(match_index: u64, term: u64) -> AppendEntriesResponse {
+        AppendEntriesResponse { term, success: true, match_index: Some(match_index) }
+    }
+    fn rejected(term: u64) -> AppendEntriesResponse {
+        AppendEntriesResponse { term, success: false, match_index: None }
+    }
+
+    #[test]
+    fn on_elected_appends_a_noop_and_starts_every_peer_at_the_log_end() {
+        let s = leader_of(1, 1, &[2, 3]);
+        assert_eq!(s.log.last_index(), 1);
+        assert!(s.log.get(1).unwrap().is_noop());
+        assert_eq!(s.log.get(1).unwrap().term, 1);
+        assert_eq!(s.replication_progress(2), Some((1, 0)));
+        assert_eq!(s.cluster_size(), 3);
+        assert_eq!(s.commit_index, 0, "a 3-node leader cannot commit alone");
+    }
+
+    #[test]
+    fn a_single_node_leader_commits_its_own_entries_immediately() {
+        let mut s = leader_of(1, 1, &[]);
+        assert_eq!(s.commit_index, 1, "the no-op is committed by the lone node's own vote");
+        let idx = s.append_as_leader(b"x".to_vec()).unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(s.commit_index, 2);
+        let applied: Vec<u64> = s.take_newly_committed().iter().map(|e| e.index).collect();
+        assert_eq!(applied, vec![1, 2]);
+        assert!(s.take_newly_committed().is_empty(), "each entry is delivered exactly once");
+    }
+
+    #[test]
+    fn only_the_leader_accepts_commands_and_empty_commands_are_reserved() {
+        let mut follower = RaftState::new(2);
+        assert!(matches!(follower.append_as_leader(b"x".to_vec()), Err(ConsensusError::NotLeader)));
+        let mut leader = leader_of(1, 1, &[2, 3]);
+        assert!(matches!(leader.append_as_leader(vec![]), Err(ConsensusError::EmptyCommand)));
+    }
+
+    #[test]
+    fn the_leader_sends_each_peer_entries_from_its_own_next_index() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        s.append_as_leader(b"a".to_vec()).unwrap();
+        s.append_as_leader(b"b".to_vec()).unwrap();
+
+        let req = s.build_append_entries(2).unwrap();
+        assert_eq!((req.prev_log_index, req.prev_log_term), (0, 0));
+        assert_eq!(req.entries.len(), 3, "no-op + a + b");
+        assert_eq!(req.leader_commit, 0);
+
+        // After peer 2 acknowledges everything, the next message is a heartbeat.
+        s.handle_append_entries_response(2, 1, 0, 3, ok(3, 1));
+        let hb = s.build_append_entries(2).unwrap();
+        assert_eq!((hb.prev_log_index, hb.prev_log_term), (3, 1));
+        assert!(hb.entries.is_empty());
+
+        // Peer 3 hasn't acked anything, so it still gets the full backlog.
+        assert_eq!(s.build_append_entries(3).unwrap().entries.len(), 3);
+        assert!(s.build_append_entries(99).is_none(), "unknown peer");
+        assert!(RaftState::new(1).build_append_entries(2).is_none(), "not a leader");
+    }
+
+    #[test]
+    fn a_single_append_never_carries_more_than_the_batch_limit() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        for i in 0..(MAX_ENTRIES_PER_APPEND + 10) {
+            s.append_as_leader(vec![(i % 250) as u8 + 1]).unwrap();
+        }
+        assert_eq!(s.build_append_entries(2).unwrap().entries.len(), MAX_ENTRIES_PER_APPEND);
+    }
+
+    #[test]
+    fn an_entry_commits_exactly_when_a_majority_has_it() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        s.append_as_leader(b"a".to_vec()).unwrap(); // index 2
+
+        let out = s.handle_append_entries_response(2, 1, 0, 2, ok(2, 1));
+        assert!(out.commit_advanced, "leader + one peer is a majority of three");
+        assert_eq!(s.commit_index, 2);
+
+        // The second peer acknowledging later changes nothing further.
+        let out = s.handle_append_entries_response(3, 1, 0, 2, ok(2, 1));
+        assert!(!out.commit_advanced);
+        assert_eq!(s.commit_index, 2);
+    }
+
+    #[test]
+    fn five_node_leader_needs_three_replicas_not_two() {
+        let mut s = leader_of(1, 1, &[2, 3, 4, 5]);
+        s.append_as_leader(b"a".to_vec()).unwrap(); // index 2
+        s.handle_append_entries_response(2, 1, 0, 2, ok(2, 1));
+        assert_eq!(s.commit_index, 0, "2 of 5 is not a majority");
+        s.handle_append_entries_response(3, 1, 0, 2, ok(2, 1));
+        assert_eq!(s.commit_index, 2, "3 of 5 is");
+    }
+
+    #[test]
+    fn entries_from_an_older_term_are_not_committed_by_counting_replicas() {
+        // Raft paper, figure 8: a leader must not treat an old-term entry as
+        // committed just because a majority holds it.
+        let mut s = RaftState::new(1);
+        s.log.append_new(1, b"old".to_vec()); // index 1, term 1
+        s.current_term = 1;
+        s.become_candidate(); // term 2
+        s.become_leader();
+        s.on_elected(&[2, 3]); // appends the term-2 no-op at index 2
+
+        // A majority acknowledges only the old entry.
+        s.handle_append_entries_response(2, 2, 0, 1, ok(1, 2));
+        assert_eq!(s.commit_index, 0, "index 1 is from term 1; it must not commit by replica count");
+
+        // Once a majority holds the current-term no-op, both commit together.
+        s.handle_append_entries_response(2, 2, 0, 2, ok(2, 2));
+        assert_eq!(s.commit_index, 2);
+    }
+
+    #[test]
+    fn a_rejection_backs_up_exactly_one_step_and_asks_for_a_retry() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        s.append_as_leader(b"a".to_vec()).unwrap();
+        s.append_as_leader(b"b".to_vec()).unwrap(); // log: 1..=3, next_index[2] = 1
+
+        // Pretend peer 2 had been caught up to 3, then we learn it lacks entry 3.
+        s.handle_append_entries_response(2, 1, 0, 3, ok(3, 1));
+        assert_eq!(s.replication_progress(2), Some((4, 3)));
+        let out = s.handle_append_entries_response(2, 1, 3, 0, rejected(1));
+        assert!(out.retry_now);
+        assert_eq!(s.replication_progress(2).unwrap().0, 3);
+
+        // A duplicate of the same rejection must not back up again.
+        let out = s.handle_append_entries_response(2, 1, 3, 0, rejected(1));
+        assert!(!out.retry_now);
+        assert_eq!(s.replication_progress(2).unwrap().0, 3);
+    }
+
+    #[test]
+    fn next_index_never_drops_below_one() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        let out = s.handle_append_entries_response(2, 1, 0, 0, rejected(1));
+        assert!(!out.retry_now);
+        assert_eq!(s.replication_progress(2).unwrap().0, 1);
+    }
+
+    #[test]
+    fn late_or_reordered_acks_never_move_progress_backwards() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        s.append_as_leader(b"a".to_vec()).unwrap();
+        s.append_as_leader(b"b".to_vec()).unwrap();
+        s.handle_append_entries_response(2, 1, 0, 3, ok(3, 1));
+        // An older, smaller ack arrives afterwards.
+        s.handle_append_entries_response(2, 1, 0, 1, ok(1, 1));
+        assert_eq!(s.replication_progress(2), Some((4, 3)));
+    }
+
+    #[test]
+    fn a_reply_with_a_higher_term_deposes_the_leader() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        let out = s.handle_append_entries_response(2, 1, 0, 1, AppendEntriesResponse { term: 5, success: false, match_index: None });
+        assert_eq!(out, ReplicationOutcome::default());
+        assert_eq!(s.role, Role::Follower);
+        assert_eq!(s.current_term, 5);
+    }
+
+    #[test]
+    fn a_reply_to_a_request_from_an_earlier_term_is_ignored() {
+        let mut s = leader_of(1, 3, &[2, 3]);
+        let before = s.replication_progress(2);
+        let out = s.handle_append_entries_response(2, 2, 0, 1, ok(1, 2));
+        assert_eq!(out, ReplicationOutcome::default());
+        assert_eq!(s.replication_progress(2), before);
+        assert_eq!(s.role, Role::Leader);
+    }
+
+    #[test]
+    fn a_stale_rejection_from_an_earlier_leadership_does_not_back_up_progress() {
+        // We lead term 3. A follower now at term 3 answers a request we sent
+        // back in term 2 (during an earlier leadership) with a rejection. It
+        // says nothing about our current log, so it must not move next_index.
+        let mut s = leader_of(1, 3, &[2, 3]);
+        s.handle_append_entries_response(2, 3, 0, 1, ok(1, 3));
+        assert_eq!(s.replication_progress(2), Some((2, 1)));
+
+        let out = s.handle_append_entries_response(2, 2, 1, 0, rejected(3));
+        assert_eq!(out, ReplicationOutcome::default());
+        assert_eq!(s.replication_progress(2), Some((2, 1)), "progress must be untouched");
+    }
+
+    #[test]
+    fn a_follower_that_is_still_behind_is_asked_to_continue() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        for i in 0..5u8 {
+            s.append_as_leader(vec![i + 1]).unwrap();
+        }
+        // The peer acknowledged only the first 2 of 6 entries.
+        let out = s.handle_append_entries_response(2, 1, 0, 2, ok(2, 1));
+        assert!(out.retry_now);
+        assert_eq!(s.replication_progress(2), Some((3, 2)));
+    }
+
+    #[test]
+    fn a_new_leader_forgets_the_previous_terms_replication_progress() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        s.append_as_leader(b"a".to_vec()).unwrap();
+        s.handle_append_entries_response(2, 1, 0, 2, ok(2, 1));
+        // Lose leadership, then win again in a later term.
+        s.handle_request_vote(RequestVoteRequest { term: 2, candidate_id: 3, last_log_index: 9, last_log_term: 9 });
+        assert_eq!(s.role, Role::Follower);
+        s.become_candidate();
+        s.become_leader();
+        s.on_elected(&[2, 3]);
+        assert_eq!(s.replication_progress(2).unwrap().1, 0, "match_index must restart from zero");
     }
 }
