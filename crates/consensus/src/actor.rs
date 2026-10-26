@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::log::LogEntry;
+use crate::persist::{PersistError, RaftStore};
 use crate::rpc::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
 use crate::state::{RaftState, Role};
 use crate::ConsensusError;
@@ -42,6 +43,7 @@ enum RaftMessage {
         resp: AppendEntriesResponse,
     },
     Inspect(oneshot::Sender<(Role, u64, u64)>),
+    Shutdown,
 }
 
 #[derive(Clone)]
@@ -92,6 +94,12 @@ impl RaftHandle {
         }
     }
 
+    /// Stops the actor. Anything already persisted stays persisted; a new
+    /// actor started over the same store resumes from it.
+    pub async fn shutdown(&self) {
+        let _ = self.sender.send(RaftMessage::Shutdown).await;
+    }
+
     pub async fn inspect(&self) -> (Role, u64, u64) {
         let (tx, rx) = oneshot::channel();
         let _ = self.sender.send(RaftMessage::Inspect(tx)).await;
@@ -126,7 +134,7 @@ pub fn spawn_raft_actor(
     heartbeat_interval: Duration,
     election_timeout_range: ElectionTimeoutRange,
 ) -> RaftHandle {
-    spawn_inner(node_id, peers, transport, heartbeat_interval, election_timeout_range, None)
+    spawn_inner(RaftState::new(node_id), peers, transport, heartbeat_interval, election_timeout_range, None, None)
 }
 
 /// Like [`spawn_raft_actor`], plus a channel that yields every **committed**
@@ -141,8 +149,72 @@ pub fn spawn_raft_actor_with_apply(
     election_timeout_range: ElectionTimeoutRange,
 ) -> (RaftHandle, mpsc::UnboundedReceiver<LogEntry>) {
     let (apply_tx, apply_rx) = mpsc::unbounded_channel();
-    let handle = spawn_inner(node_id, peers, transport, heartbeat_interval, election_timeout_range, Some(apply_tx));
+    let handle = spawn_inner(
+        RaftState::new(node_id),
+        peers,
+        transport,
+        heartbeat_interval,
+        election_timeout_range,
+        Some(apply_tx),
+        None,
+    );
     (handle, apply_rx)
+}
+
+/// The production constructor: like [`spawn_raft_actor_with_apply`], but the
+/// node's term, vote and log are loaded from `store` at startup and every
+/// change is made durable **before** the node replies to a peer, replicates,
+/// acknowledges a client, or applies an entry. If the store ever fails the
+/// actor stops (fail-stop): a node that can no longer remember what it
+/// promised must not keep making promises.
+///
+/// After a restart the node replays every committed entry (from index 1) to
+/// the apply channel once it learns the commit index, so the state machine
+/// must tolerate re-application (see `statemachine` in the API crate).
+pub fn spawn_raft_actor_persistent(
+    node_id: u64,
+    peers: Vec<u64>,
+    transport: Arc<dyn Transport>,
+    heartbeat_interval: Duration,
+    election_timeout_range: ElectionTimeoutRange,
+    mut store: Box<dyn RaftStore>,
+) -> Result<(RaftHandle, mpsc::UnboundedReceiver<LogEntry>), PersistError> {
+    let persisted = store.load()?;
+    let state = RaftState::restore(node_id, persisted).map_err(|e| PersistError::Corrupt(e.to_string()))?;
+    let (apply_tx, apply_rx) = mpsc::unbounded_channel();
+    let handle = spawn_inner(
+        state,
+        peers,
+        transport,
+        heartbeat_interval,
+        election_timeout_range,
+        Some(apply_tx),
+        Some(store),
+    );
+    Ok((handle, apply_rx))
+}
+
+/// Makes everything that changed since the last call durable: first the log
+/// mutations the state recorded, then term/vote if they moved.
+fn flush_persistence(
+    store: &mut Option<Box<dyn RaftStore>>,
+    state: &mut RaftState,
+    persisted_hard: &mut (u64, Option<u64>),
+) -> Result<(), PersistError> {
+    let ops = state.log.drain_journal();
+    let hard = (state.current_term, state.voted_for);
+    let Some(store) = store else {
+        *persisted_hard = hard;
+        return Ok(());
+    };
+    if !ops.is_empty() {
+        store.apply_log_ops(&ops)?;
+    }
+    if hard != *persisted_hard {
+        store.save_hard_state(hard.0, hard.1)?;
+        *persisted_hard = hard;
+    }
+    Ok(())
 }
 
 /// Hands newly committed entries to the state machine and answers any
@@ -183,21 +255,36 @@ fn replicate_to(state: &RaftState, peer: u64, transport: &Arc<dyn Transport>, se
 }
 
 fn spawn_inner(
-    node_id: u64,
+    initial_state: RaftState,
     peers: Vec<u64>,
     transport: Arc<dyn Transport>,
     heartbeat_interval: Duration,
     election_timeout_range: ElectionTimeoutRange,
     apply_tx: Option<mpsc::UnboundedSender<LogEntry>>,
+    store: Option<Box<dyn RaftStore>>,
 ) -> RaftHandle {
     let (tx, mut rx) = mpsc::channel(256);
     let self_tx = tx.clone();
 
     tokio::spawn(async move {
-        let mut state = RaftState::new(node_id);
+        let mut state = initial_state;
+        let mut store = store;
+        let mut persisted_hard = (state.current_term, state.voted_for);
         let mut pending: BTreeMap<u64, (u64, CommitWaiter)> = BTreeMap::new();
         let mut election_deadline = Instant::now() + random_election_timeout(election_timeout_range);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+
+        // Makes all pending state changes durable. On failure the actor stops:
+        // dropping every reply channel means callers see an error, never an
+        // acknowledgement for data that is not safely stored.
+        macro_rules! persist {
+            () => {
+                if let Err(e) = flush_persistence(&mut store, &mut state, &mut persisted_hard) {
+                    tracing::error!(error = %e, "fatal: cannot persist raft state; stopping this node's raft actor");
+                    break;
+                }
+            };
+        }
 
         loop {
             tokio::select! {
@@ -207,6 +294,7 @@ fn spawn_inner(
                         RaftMessage::RequestVote(req, reply) => {
                             let candidate_term_is_current_or_newer = req.term >= state.current_term;
                             let resp = state.handle_request_vote(req);
+                            persist!();
                             if resp.vote_granted || candidate_term_is_current_or_newer {
                                 election_deadline = Instant::now() + random_election_timeout(election_timeout_range);
                             }
@@ -220,6 +308,7 @@ fn spawn_inner(
                             // election.
                             let from_live_leader = req.term >= state.current_term;
                             let resp = state.handle_append_entries(req);
+                            persist!();
                             if from_live_leader {
                                 election_deadline = Instant::now() + random_election_timeout(election_timeout_range);
                             }
@@ -228,6 +317,7 @@ fn spawn_inner(
                         }
                         RaftMessage::Propose(command, reply) => {
                             let result = state.append_as_leader(command);
+                            persist!();
                             if result.is_ok() {
                                 for &peer in &peers {
                                     replicate_to(&state, peer, &transport, &self_tx);
@@ -239,6 +329,7 @@ fn spawn_inner(
                         RaftMessage::ProposeAndWait(command, waiter) => {
                             match state.append_as_leader(command) {
                                 Ok(index) => {
+                                    persist!();
                                     pending.insert(index, (state.current_term, waiter));
                                     for &peer in &peers {
                                         replicate_to(&state, peer, &transport, &self_tx);
@@ -253,9 +344,13 @@ fn spawn_inner(
                         }
                         RaftMessage::VoteResult(resp, peer) => {
                             let cluster_size = peers.len() + 1;
-                            if state.record_vote(resp, peer, cluster_size) {
+                            let won = state.record_vote(resp, peer, cluster_size);
+                            if won {
                                 state.become_leader();
                                 state.on_elected(&peers);
+                            }
+                            persist!();
+                            if won {
                                 // Announce leadership (and start replicating)
                                 // immediately rather than at the next tick.
                                 for &p in &peers {
@@ -267,6 +362,7 @@ fn spawn_inner(
                         RaftMessage::AppendResult { peer, sent_term, sent_prev_index, sent_len, resp } => {
                             let was_leader = state.role == Role::Leader;
                             let outcome = state.handle_append_entries_response(peer, sent_term, sent_prev_index, sent_len, resp);
+                            persist!();
                             if was_leader && state.role != Role::Leader {
                                 // Deposed by a higher term: restart the
                                 // election clock instead of firing at once.
@@ -282,16 +378,19 @@ fn spawn_inner(
                         RaftMessage::Inspect(reply) => {
                             let _ = reply.send((state.role, state.current_term, state.commit_index));
                         }
+                        RaftMessage::Shutdown => break,
                     }
                 }
 
                 _ = tokio::time::sleep_until(election_deadline), if state.role != Role::Leader => {
                     let vote_req = state.become_candidate();
+                    persist!();
                     election_deadline = Instant::now() + random_election_timeout(election_timeout_range);
 
                     if peers.is_empty() {
                         state.become_leader();
                         state.on_elected(&peers);
+                        persist!();
                         drain_committed(&mut state, &apply_tx, &mut pending);
                         continue;
                     }
@@ -330,6 +429,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex as StdMutex;
+    use crate::persist::MemoryStore;
     use tokio::sync::Mutex;
 
     /// An in-process network between Raft actors whose links can be cut:
@@ -377,13 +477,32 @@ mod tests {
     }
 
     async fn spawn_cluster(ids: &[u64], heartbeat: Duration, election_range: ElectionTimeoutRange) -> Cluster {
+        spawn_cluster_inner(ids, heartbeat, election_range, None).await
+    }
+
+    /// A cluster whose nodes persist to the given stores. Calling this again
+    /// with the same stores is a restart of the whole cluster.
+    async fn spawn_persistent_cluster(ids: &[u64], stores: &HashMap<u64, MemoryStore>) -> Cluster {
+        spawn_cluster_inner(ids, Duration::from_millis(20), FAST, Some(stores)).await
+    }
+
+    async fn spawn_cluster_inner(
+        ids: &[u64],
+        heartbeat: Duration,
+        election_range: ElectionTimeoutRange,
+        stores: Option<&HashMap<u64, MemoryStore>>,
+    ) -> Cluster {
         let net = Arc::new(Net { handles: Mutex::new(HashMap::new()), isolated: StdMutex::new(HashSet::new()) });
         let mut handles = HashMap::new();
         let mut applied_rx = HashMap::new();
         for &id in ids {
             let peers: Vec<u64> = ids.iter().copied().filter(|&p| p != id).collect();
             let transport = Arc::new(NodeTransport { from: id, net: net.clone() });
-            let (handle, rx) = spawn_raft_actor_with_apply(id, peers, transport, heartbeat, election_range);
+            let (handle, rx) = match stores {
+                Some(stores) => spawn_raft_actor_persistent(id, peers, transport, heartbeat, election_range, Box::new(stores[&id].clone()))
+                    .expect("store should load"),
+                None => spawn_raft_actor_with_apply(id, peers, transport, heartbeat, election_range),
+            };
             net.handles.lock().await.insert(id, handle.clone());
             handles.insert(id, handle);
             applied_rx.insert(id, rx);
@@ -480,7 +599,9 @@ mod tests {
     #[tokio::test]
     async fn single_node_cluster_should_elect_itself_leader() {
         let cluster = spawn_cluster(&[1], Duration::from_millis(20), FAST).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Wait for the election rather than guessing how long it takes: on a
+        // loaded machine a fixed sleep is a coin flip.
+        cluster.wait_for_leader(&[1]).await;
         let (role, _, _) = cluster.handles[&1].inspect().await;
         assert_eq!(role, Role::Leader, "a lone node with no peers must still become its own leader");
     }
@@ -489,40 +610,72 @@ mod tests {
     async fn three_node_cluster_elects_exactly_one_leader() {
         let ids = [1, 2, 3];
         let cluster = spawn_cluster(&ids, Duration::from_millis(20), FAST).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
 
-        let mut leaders = 0;
-        let mut terms = Vec::new();
-        for &id in &ids {
-            let (role, term, _commit) = cluster.handles[&id].inspect().await;
-            terms.push(term);
-            if role == Role::Leader {
-                leaders += 1;
+        // Liveness: the cluster settles on exactly one leader, all in one term.
+        // (A single snapshot after a fixed sleep is not a valid test: a leader
+        // from term 1 may briefly coexist with a newly elected leader of term 2
+        // until it hears about it. That is legal Raft; only one leader *per
+        // term* is guaranteed.)
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut leaders = 0;
+                let mut terms = Vec::new();
+                for &id in &ids {
+                    let (role, term, _) = cluster.handles[&id].inspect().await;
+                    terms.push(term);
+                    if role == Role::Leader {
+                        leaders += 1;
+                    }
+                }
+                if leaders == 1 && terms.iter().all(|&t| t == terms[0]) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        })
+        .await
+        .expect("the cluster never settled on exactly one leader in a single term");
+
+        // Safety, the actual Raft invariant: at no moment do two different
+        // nodes lead the same term.
+        let mut leaders_by_term: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for _ in 0..40 {
+            for &id in &ids {
+                let (role, term, _) = cluster.handles[&id].inspect().await;
+                if role == Role::Leader {
+                    leaders_by_term.entry(term).or_default().insert(id);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(leaders, 1, "expected exactly one leader, roles/terms: {terms:?}");
-        assert!(terms.iter().all(|&t| t == terms[0]));
+        for (term, who) in &leaders_by_term {
+            assert!(who.len() <= 1, "election safety violated: term {term} had leaders {who:?}");
+        }
     }
 
     #[tokio::test]
     async fn heartbeats_prevent_repeated_elections() {
         let ids = [1, 2, 3];
-        let cluster = spawn_cluster(&ids, Duration::from_millis(20), FAST).await;
+        // Election timeout 20-35x the heartbeat interval: a test thread that is
+        // starved for a while cannot cause a spurious election, so any term
+        // change here would mean heartbeats genuinely failed to suppress one.
+        let cluster = spawn_cluster(&ids, Duration::from_millis(20), ElectionTimeoutRange { min_ms: 400, max_ms: 700 }).await;
+        cluster.wait_for_leader(&ids).await;
+        tokio::time::sleep(Duration::from_millis(150)).await; // let followers adopt the term
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let (_, term_after_first_election, _) = cluster.handles[&1].inspect().await;
+        let mut terms_after_election = Vec::new();
+        for &id in &ids {
+            terms_after_election.push(cluster.handles[&id].inspect().await.1);
+        }
+        assert!(terms_after_election.iter().all(|&t| t == terms_after_election[0]), "nodes disagree: {terms_after_election:?}");
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let mut final_terms = Vec::new();
         for &id in &ids {
-            let (_, term, _) = cluster.handles[&id].inspect().await;
-            final_terms.push(term);
+            final_terms.push(cluster.handles[&id].inspect().await.1);
         }
-        assert!(
-            final_terms.iter().all(|&t| t == term_after_first_election),
-            "term should be stable once a leader is established, got {final_terms:?} (was {term_after_first_election})"
-        );
+        assert_eq!(final_terms, terms_after_election, "term should be stable once a leader is established");
     }
 
     #[tokio::test]
@@ -556,9 +709,7 @@ mod tests {
     async fn propose_fails_on_a_follower_and_succeeds_on_the_leader() {
         let ids = [1, 2, 3];
         let cluster = spawn_cluster(&ids, Duration::from_millis(20), FAST).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        let leader_id = cluster.leader_among(&ids).await.expect("cluster should have elected a leader");
+        let leader_id = cluster.wait_for_leader(&ids).await;
 
         for &id in &ids {
             let result = cluster.handles[&id].propose(b"set x=1".to_vec()).await;
@@ -699,7 +850,7 @@ mod tests {
                 Err(TransportError::Unreachable(p))
             }
         }
-        let handle = spawn_raft_actor(2, vec![1, 3], Arc::new(Dead), Duration::from_millis(20), ElectionTimeoutRange { min_ms: 150, max_ms: 200 });
+        let handle = spawn_raft_actor(2, vec![1, 3], Arc::new(Dead), Duration::from_millis(20), ElectionTimeoutRange { min_ms: 600, max_ms: 800 });
 
         for _ in 0..16 {
             let resp = handle
@@ -716,6 +867,154 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let (role, term, _) = handle.inspect().await;
-        assert_eq!((role, term), (Role::Follower, 1), "over 800ms of live-leader contact the node must never time out");
+        assert_eq!((role, term), (Role::Follower, 1), "over 800ms of live-leader contact (a rejected append every 50ms) the node must never time out");
+    }
+
+    // ---- Phase 15: durability ----
+
+    struct DeadNet;
+    #[async_trait::async_trait]
+    impl Transport for DeadNet {
+        async fn send_request_vote(&self, p: u64, _: RequestVoteRequest) -> Result<RequestVoteResponse, TransportError> {
+            Err(TransportError::Unreachable(p))
+        }
+        async fn send_append_entries(&self, p: u64, _: AppendEntriesRequest) -> Result<AppendEntriesResponse, TransportError> {
+            Err(TransportError::Unreachable(p))
+        }
+    }
+
+    const NEVER_ELECT: ElectionTimeoutRange = ElectionTimeoutRange { min_ms: 60_000, max_ms: 61_000 };
+
+    fn persistent_follower(store: &MemoryStore) -> RaftHandle {
+        spawn_raft_actor_persistent(2, vec![1, 3], Arc::new(DeadNet), Duration::from_millis(20), NEVER_ELECT, Box::new(store.clone()))
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn a_restarted_node_cannot_vote_twice_in_the_term_it_already_voted_in() {
+        let store = MemoryStore::new();
+        let node = persistent_follower(&store);
+        let first = node.request_vote(RequestVoteRequest { term: 5, candidate_id: 1, last_log_index: 0, last_log_term: 0 }).await;
+        assert!(first.vote_granted);
+        node.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Brand-new actor, same disk.
+        let restarted = persistent_follower(&store);
+        let (_, term, _) = restarted.inspect().await;
+        assert_eq!(term, 5, "the term must survive a restart");
+
+        let rival = restarted.request_vote(RequestVoteRequest { term: 5, candidate_id: 3, last_log_index: 0, last_log_term: 0 }).await;
+        assert!(!rival.vote_granted, "a second vote in term 5 would allow two leaders");
+        let same = restarted.request_vote(RequestVoteRequest { term: 5, candidate_id: 1, last_log_index: 0, last_log_term: 0 }).await;
+        assert!(same.vote_granted, "re-granting to the same candidate is still fine");
+    }
+
+    #[tokio::test]
+    async fn without_persistence_the_same_restart_would_double_vote() {
+        // Control for the test above: proves it is persistence, not luck, that prevents the second vote.
+        let node = spawn_raft_actor(2, vec![1, 3], Arc::new(DeadNet), Duration::from_millis(20), NEVER_ELECT);
+        node.request_vote(RequestVoteRequest { term: 5, candidate_id: 1, last_log_index: 0, last_log_term: 0 }).await;
+        node.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let restarted = spawn_raft_actor(2, vec![1, 3], Arc::new(DeadNet), Duration::from_millis(20), NEVER_ELECT);
+        let rival = restarted.request_vote(RequestVoteRequest { term: 5, candidate_id: 3, last_log_index: 0, last_log_term: 0 }).await;
+        assert!(rival.vote_granted, "an amnesiac node grants the second vote; that is the bug persistence prevents");
+    }
+
+    #[tokio::test]
+    async fn a_follower_only_acknowledges_an_append_after_it_is_durable() {
+        let store = MemoryStore::new();
+        let node = persistent_follower(&store);
+        let e = |term, index| LogEntry { term, index, command: vec![index as u8] };
+
+        let resp = node
+            .append_entries(AppendEntriesRequest {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![e(1, 1), e(1, 2)],
+                leader_commit: 0,
+            })
+            .await;
+        assert!(resp.success);
+        // The reply has been received, so the data must already be on "disk".
+        let snap = store.snapshot();
+        assert_eq!((snap.term, snap.entries.len()), (1, 2));
+
+        // A new leader overwrites index 2; the truncation is persisted too.
+        let resp = node
+            .append_entries(AppendEntriesRequest {
+                term: 2,
+                leader_id: 3,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![e(2, 2)],
+                leader_commit: 0,
+            })
+            .await;
+        assert!(resp.success);
+        let snap = store.snapshot();
+        assert_eq!((snap.term, snap.entries[1].term), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn restarting_the_whole_cluster_loses_no_committed_entry() {
+        let ids = [1, 2, 3];
+        let stores: HashMap<u64, MemoryStore> = ids.iter().map(|&id| (id, MemoryStore::new())).collect();
+
+        let mut first = spawn_persistent_cluster(&ids, &stores).await;
+        first.wait_for_leader(&ids).await;
+        for c in ["a", "b", "c"] {
+            first.propose_ok(&ids, c.as_bytes()).await;
+        }
+        first.wait_until_everyone_applied(&ids, 3).await;
+        let term_before = first.handles[&1].inspect().await.1;
+
+        // Power off every node at once. Nobody is left to resend anything:
+        // whatever survives is exactly what was on disk.
+        for &id in &ids {
+            first.handles[&id].shutdown().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for &id in &ids {
+            let on_disk: Vec<Vec<u8>> = stores[&id].snapshot().entries.into_iter().filter(|e| !e.is_noop()).map(|e| e.command).collect();
+            assert_eq!(on_disk, cmds(&["a", "b", "c"]), "node {id} must have persisted every committed entry");
+        }
+
+        let mut second = spawn_persistent_cluster(&ids, &stores).await;
+        second.wait_for_leader(&ids).await;
+        second.wait_until_everyone_applied(&ids, 3).await;
+        for &id in &ids {
+            assert_eq!(second.seen[&id], cmds(&["a", "b", "c"]), "node {id} must re-apply the surviving log");
+            assert!(second.handles[&id].inspect().await.1 > term_before, "terms must never go backwards across a restart");
+        }
+
+        // And the restarted cluster keeps working.
+        second.propose_ok(&ids, b"d").await;
+        second.wait_until_everyone_applied(&ids, 4).await;
+        assert_eq!(second.seen[&1].last().unwrap(), b"d");
+    }
+
+    #[tokio::test]
+    async fn a_failing_disk_stops_the_node_instead_of_acknowledging_unsaved_data() {
+        let store = MemoryStore::new();
+        let (node, mut applied) =
+            spawn_raft_actor_persistent(1, vec![], Arc::new(DeadNet), Duration::from_millis(20), FAST, Box::new(store.clone())).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while node.inspect().await.0 != Role::Leader {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("single node should lead");
+
+        store.set_fail_writes(true);
+        let result = node.propose_and_wait(b"must-not-be-acked".to_vec(), Duration::from_secs(2)).await;
+        assert!(matches!(result, Err(ConsensusError::Stopped)), "got {result:?}");
+        assert!(applied.try_recv().is_err(), "an entry that could not be saved must never reach the state machine");
+        assert!(store.snapshot().entries.iter().all(|e| e.command != b"must-not-be-acked"));
     }
 }

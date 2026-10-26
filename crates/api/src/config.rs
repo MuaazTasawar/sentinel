@@ -28,13 +28,32 @@ pub struct NodeConfig {
     /// shares were created with. Shamir needs at least 2.
     #[serde(default = "default_unseal_threshold")]
     pub unseal_threshold: u8,
+    /// Directory for Raft's durable state (term, vote, log). Defaults to
+    /// `<storage_path>.raft`. Keep it on durable storage, and never delete it
+    /// without also deleting `storage_path` (or the reverse).
+    #[serde(default)]
+    pub raft_dir: Option<String>,
+    /// How long a write waits for a majority of the cluster to commit it.
+    #[serde(default = "default_commit_timeout_ms")]
+    pub commit_timeout_ms: u64,
 }
 
 fn default_unseal_threshold() -> u8 {
     2
 }
 
+fn default_commit_timeout_ms() -> u64 {
+    5_000
+}
+
 impl NodeConfig {
+    pub fn raft_dir(&self) -> std::path::PathBuf {
+        match &self.raft_dir {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::path::PathBuf::from(format!("{}.raft", self.storage_path)),
+        }
+    }
+
     /// Loads `.env.toml` (if present) and then the process environment.
     /// Precedence: **environment overrides the file**, which is what every
     /// twelve-factor-style deployment expects. (The previous version had
@@ -163,6 +182,20 @@ mod tests {
         let mut env = base_env();
         env.insert("SENTINEL__UNSEAL_THRESHOLD".into(), "3".into());
         assert_eq!(NodeConfig::build(None, Some(env)).unwrap().unseal_threshold, 3);
+    }
+
+    #[test]
+    fn raft_dir_defaults_next_to_the_storage_dir_and_commit_timeout_has_a_default() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert_eq!(cfg.raft_dir(), std::path::PathBuf::from("data.raft"));
+        assert_eq!(cfg.commit_timeout_ms, 5_000);
+
+        let mut env = base_env();
+        env.insert("SENTINEL__RAFT_DIR".into(), "/var/lib/sentinel/raft".into());
+        env.insert("SENTINEL__COMMIT_TIMEOUT_MS".into(), "250".into());
+        let cfg = NodeConfig::build(None, Some(env)).unwrap();
+        assert_eq!(cfg.raft_dir(), std::path::PathBuf::from("/var/lib/sentinel/raft"));
+        assert_eq!(cfg.commit_timeout_ms, 250);
     }
 
     #[test]

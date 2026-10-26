@@ -10,6 +10,7 @@ pub async fn cluster_status(State(state): State<AppState>) -> Json<Value> {
         "role": format!("{role:?}"),
         "term": term,
         "commit_index": commit_index,
+        "applied_index": *state.applied.borrow(),
     }))
 }
 
@@ -32,5 +33,6 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["role"], "Leader");
         assert_eq!(json["term"], 1);
+        assert!(json["applied_index"].is_u64(), "status must report how far the state machine has applied");
     }
 }

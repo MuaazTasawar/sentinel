@@ -6,14 +6,37 @@ use std::time::Instant;
 
 use crate::middleware::mtls::ClientIdentity;
 
-use sentinel_consensus::ConsensusError;
 use sentinel_crypto::envelope;
 
 use crate::errors::AppError;
 use crate::state::AppState;
+use crate::statemachine::{storage_key, Command};
 
-fn storage_key(key: &str) -> String {
-    format!("secrets/{key}")
+const MAX_KEY_LEN: usize = 512;
+
+/// Secret names end up in storage keys and the audit log, so keep them sane.
+fn validate_key(key: &str) -> Result<(), AppError> {
+    if key.is_empty() || key.len() > MAX_KEY_LEN || key.chars().any(|c| c.is_control()) {
+        return Err(AppError::BadRequest(format!(
+            "secret names must be 1-{MAX_KEY_LEN} bytes with no control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Proposes `command` and returns only once a **majority of the cluster has
+/// committed it** and this node's state machine has applied it. Handlers never
+/// write storage themselves, so a 2xx from here means the change is durable on
+/// a majority, not just accepted by a leader that might be about to lose its
+/// majority.
+async fn commit(state: &AppState, command: Command) -> Result<(), AppError> {
+    let index = state.raft.propose_and_wait(command.encode(), state.commit_timeout).await?;
+
+    let mut applied = state.applied.clone();
+    match tokio::time::timeout(state.commit_timeout, applied.wait_for(|&v| v >= index)).await {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(AppError::CommitTimeout),
+    }
 }
 
 /// Every operation that touches the secret store, including listing and
@@ -28,44 +51,27 @@ async fn require_unsealed(state: &AppState) -> Result<(), AppError> {
     }
 }
 
-/// Writes a secret. Requires the vault to be unsealed and this node to
-/// be the current Raft leader - the write is proposed to the log before
-/// it's applied to storage, so a write that succeeds has at least been
-/// accepted into the leader's log (not yet proof of majority
-/// replication, which is why this stays a documented simplification
-/// rather than a claimed guarantee - see the note below).
+/// Writes a secret. Requires the vault to be unsealed and this node to be
+/// the Raft leader. The value is encrypted here, the ciphertext is proposed
+/// to the log, and the call returns only after a majority has committed it
+/// and this node has applied it (see [`commit`]). On a follower it fails
+/// with 421 (`NotLeader`); if the leader cannot reach a majority it fails
+/// with 504 and **nothing is written**.
 pub async fn put_secret(
     State(state): State<AppState>,
     Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
+    validate_key(&key)?;
+
     let kek_guard = state.kek.lock().await;
     let kek = kek_guard.as_ref().ok_or(AppError::Sealed)?;
     let ciphertext = envelope::encrypt(kek, &body)?;
     drop(kek_guard);
 
-    let serialized = bincode::serialize(&ciphertext).map_err(|e| AppError::Internal(e.into()))?;
-
-    // NOTE ON SEQUENCING (intentional simplification, not an oversight):
-    // a fully correct Raft-backed vault applies a write to storage only
-    // once its log index is confirmed committed (replicated to a
-    // majority), via an "apply loop" that watches commit_index and
-    // applies entries in order. That apply loop doesn't exist yet - this
-    // skeleton proposes the write (which fails closed with NotLeader if
-    // this node isn't the leader, so at least only a leader can write)
-    // and then applies it directly. That means a leader that's about to
-    // lose an election (e.g. it's partitioned and hasn't realized it
-    // yet) could locally apply a write that never reaches a majority,
-    // which a real deployment cannot tolerate. Flagging this precisely
-    // because it is the single biggest gap between "looks like Raft" and
-    // "is linearizable" in the current codebase.
-    state.raft.propose(serialized.clone()).await.map_err(|e| match e {
-        ConsensusError::NotLeader => AppError::NotLeader(None),
-        other => AppError::Internal(other.into()),
-    })?;
-
-    state.storage.put(&storage_key(&key), serialized).await?;
+    let value = bincode::serialize(&ciphertext).map_err(|e| AppError::Internal(e.into()))?;
+    commit(&state, Command::Put { key: key.clone(), value }).await?;
 
     state.audit.lock().await.append(format!("secret written: {key} (by {})", identity.0));
 
@@ -92,17 +98,21 @@ pub async fn get_secret(
 ) -> Result<Bytes, AppError> {
     let anomaly = state.anomaly_detector.lock().await.record_access(Instant::now());
     if let Some(report) = anomaly {
-        let seal_cmd = sentinel_anomaly::SealCommand::from_report("access rate anomaly", &report);
-        // Best-effort: propose so the rest of the cluster hears about
-        // it too, but don't let a stalled/unreachable Raft leader delay
-        // sealing locally - a node that can detect the anomaly must be
-        // able to protect itself even if replication is currently
-        // degraded, which is exactly the kind of moment replication is
-        // most likely to be degraded in.
-        if let Ok(bytes) = seal_cmd.encode() {
-            let _ = state.raft.propose(bytes).await;
-        }
+        // Seal locally first and unconditionally: a node that detects the
+        // anomaly must protect itself even if replication is degraded, which
+        // is exactly when it is most likely to be.
         *state.kek.lock().await = None;
+        // Then ask the cluster to seal too. The command is applied on every
+        // node when it commits. Best-effort: only the leader can propose, so
+        // an anomaly detected on a follower seals that follower now and is
+        // forwarded to the leader by the peer-forwarding added in Phase 16.
+        let seal = Command::Seal {
+            reason: format!(
+                "access rate anomaly detected by {}: count={}, baseline_mean={:.1}, z_score={:.1}",
+                identity.0, report.current_count, report.baseline_mean, report.z_score
+            ),
+        };
+        let _ = state.raft.propose(seal.encode()).await;
         state.audit.lock().await.append(format!(
             "AUTO-SEAL triggered by {}: access rate anomaly (count={}, baseline_mean={:.1}, z_score={:.1})",
             identity.0, report.current_count, report.baseline_mean, report.z_score
@@ -124,23 +134,18 @@ pub async fn get_secret(
     Ok(Bytes::from(plaintext))
 }
 
-/// Deletes a secret. Requires the vault to be unsealed, plus the same
-/// leadership requirement and propose-then-apply simplification as
-/// `put_secret`.
+/// Deletes a secret. Requires the vault to be unsealed and this node to be
+/// the leader, and returns only after a majority has committed the deletion
+/// (same contract as [`put_secret`]).
 pub async fn delete_secret(
     State(state): State<AppState>,
     Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
     require_unsealed(&state).await?;
+    validate_key(&key)?;
 
-    let command = format!("delete:{key}").into_bytes();
-    state.raft.propose(command).await.map_err(|e| match e {
-        ConsensusError::NotLeader => AppError::NotLeader(None),
-        other => AppError::Internal(other.into()),
-    })?;
-
-    state.storage.delete(&storage_key(&key)).await?;
+    commit(&state, Command::Delete { key: key.clone() }).await?;
     state.audit.lock().await.append(format!("secret deleted: {key} (by {})", identity.0));
 
     Ok(StatusCode::NO_CONTENT)
@@ -361,5 +366,119 @@ mod tests {
         let get_req = axum::http::Request::builder().uri("/secrets/keep-me").body(axum::body::Body::empty()).unwrap();
         let resp = router.oneshot(get_req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "the sealed-state delete must not have removed anything");
+    }
+
+    #[tokio::test]
+    async fn a_write_on_a_node_that_is_not_leader_is_refused_and_stores_nothing() {
+        use crate::state::test_support::{build, default_detector};
+        // Peers exist but never answer, so this node can never win an election.
+        struct Silent;
+        #[async_trait::async_trait]
+        impl sentinel_consensus::Transport for Silent {
+            async fn send_request_vote(&self, p: u64, _: sentinel_consensus::RequestVoteRequest) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError> {
+                Err(sentinel_consensus::TransportError::Unreachable(p))
+            }
+            async fn send_append_entries(&self, p: u64, _: sentinel_consensus::AppendEntriesRequest) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError> {
+                Err(sentinel_consensus::TransportError::Unreachable(p))
+            }
+        }
+        let kek = sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN]);
+        let (state, _dir) = build(Some(kek), default_detector(), UnsealState::new(2), vec![2, 3], std::sync::Arc::new(Silent), std::time::Duration::from_secs(1)).await;
+        let storage = state.storage.clone();
+        let router = app(state);
+
+        let req = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("v")).unwrap();
+        assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::MISDIRECTED_REQUEST);
+        assert!(storage.get("secrets/k").await.is_err(), "a refused write must leave no trace");
+    }
+
+    #[tokio::test]
+    async fn a_leader_that_cannot_reach_a_majority_does_not_apply_the_write() {
+        // The bug this phase fixes: the old handler proposed and then wrote
+        // straight to storage, so a partitioned leader "succeeded" with data
+        // no other node had. Now the write waits for a majority, times out,
+        // and storage is untouched.
+        use crate::state::test_support::{build, default_detector, VotesButNoReplication};
+        let kek = sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN]);
+        let (state, _dir) = build(
+            Some(kek),
+            default_detector(),
+            UnsealState::new(2),
+            vec![2, 3],
+            std::sync::Arc::new(VotesButNoReplication),
+            std::time::Duration::from_millis(400),
+        )
+        .await;
+        // Wait until this node has actually become leader.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while state.raft.inspect().await.0 != sentinel_consensus::Role::Leader {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("node should win the (fake) election");
+
+        let storage = state.storage.clone();
+        let audit = state.audit.clone();
+        let router = app(state);
+
+        let put = axum::http::Request::builder().method("PUT").uri("/secrets/orphan").body(axum::body::Body::from("secret")).unwrap();
+        let resp = router.clone().oneshot(put).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT, "an unconfirmed write must not report success");
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(storage.get("secrets/orphan").await.is_err(), "the write must not have reached storage");
+        assert!(
+            !audit.lock().await.entries().iter().any(|e| e.event.starts_with("secret written: orphan")),
+            "and must not be audited as written"
+        );
+
+        let del = axum::http::Request::builder().method("DELETE").uri("/secrets/orphan").body(axum::body::Body::empty()).unwrap();
+        assert_eq!(router.oneshot(del).await.unwrap().status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn bad_secret_names_are_rejected_before_anything_is_proposed() {
+        let (state, _dir) = test_state().await;
+        let router = app(state);
+        let long = "a".repeat(513);
+        for name in [long.as_str(), "bad%0Aname", "tab%09name"] {
+            let req = axum::http::Request::builder().method("PUT").uri(format!("/secrets/{name}")).body(axum::body::Body::from("v")).unwrap();
+            assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST, "name {name:.12?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_anomaly_seal_is_proposed_as_a_replicated_command_and_applied() {
+        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
+        let (state, _dir) = test_state_with_detector(detector).await;
+        let audit = state.audit.clone();
+        let router = app(state);
+
+        let put = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("v")).unwrap();
+        router.clone().oneshot(put).await.unwrap();
+        for _ in 0..10 {
+            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
+            router.clone().oneshot(req).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for _ in 0..40 {
+            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
+            if router.clone().oneshot(req).await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+        }
+
+        // The committed seal command comes back out of the log and is applied.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if audit.lock().await.entries().iter().any(|e| e.event.contains("committed cluster-wide seal command")) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replicated seal command should have been applied");
     }
 }

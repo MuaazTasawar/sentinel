@@ -4,6 +4,7 @@ mod handlers;
 mod middleware;
 mod routes;
 mod state;
+mod statemachine;
 mod transport;
 
 use std::sync::Arc;
@@ -28,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
     tracing::info!(node_id = cfg.node_id, "sentinel node starting");
 
-    let storage = Arc::new(sentinel_storage::SledStorage::open(&cfg.storage_path)?);
+    let storage: Arc<dyn sentinel_storage::Storage> = Arc::new(sentinel_storage::SledStorage::open(&cfg.storage_path)?);
     let audit = Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new()));
     // Sealed at startup, always: nothing in this bootstrap path ever
     // populates the KEK. A node that could unseal itself just by starting
@@ -46,13 +47,23 @@ async fn main() -> anyhow::Result<()> {
     let http_client = build_mtls_reqwest_client(&cfg)?;
     let raft_transport = Arc::new(HttpTransport::new(http_client, peer_addrs));
 
-    let raft = sentinel_consensus::spawn_raft_actor(
+    // Raft's term, vote and log live on disk and are fsync'd before this node
+    // answers a peer or acknowledges a client, so a crash or restart cannot
+    // make it forget a vote or lose an entry it already confirmed.
+    let raft_dir = cfg.raft_dir();
+    let raft_store = sentinel_consensus::FileStore::open(&raft_dir)?;
+    let (raft, committed) = sentinel_consensus::spawn_raft_actor_persistent(
         cfg.node_id,
         peer_ids,
         raft_transport,
         Duration::from_millis(50),
         sentinel_consensus::ElectionTimeoutRange::default(),
-    );
+        Box::new(raft_store),
+    )?;
+    tracing::info!(dir = %raft_dir.display(), "raft state loaded");
+
+    // The only code path that changes the secret store: committed log entries.
+    let applied = statemachine::spawn_apply_loop(committed, storage.clone(), kek.clone(), audit.clone());
 
     // 1 bucket/second, 60-second rolling baseline, flag anything more
     // than 3 standard deviations above recent normal traffic. These are
@@ -68,7 +79,16 @@ async fn main() -> anyhow::Result<()> {
     )));
 
     let unseal = handlers::unseal::UnsealState::new(cfg.unseal_threshold);
-    let app_state = AppState { storage, raft, audit, kek, anomaly_detector, unseal };
+    let app_state = AppState {
+        storage,
+        raft,
+        audit,
+        kek,
+        anomaly_detector,
+        unseal,
+        applied,
+        commit_timeout: Duration::from_millis(cfg.commit_timeout_ms),
+    };
     let router = routes::build_router(app_state);
 
     let tls_config = mtls::build_server_config(

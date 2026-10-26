@@ -23,6 +23,12 @@ pub enum AppError {
     Unauthorized(String),
     #[error("not the raft leader; redirect to node {0:?}")]
     NotLeader(Option<u64>),
+    /// The write was proposed but a majority did not confirm it in time. It
+    /// may or may not have been applied; the caller should check before retrying.
+    #[error("the write was not confirmed by a majority in time; its outcome is unknown")]
+    CommitTimeout,
+    #[error("leadership changed before the write committed; it was discarded, please retry")]
+    LeadershipLost,
     #[error("storage error: {0}")]
     Storage(#[from] sentinel_storage::StorageError),
     #[error("crypto error: {0}")]
@@ -40,11 +46,24 @@ impl IntoResponse for AppError {
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             AppError::Unauthorized(_) => (StatusCode::FORBIDDEN, self.to_string()),
             AppError::NotLeader(_) => (StatusCode::MISDIRECTED_REQUEST, self.to_string()),
+            AppError::CommitTimeout => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
+            AppError::LeadershipLost => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             AppError::Storage(_) | AppError::Crypto(_) | AppError::Internal(_) => {
                 tracing::error!(error = ?self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
             }
         };
         (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+impl From<sentinel_consensus::ConsensusError> for AppError {
+    fn from(e: sentinel_consensus::ConsensusError) -> Self {
+        use sentinel_consensus::ConsensusError as C;
+        match e {
+            C::NotLeader => AppError::NotLeader(None),
+            C::CommitTimeout => AppError::CommitTimeout,
+            C::LeadershipLost => AppError::LeadershipLost,
+            other => AppError::Internal(other.into()),
+        }
     }
 }

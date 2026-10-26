@@ -1,12 +1,15 @@
 pub mod actor;
 pub mod log;
+pub mod persist;
 pub mod rpc;
 pub mod state;
 
 pub use actor::{
-    spawn_raft_actor, spawn_raft_actor_with_apply, ElectionTimeoutRange, RaftHandle, Transport, TransportError,
+    spawn_raft_actor, spawn_raft_actor_persistent, spawn_raft_actor_with_apply, ElectionTimeoutRange, RaftHandle,
+    Transport, TransportError,
 };
-pub use log::{LogEntry, LogError, ReplicatedLog};
+pub use log::{LogEntry, LogError, LogOp, ReplicatedLog};
+pub use persist::{FileStore, MemoryStore, PersistError, PersistedState, RaftStore};
 pub use rpc::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
 pub use state::{RaftState, ReplicationOutcome, Role, MAX_ENTRIES_PER_APPEND};
 

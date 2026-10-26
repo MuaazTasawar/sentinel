@@ -2439,9 +2439,11 @@ name = "sentinel-consensus"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

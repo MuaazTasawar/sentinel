@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::log::{LogEntry, ReplicatedLog};
+use crate::log::{LogEntry, LogError, ReplicatedLog};
+use crate::persist::PersistedState;
 use crate::rpc::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
 use crate::ConsensusError;
 
@@ -62,6 +63,17 @@ impl RaftState {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
         }
+    }
+
+    /// Rebuilds a node from what it persisted before a restart. It comes back
+    /// as a follower with nothing known to be committed; the leader's next
+    /// heartbeat tells it the commit index.
+    pub fn restore(node_id: u64, persisted: PersistedState) -> Result<Self, LogError> {
+        let mut state = Self::new(node_id);
+        state.current_term = persisted.term;
+        state.voted_for = persisted.voted_for;
+        state.log = ReplicatedLog::from_entries(persisted.entries)?;
+        Ok(state)
     }
 
     fn step_down_if_stale(&mut self, term: u64) {
@@ -465,6 +477,31 @@ mod tests {
 
         assert!(!resp_a.vote_granted);
         assert!(!resp_b.vote_granted);
+    }
+
+    #[test]
+    fn restore_brings_back_term_vote_and_log_as_a_fresh_follower() {
+        let persisted = PersistedState {
+            term: 9,
+            voted_for: Some(3),
+            entries: vec![
+                LogEntry { term: 2, index: 1, command: vec![1] },
+                LogEntry { term: 9, index: 2, command: vec![2] },
+            ],
+        };
+        let s = RaftState::restore(1, persisted).unwrap();
+        assert_eq!((s.current_term, s.voted_for, s.role), (9, Some(3), Role::Follower));
+        assert_eq!((s.log.last_index(), s.log.last_term()), (2, 9));
+        assert_eq!((s.commit_index, s.last_applied), (0, 0));
+    }
+
+    #[test]
+    fn a_restored_node_cannot_vote_twice_in_the_term_it_already_voted_in() {
+        let mut s = RaftState::restore(1, PersistedState { term: 4, voted_for: Some(2), entries: vec![] }).unwrap();
+        let other = s.handle_request_vote(RequestVoteRequest { term: 4, candidate_id: 3, last_log_index: 0, last_log_term: 0 });
+        assert!(!other.vote_granted, "the vote for node 2 in term 4 survived the restart");
+        let same = s.handle_request_vote(RequestVoteRequest { term: 4, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
+        assert!(same.vote_granted);
     }
 
     // ---- Phase 14: leader replication ----
