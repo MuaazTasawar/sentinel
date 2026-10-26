@@ -9,6 +9,8 @@ use sentinel_storage::Storage;
 use tokio::sync::{watch, Mutex};
 
 use crate::handlers::unseal::UnsealState;
+use crate::middleware::authz::Policy;
+use crate::transport::SealForwarder;
 
 /// Everything a request handler needs. Cloning this is cheap: every
 /// field is already an `Arc` or a handle backed by a channel, so
@@ -39,6 +41,10 @@ pub struct AppState {
     /// How long a write waits for a majority commit (and for this node to
     /// apply it) before answering 504.
     pub commit_timeout: Duration,
+    /// Who may call what.
+    pub policy: Arc<Policy>,
+    /// How this node asks the leader to seal the cluster when it cannot do so itself.
+    pub seal_forwarder: Arc<dyn SealForwarder>,
 }
 
 /// Shared fixtures for handler and router tests, so every test module
@@ -142,6 +148,8 @@ pub mod test_support {
             unseal,
             applied,
             commit_timeout,
+            policy: Arc::new(Policy::allow_any()),
+            seal_forwarder: Arc::new(crate::transport::NoForwarder),
         };
         (state, dir)
     }

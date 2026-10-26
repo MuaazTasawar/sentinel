@@ -36,6 +36,26 @@ pub struct NodeConfig {
     /// How long a write waits for a majority of the cluster to commit it.
     #[serde(default = "default_commit_timeout_ms")]
     pub commit_timeout_ms: u64,
+
+    // ---- authorization (see middleware/authz.rs) ----
+    /// Certificate Common Names of the other cluster nodes (may call /raft/*).
+    #[serde(default)]
+    pub peer_cns: Vec<String>,
+    /// Common Names allowed to unseal/seal (/sys/*).
+    #[serde(default)]
+    pub admin_cns: Vec<String>,
+    /// Common Names allowed to write/delete (and read) secrets.
+    #[serde(default)]
+    pub writer_cns: Vec<String>,
+    /// Common Names allowed to read/list secrets and view status.
+    #[serde(default)]
+    pub reader_cns: Vec<String>,
+    /// Certificate serial numbers (hex) to refuse after the TLS handshake.
+    #[serde(default)]
+    pub revoked_serials: Vec<String>,
+    /// DEVELOPMENT ONLY: any client with a valid certificate may do anything.
+    #[serde(default)]
+    pub insecure_allow_any_client: bool,
 }
 
 fn default_unseal_threshold() -> u8 {
@@ -47,6 +67,17 @@ fn default_commit_timeout_ms() -> u64 {
 }
 
 impl NodeConfig {
+    pub fn policy_config(&self) -> crate::middleware::authz::PolicyConfig {
+        crate::middleware::authz::PolicyConfig {
+            peer_cns: self.peer_cns.clone(),
+            admin_cns: self.admin_cns.clone(),
+            writer_cns: self.writer_cns.clone(),
+            reader_cns: self.reader_cns.clone(),
+            revoked_serials: self.revoked_serials.clone(),
+            insecure_allow_any_client: self.insecure_allow_any_client,
+        }
+    }
+
     pub fn raft_dir(&self) -> std::path::PathBuf {
         match &self.raft_dir {
             Some(dir) => std::path::PathBuf::from(dir),
@@ -74,6 +105,11 @@ impl NodeConfig {
             .separator("__")
             .list_separator(",")
             .with_list_parse_key("peers")
+            .with_list_parse_key("peer_cns")
+            .with_list_parse_key("admin_cns")
+            .with_list_parse_key("writer_cns")
+            .with_list_parse_key("reader_cns")
+            .with_list_parse_key("revoked_serials")
             .try_parsing(true)
             .source(env_override);
         builder = builder.add_source(env);
@@ -196,6 +232,25 @@ mod tests {
         let cfg = NodeConfig::build(None, Some(env)).unwrap();
         assert_eq!(cfg.raft_dir(), std::path::PathBuf::from("/var/lib/sentinel/raft"));
         assert_eq!(cfg.commit_timeout_ms, 250);
+    }
+
+    #[test]
+    fn authorization_lists_come_from_comma_separated_env_vars_and_default_to_empty_and_secure() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert!(cfg.admin_cns.is_empty() && cfg.peer_cns.is_empty() && cfg.revoked_serials.is_empty());
+        assert!(!cfg.insecure_allow_any_client, "the insecure switch must default to off");
+
+        let mut env = base_env();
+        env.insert("SENTINEL__ADMIN_CNS".into(), "root,deputy".into());
+        env.insert("SENTINEL__WRITER_CNS".into(), "app-w".into());
+        env.insert("SENTINEL__PEER_CNS".into(), "node1,node2,node3".into());
+        env.insert("SENTINEL__REVOKED_SERIALS".into(), "00:ab,0xcd".into());
+        let cfg = NodeConfig::build(None, Some(env)).unwrap();
+        assert_eq!(cfg.admin_cns, vec!["root", "deputy"]);
+        assert_eq!(cfg.writer_cns, vec!["app-w"]);
+        assert_eq!(cfg.peer_cns.len(), 3);
+        let policy = crate::middleware::authz::Policy::new(&cfg.policy_config(), true).unwrap();
+        assert!(policy.is_revoked("ab") && policy.is_revoked("CD"));
     }
 
     #[test]

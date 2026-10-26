@@ -42,10 +42,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let peer_addrs = cfg.parse_peer_addrs()?;
+
+    // Authorization is default-deny. A policy that would lock everyone out (no
+    // admins, no secret clients, peers without peer identities) is a startup
+    // error rather than a vault nobody can use, and the insecure development
+    // switch is refused unless explicitly set.
+    let policy = middleware::authz::Policy::new(&cfg.policy_config(), !peer_addrs.is_empty())
+        .map_err(|e| anyhow::anyhow!("invalid authorization configuration: {e}"))?;
+    for warning in policy.warnings() {
+        tracing::warn!("{warning}");
+    }
+    let policy = Arc::new(policy);
     let peer_ids: Vec<u64> = peer_addrs.keys().copied().collect();
 
     let http_client = build_mtls_reqwest_client(&cfg)?;
-    let raft_transport = Arc::new(HttpTransport::new(http_client, peer_addrs));
+    // One object plays two roles: the Raft RPC transport, and the way this
+    // node asks the leader to seal the cluster when it is not the leader.
+    let peer_transport = Arc::new(HttpTransport::new(http_client, peer_addrs));
+    let raft_transport: Arc<dyn sentinel_consensus::Transport> = peer_transport.clone();
+    let seal_forwarder: Arc<dyn transport::SealForwarder> = peer_transport;
 
     // Raft's term, vote and log live on disk and are fsync'd before this node
     // answers a peer or acknowledges a client, so a crash or restart cannot
@@ -88,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
         unseal,
         applied,
         commit_timeout: Duration::from_millis(cfg.commit_timeout_ms),
+        policy: policy.clone(),
+        seal_forwarder,
     };
     let router = routes::build_router(app_state);
 
@@ -105,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         let (stream, peer_addr) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let router = router.clone();
+        let policy = policy.clone();
 
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
@@ -126,6 +144,19 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(peer = %peer_addr, "handshake succeeded but client cert had no readable CN; refusing connection");
                 return;
             };
+
+            // Revocation: refuse a certificate whose serial is on the deny-list,
+            // even though the CA signed it and the handshake succeeded.
+            let serial = {
+                let (_, conn) = tls_stream.get_ref();
+                conn.peer_certificates().and_then(|certs| certs.first()).and_then(mtls::cert_serial_hex)
+            };
+            if let Some(serial) = &serial {
+                if policy.is_revoked(serial) {
+                    tracing::warn!(peer = %peer_addr, identity = %identity.0, serial = %serial, "refusing a connection from a revoked certificate");
+                    return;
+                }
+            }
 
             let router_with_identity = router.layer(axum::Extension(identity));
             let hyper_service = hyper_util::service::TowerToHyperService::new(router_with_identity);

@@ -16,10 +16,10 @@ pub enum MtlsError {
 }
 
 /// The identity of the mTLS peer that made this request, extracted from
-/// their client certificate's Common Name after the handshake — never
+/// their client certificate's Common Name after the handshake - never
 /// from anything the request body claims about itself. Inserted as an
 /// Axum request extension by the connection-handling loop in `main.rs`,
-/// once per connection (not once per request — a single mTLS connection
+/// once per connection (not once per request - a single mTLS connection
 /// keeps its verified identity for its whole lifetime, matching how the
 /// handshake itself works).
 #[derive(Debug, Clone)]
@@ -30,12 +30,12 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 /// Installs `ring` as the process-wide default rustls crypto provider,
 /// exactly once. Needed because `reqwest`'s TLS stack pulls in
 /// `aws-lc-rs` while our own direct `rustls` dependency defaults to
-/// `ring` — with two providers compiled into the same binary, rustls
+/// `ring` - with two providers compiled into the same binary, rustls
 /// 0.23 refuses to silently guess and panics on the first `ServerConfig`
 /// or `ClientConfig` built without an explicit choice. Called from every
 /// entry point that touches rustls (this module's `build_server_config`,
 /// and `main.rs` before building the reqwest client), so it's always
-/// installed before it's needed regardless of which one runs first —
+/// installed before it's needed regardless of which one runs first -
 /// `Once` makes calling it from multiple places safe.
 pub fn ensure_crypto_provider_installed() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
@@ -63,14 +63,14 @@ fn load_private_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'sta
 
 /// Builds a `rustls::ServerConfig` that requires every client to present
 /// a certificate signed by `ca_cert_path`, and refuses the handshake
-/// entirely otherwise — there is no code path in this config that
+/// entirely otherwise - there is no code path in this config that
 /// accepts an unauthenticated connection. This exact shape (client-cert
 /// verifier via `WebPkiClientVerifier`, `with_single_cert` for the
 /// server's own identity) was verified against a real TCP+TLS handshake
 /// before being written here: valid client certs are accepted and their
 /// CN is extractable, connections with no client cert are rejected, and
 /// connections presenting a cert not signed by the trusted CA are
-/// rejected — including when the certs and keys are loaded from real
+/// rejected - including when the certs and keys are loaded from real
 /// PEM files on disk, exactly as this function does.
 pub fn build_server_config(
     cert_path: &Path,
@@ -100,7 +100,7 @@ pub fn build_server_config(
 /// Extracts the client certificate's Common Name (e.g. "alice-operator",
 /// or a cluster peer's node id) from the DER-encoded peer certificate
 /// rustls hands back after a successful handshake. Returns `None` if the
-/// cert is malformed or has no CN — callers should treat that as "no
+/// cert is malformed or has no CN - callers should treat that as "no
 /// usable identity," not silently proceed as an anonymous request, since
 /// by the time this is called the handshake already required *some*
 /// CA-signed certificate to exist.
@@ -108,6 +108,13 @@ pub fn extract_cn(cert_der: &CertificateDer<'_>) -> Option<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref()).ok()?;
     let cn = cert.subject().iter_common_name().next().and_then(|attr| attr.as_str().ok()).map(|s| s.to_string());
     cn
+}
+
+/// The certificate's serial number as canonical lowercase hex (no leading
+/// zeros), the form the revocation deny-list is compared in.
+pub fn cert_serial_hex(cert_der: &CertificateDer<'_>) -> Option<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref()).ok()?;
+    Some(cert.tbs_certificate.serial.to_str_radix(16))
 }
 
 #[cfg(test)]
@@ -153,6 +160,18 @@ mod tests {
         let leaf = make_leaf(&ca_cert, &ca_key, "alice-operator");
         let cn = extract_cn(&leaf.cert_der).expect("should extract a CN");
         assert_eq!(cn, "alice-operator");
+    }
+
+    #[test]
+    fn the_serial_is_extracted_and_is_stable_and_distinct_per_certificate() {
+        let (ca_cert, ca_key) = make_ca();
+        let a = make_leaf(&ca_cert, &ca_key, "a");
+        let b = make_leaf(&ca_cert, &ca_key, "b");
+        let sa = cert_serial_hex(&a.cert_der).expect("serial");
+        assert_eq!(sa, cert_serial_hex(&a.cert_der).unwrap());
+        assert_ne!(sa, cert_serial_hex(&b.cert_der).unwrap(), "two certificates must not share a serial");
+        assert!(sa.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(crate::middleware::authz::normalize_serial(&sa).as_deref(), Some(sa.as_str()), "already canonical");
     }
 
     #[test]

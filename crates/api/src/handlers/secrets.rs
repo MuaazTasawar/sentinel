@@ -79,59 +79,77 @@ pub async fn put_secret(
 }
 
 /// Reads a secret. Requires the vault to be unsealed. Does not require
-/// leadership - reads are served locally, which is standard practice
-/// for a "read your own writes isn't guaranteed on a stale follower"
-/// tradeoff; a future phase could add a leader-only strict-read mode for
-/// callers that need linearizable reads.
+/// leadership: reads are served from this node's own storage, so a follower
+/// that is a moment behind the leader can briefly return an older value.
 ///
-/// Every read is recorded against the node's anomaly detector *before*
-/// anything else happens. If the resulting access rate is a statistical
-/// outlier against this node's own recent baseline, the vault seals
-/// itself immediately - including refusing the very request that
-/// triggered the detection - and proposes the seal decision to the Raft
-/// log so the rest of the cluster converges on the same sealed state
-/// rather than leaving other nodes exploitable.
+/// Every **successful** read is recorded against the node's anomaly detector.
+/// If the resulting access rate is a statistical outlier against this node's
+/// own recent baseline, the vault seals itself, withholds the secret it was
+/// about to return, and asks the cluster to seal too (see [`propagate_seal`]).
+///
+/// Only reads that actually return a secret count. Lookups of names that do
+/// not exist (404), reads against a sealed vault (503) and failed decryptions
+/// reveal nothing, so they must not be able to trip the seal: otherwise any
+/// client with a valid certificate could lock the whole vault by looping over
+/// made-up names. Such misses are not an exfiltration signal.
 pub async fn get_secret(
     State(state): State<AppState>,
     Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
 ) -> Result<Bytes, AppError> {
+    let plaintext = {
+        let kek_guard = state.kek.lock().await;
+        let kek = kek_guard.as_ref().ok_or(AppError::Sealed)?;
+
+        let blob = state.storage.get(&storage_key(&key)).await.map_err(|_| AppError::NotFound)?;
+        let ciphertext: envelope::EnvelopeCiphertext =
+            bincode::deserialize(&blob).map_err(|e| AppError::Internal(e.into()))?;
+        envelope::decrypt(kek, &ciphertext)?
+    };
+
     let anomaly = state.anomaly_detector.lock().await.record_access(Instant::now());
     if let Some(report) = anomaly {
         // Seal locally first and unconditionally: a node that detects the
         // anomaly must protect itself even if replication is degraded, which
-        // is exactly when it is most likely to be.
+        // is exactly when it is most likely to be. The plaintext we already
+        // decrypted is dropped here, never returned.
         *state.kek.lock().await = None;
-        // Then ask the cluster to seal too. The command is applied on every
-        // node when it commits. Best-effort: only the leader can propose, so
-        // an anomaly detected on a follower seals that follower now and is
-        // forwarded to the leader by the peer-forwarding added in Phase 16.
-        let seal = Command::Seal {
-            reason: format!(
-                "access rate anomaly detected by {}: count={}, baseline_mean={:.1}, z_score={:.1}",
-                identity.0, report.current_count, report.baseline_mean, report.z_score
-            ),
-        };
-        let _ = state.raft.propose(seal.encode()).await;
+        let reason = format!(
+            "access rate anomaly detected by {}: count={}, baseline_mean={:.1}, z_score={:.1}",
+            identity.0, report.current_count, report.baseline_mean, report.z_score
+        );
         state.audit.lock().await.append(format!(
             "AUTO-SEAL triggered by {}: access rate anomaly (count={}, baseline_mean={:.1}, z_score={:.1})",
             identity.0, report.current_count, report.baseline_mean, report.z_score
         ));
+        propagate_seal(&state, reason).await;
         return Err(AppError::Sealed);
     }
-
-    let kek_guard = state.kek.lock().await;
-    let kek = kek_guard.as_ref().ok_or(AppError::Sealed)?;
-
-    let blob = state.storage.get(&storage_key(&key)).await.map_err(|_| AppError::NotFound)?;
-    let ciphertext: envelope::EnvelopeCiphertext =
-        bincode::deserialize(&blob).map_err(|e| AppError::Internal(e.into()))?;
-    let plaintext = envelope::decrypt(kek, &ciphertext)?;
-    drop(kek_guard);
 
     state.audit.lock().await.append(format!("secret read: {key} (by {})", identity.0));
 
     Ok(Bytes::from(plaintext))
+}
+
+/// Gets a seal to the rest of the cluster. If this node is the leader the
+/// seal is proposed to the log and every node applies it when it commits. If
+/// it is not, the request is forwarded to the peers in the background (only
+/// the leader accepts it). Either way the caller has already sealed locally.
+async fn propagate_seal(state: &AppState, reason: String) {
+    let command = Command::Seal { reason: reason.clone() };
+    match state.raft.propose(command.encode()).await {
+        Ok(_) => {}
+        Err(sentinel_consensus::ConsensusError::NotLeader) => {
+            let forwarder = state.seal_forwarder.clone();
+            tokio::spawn(async move {
+                let accepted = forwarder.forward_seal(&reason).await;
+                if accepted == 0 {
+                    tracing::warn!("no peer accepted the forwarded seal (no leader reachable); only this node is sealed");
+                }
+            });
+        }
+        Err(e) => tracing::warn!(error = %e, "could not propose the cluster-wide seal"),
+    }
 }
 
 /// Deletes a secret. Requires the vault to be unsealed and this node to be
@@ -168,6 +186,7 @@ mod tests {
     use crate::handlers::unseal::UnsealState;
     use axum::{routing::get, Router};
     use sentinel_crypto::envelope::KEY_LEN;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     async fn test_state() -> (AppState, tempfile::TempDir) {
@@ -480,5 +499,126 @@ mod tests {
         })
         .await
         .expect("the replicated seal command should have been applied");
+    }
+
+    #[tokio::test]
+    async fn lookups_of_names_that_do_not_exist_can_never_trip_the_auto_seal() {
+        // The DoS this fixes: any client with a valid certificate could loop
+        // over made-up names, the 404s counted as "reads", and the whole
+        // vault sealed itself.
+        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
+        let (state, _dir) = test_state_with_detector(detector).await;
+        let kek = state.kek.clone();
+        let router = app(state);
+
+        let put = axum::http::Request::builder().method("PUT").uri("/secrets/real").body(axum::body::Body::from("v")).unwrap();
+        router.clone().oneshot(put).await.unwrap();
+        // A normal baseline of successful reads...
+        for _ in 0..10 {
+            let req = axum::http::Request::builder().uri("/secrets/real").body(axum::body::Body::empty()).unwrap();
+            assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // ...then a flood of misses far larger than the burst that DOES seal the vault.
+        for i in 0..400 {
+            let req = axum::http::Request::builder().uri(format!("/secrets/missing-{i}")).body(axum::body::Body::empty()).unwrap();
+            assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND, "request {i}");
+        }
+        assert!(kek.lock().await.is_some(), "a flood of 404s must not seal the vault");
+
+        let req = axum::http::Request::builder().uri("/secrets/real").body(axum::body::Body::empty()).unwrap();
+        assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::OK, "and the vault still serves real reads");
+    }
+
+    #[tokio::test]
+    async fn the_secret_that_triggers_the_seal_is_withheld() {
+        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
+        let (state, _dir) = test_state_with_detector(detector).await;
+        let router = app(state);
+        let put = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("TOP-SECRET")).unwrap();
+        router.clone().oneshot(put).await.unwrap();
+        for _ in 0..10 {
+            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
+            router.clone().oneshot(req).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let mut leaked_after_seal = false;
+        let mut sealed = false;
+        for _ in 0..60 {
+            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                sealed = true;
+                assert!(!String::from_utf8_lossy(&body).contains("TOP-SECRET"), "the sealing response must not carry the secret");
+            } else if sealed {
+                leaked_after_seal = true;
+            }
+        }
+        assert!(sealed, "the burst should have sealed the vault");
+        assert!(!leaked_after_seal, "once sealed, no later read may succeed");
+    }
+
+    #[tokio::test]
+    async fn an_anomaly_on_a_follower_is_forwarded_to_the_peers_instead_of_being_dropped() {
+        use crate::state::test_support::build;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Silent;
+        #[async_trait::async_trait]
+        impl sentinel_consensus::Transport for Silent {
+            async fn send_request_vote(&self, p: u64, _: sentinel_consensus::RequestVoteRequest) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError> {
+                Err(sentinel_consensus::TransportError::Unreachable(p))
+            }
+            async fn send_append_entries(&self, p: u64, _: sentinel_consensus::AppendEntriesRequest) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError> {
+                Err(sentinel_consensus::TransportError::Unreachable(p))
+            }
+        }
+        struct Recorder(Arc<AtomicUsize>, Arc<std::sync::Mutex<String>>);
+        #[async_trait::async_trait]
+        impl crate::transport::SealForwarder for Recorder {
+            async fn forward_seal(&self, reason: &str) -> usize {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                *self.1.lock().unwrap() = reason.to_string();
+                1
+            }
+        }
+
+        let kek = sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN]);
+        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
+        // Peers exist but never answer, so this node is permanently a follower.
+        let (mut state, _dir) = build(Some(sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN])), detector, UnsealState::new(2), vec![2, 3], Arc::new(Silent), std::time::Duration::from_secs(1)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reason = Arc::new(std::sync::Mutex::new(String::new()));
+        state.seal_forwarder = Arc::new(Recorder(calls.clone(), reason.clone()));
+
+        // A follower cannot take writes through Raft, so place the ciphertext directly.
+        let blob = bincode::serialize(&envelope::encrypt(&kek, b"v").unwrap()).unwrap();
+        state.storage.put("secrets/k", blob).await.unwrap();
+        let kek_handle = state.kek.clone();
+        let router = app(state);
+
+        for _ in 0..10 {
+            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
+            router.clone().oneshot(req).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for _ in 0..60 {
+            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
+            if router.clone().oneshot(req).await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+        }
+        assert!(kek_handle.lock().await.is_none(), "the follower seals itself immediately");
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the seal should have been forwarded to the peers");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "forwarded exactly once");
+        assert!(reason.lock().unwrap().contains("access rate anomaly"));
     }
 }

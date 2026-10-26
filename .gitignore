@@ -11,3 +11,5 @@ sentinel.db/
 /crates/crypto/fuzz/target/
 /crates/crypto/fuzz/corpus/
 /crates/crypto/fuzz/artifacts/
+# one-off installer scripts delivered alongside the phases
+phase*.ps1
