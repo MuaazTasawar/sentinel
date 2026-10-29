@@ -56,6 +56,22 @@ pub struct NodeConfig {
     /// DEVELOPMENT ONLY: any client with a valid certificate may do anything.
     #[serde(default)]
     pub insecure_allow_any_client: bool,
+
+    // ---- provisioning and audit ----
+    /// Where the tamper-evident audit log is written (JSON lines, fsync'd per
+    /// entry). Defaults to `<storage_path>.audit.jsonl`.
+    #[serde(default)]
+    pub audit_path: Option<String>,
+    /// The `canary.bin` produced by `sentinel-cli init`. Installed into this
+    /// node's storage at startup if it has none; a different canary already in
+    /// storage is a startup error (wrong vault / wrong directory).
+    #[serde(default)]
+    pub canary_file: Option<String>,
+    /// DEVELOPMENT ONLY: let the first successful unseal of an empty vault
+    /// define the canary (trust on first use). Off by default: a vault must be
+    /// provisioned with `sentinel-cli init`.
+    #[serde(default)]
+    pub allow_canary_bootstrap: bool,
 }
 
 fn default_unseal_threshold() -> u8 {
@@ -75,6 +91,13 @@ impl NodeConfig {
             reader_cns: self.reader_cns.clone(),
             revoked_serials: self.revoked_serials.clone(),
             insecure_allow_any_client: self.insecure_allow_any_client,
+        }
+    }
+
+    pub fn audit_path(&self) -> std::path::PathBuf {
+        match &self.audit_path {
+            Some(path) => std::path::PathBuf::from(path),
+            None => std::path::PathBuf::from(format!("{}.audit.jsonl", self.storage_path)),
         }
     }
 
@@ -251,6 +274,23 @@ mod tests {
         assert_eq!(cfg.peer_cns.len(), 3);
         let policy = crate::middleware::authz::Policy::new(&cfg.policy_config(), true).unwrap();
         assert!(policy.is_revoked("ab") && policy.is_revoked("CD"));
+    }
+
+    #[test]
+    fn audit_and_provisioning_settings_default_to_safe_values() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert_eq!(cfg.audit_path(), std::path::PathBuf::from("data.audit.jsonl"));
+        assert!(cfg.canary_file.is_none());
+        assert!(!cfg.allow_canary_bootstrap, "trust-on-first-use must be opt-in");
+
+        let mut env = base_env();
+        env.insert("SENTINEL__AUDIT_PATH".into(), "/var/log/sentinel/audit.jsonl".into());
+        env.insert("SENTINEL__CANARY_FILE".into(), "/etc/sentinel/canary.bin".into());
+        env.insert("SENTINEL__ALLOW_CANARY_BOOTSTRAP".into(), "true".into());
+        let cfg = NodeConfig::build(None, Some(env)).unwrap();
+        assert_eq!(cfg.audit_path(), std::path::PathBuf::from("/var/log/sentinel/audit.jsonl"));
+        assert_eq!(cfg.canary_file.as_deref(), Some("/etc/sentinel/canary.bin"));
+        assert!(cfg.allow_canary_bootstrap);
     }
 
     #[test]

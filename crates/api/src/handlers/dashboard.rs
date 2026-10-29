@@ -16,7 +16,7 @@ pub async fn dashboard_status(State(state): State<AppState>) -> Json<Value> {
 
     let sealed = state.kek.lock().await.is_none();
 
-    let (audit_verified, audit_entry_count, audit_tip_hash, recent_events) = {
+    let (audit_verified, audit_entry_count, audit_tip_hash, recent_events, audit_persistent, audit_healthy) = {
         let chain = state.audit.lock().await;
         let verified = chain.verify().is_ok();
         let tip_hash = chain.tip_hash().iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -27,7 +27,7 @@ pub async fn dashboard_status(State(state): State<AppState>) -> Json<Value> {
             .take(10)
             .map(|e| json!({ "index": e.index, "timestamp": e.timestamp.to_rfc3339(), "event": e.event }))
             .collect();
-        (verified, chain.entries().len(), tip_hash, recent)
+        (verified, chain.entries().len(), tip_hash, recent, chain.is_persistent(), chain.is_healthy())
     };
 
     let anomaly_snapshot = state.anomaly_detector.lock().await.snapshot();
@@ -41,6 +41,8 @@ pub async fn dashboard_status(State(state): State<AppState>) -> Json<Value> {
             "verified": audit_verified,
             "entry_count": audit_entry_count,
             "tip_hash": audit_tip_hash,
+            "persistent": audit_persistent,
+            "healthy": audit_healthy,
             "recent_events": recent_events,
         },
         "anomaly": {
@@ -84,6 +86,8 @@ mod tests {
         assert_eq!(json["sealed"], true);
         assert_eq!(json["audit"]["verified"], true);
         assert_eq!(json["audit"]["entry_count"], 1);
+        assert_eq!(json["audit"]["persistent"], false, "the test fixture uses an in-memory chain");
+        assert_eq!(json["audit"]["healthy"], true);
         assert_eq!(json["audit"]["recent_events"][0]["event"], "node started");
         assert_eq!(json["anomaly"]["current_count"], 0);
     }

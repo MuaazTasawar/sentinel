@@ -29,6 +29,10 @@ pub enum AppError {
     CommitTimeout,
     #[error("leadership changed before the write committed; it was discarded, please retry")]
     LeadershipLost,
+    /// The audit log could not be written. Secret operations are refused
+    /// rather than performed without a durable record of them.
+    #[error("the audit log is not writable, so secret operations are refused until it is restored")]
+    AuditUnavailable,
     #[error("storage error: {0}")]
     Storage(#[from] sentinel_storage::StorageError),
     #[error("crypto error: {0}")]
@@ -48,6 +52,10 @@ impl IntoResponse for AppError {
             AppError::NotLeader(_) => (StatusCode::MISDIRECTED_REQUEST, self.to_string()),
             AppError::CommitTimeout => (StatusCode::GATEWAY_TIMEOUT, self.to_string()),
             AppError::LeadershipLost => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
+            AppError::AuditUnavailable => {
+                tracing::error!("refusing a secret operation: the audit log is degraded");
+                (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+            }
             AppError::Storage(_) | AppError::Crypto(_) | AppError::Internal(_) => {
                 tracing::error!(error = ?self, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())

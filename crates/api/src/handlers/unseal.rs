@@ -194,7 +194,15 @@ async fn verify_or_initialise_canary(state: &AppState, kek: &SecretBytes) -> Res
             }
         }
         Err(StorageError::NotFound(_)) => {
-            // No canary yet. Only safe to define one if the vault is empty:
+            if !state.allow_canary_bootstrap {
+                // The safe default. Letting the first quorum define the canary
+                // would bless whatever key a (possibly mistaken or malicious)
+                // first quorum produced. A real vault is provisioned instead.
+                return Err(AppError::Conflict(
+                    "this vault has not been initialised: no key canary is installed. Run `sentinel-cli init`, set `canary_file` to the canary.bin it wrote, and restart the node (development only: `allow_canary_bootstrap = true`)".into(),
+                ));
+            }
+            // Development bootstrap. Only safe if the vault is empty:
             // otherwise we'd be blessing an unverified key over real data.
             if !state.storage.list("secrets/").await?.is_empty() {
                 return Err(AppError::Conflict(
@@ -325,6 +333,47 @@ mod tests {
         let events: Vec<&str> = chain.entries().iter().map(|e| e.event.as_str()).collect();
         assert!(events.iter().any(|e| e.starts_with("vault UNSEALED")));
         assert!(events.iter().any(|e| e.starts_with("unseal share accepted from holder alice")));
+    }
+
+    #[tokio::test]
+    async fn without_a_provisioned_canary_the_first_unseal_is_refused_by_default() {
+        let (mut state, _dir) = state_with(None, default_detector(), UnsealState::new(2)).await;
+        state.allow_canary_bootstrap = false;
+        let kek = state.kek.clone();
+        let storage = state.storage.clone();
+        let router = app(state);
+        let shares = shares_for(&KEK_BYTES);
+
+        submit(&router, "alice", &shares[0]).await;
+        let (status, body) = submit(&router, "bob", &shares[1]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"].as_str().unwrap().contains("sentinel-cli init"), "the error must say what to do: {body}");
+        assert!(kek.lock().await.is_none(), "an unprovisioned vault must stay sealed");
+        assert!(storage.get(CANARY_KEY).await.is_err(), "and must not invent a canary");
+    }
+
+    #[tokio::test]
+    async fn a_provisioned_canary_makes_trust_on_first_use_unnecessary_and_still_rejects_wrong_keys() {
+        let (mut state, _dir) = state_with(None, default_detector(), UnsealState::new(2)).await;
+        state.allow_canary_bootstrap = false;
+        // What `sentinel-cli init` + the node's startup installer put in storage.
+        let canary_blob = canary::create(&SecretBytes::new(KEK_BYTES.to_vec())).unwrap();
+        state.storage.put(CANARY_KEY, bincode::serialize(&canary_blob).unwrap()).await.unwrap();
+        let kek = state.kek.clone();
+        let router = app(state);
+
+        // Wrong quorum first: refused.
+        let wrong = shares_for(&[0x99u8; KEY_LEN]);
+        submit(&router, "alice", &wrong[0]).await;
+        let (status, _) = submit(&router, "bob", &wrong[1]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(kek.lock().await.is_none());
+
+        // Right quorum: unsealed.
+        let good = shares_for(&KEK_BYTES);
+        submit(&router, "alice", &good[0]).await;
+        let (status, body) = submit(&router, "bob", &good[2]).await;
+        assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("unsealed")));
     }
 
     #[tokio::test]

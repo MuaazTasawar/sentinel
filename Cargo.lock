@@ -2099,6 +2099,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -2413,6 +2414,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -2423,14 +2425,19 @@ dependencies = [
  "anyhow",
  "bincode",
  "clap",
+ "rand 0.8.8",
+ "rcgen",
  "reqwest",
  "rpassword",
  "rustls",
  "sentinel-audit",
  "sentinel-crypto",
  "sentinel-hardware",
+ "serde",
  "serde_json",
  "tempfile",
+ "time",
+ "x509-parser",
  "yubikey",
 ]
 
@@ -3608,6 +3615,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

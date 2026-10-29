@@ -45,6 +45,9 @@ pub struct AppState {
     pub policy: Arc<Policy>,
     /// How this node asks the leader to seal the cluster when it cannot do so itself.
     pub seal_forwarder: Arc<dyn SealForwarder>,
+    /// Development only: let the first unseal of an empty vault define the key
+    /// canary (trust on first use). Production nodes are provisioned instead.
+    pub allow_canary_bootstrap: bool,
 }
 
 /// Shared fixtures for handler and router tests, so every test module
@@ -150,6 +153,7 @@ pub mod test_support {
             commit_timeout,
             policy: Arc::new(Policy::allow_any()),
             seal_forwarder: Arc::new(crate::transport::NoForwarder),
+            allow_canary_bootstrap: true,
         };
         (state, dir)
     }

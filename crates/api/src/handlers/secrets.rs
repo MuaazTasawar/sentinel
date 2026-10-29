@@ -24,6 +24,18 @@ fn validate_key(key: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Secret operations are refused while the audit log cannot be written: no
+/// secret is read, written, deleted or listed without a durable record. (At
+/// most the single operation in flight when the disk first failed can complete
+/// unrecorded; everything after it is refused. Sealing is never blocked.)
+async fn require_audit_healthy(state: &AppState) -> Result<(), AppError> {
+    if state.audit.lock().await.is_healthy() {
+        Ok(())
+    } else {
+        Err(AppError::AuditUnavailable)
+    }
+}
+
 /// Proposes `command` and returns only once a **majority of the cluster has
 /// committed it** and this node's state machine has applied it. Handlers never
 /// write storage themselves, so a 2xx from here means the change is durable on
@@ -63,6 +75,7 @@ pub async fn put_secret(
     Path(key): Path<String>,
     body: Bytes,
 ) -> Result<StatusCode, AppError> {
+    require_audit_healthy(&state).await?;
     validate_key(&key)?;
 
     let kek_guard = state.kek.lock().await;
@@ -97,6 +110,7 @@ pub async fn get_secret(
     Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
 ) -> Result<Bytes, AppError> {
+    require_audit_healthy(&state).await?;
     let plaintext = {
         let kek_guard = state.kek.lock().await;
         let kek = kek_guard.as_ref().ok_or(AppError::Sealed)?;
@@ -160,6 +174,7 @@ pub async fn delete_secret(
     Extension(identity): Extension<ClientIdentity>,
     Path(key): Path<String>,
 ) -> Result<StatusCode, AppError> {
+    require_audit_healthy(&state).await?;
     require_unsealed(&state).await?;
     validate_key(&key)?;
 
@@ -173,6 +188,7 @@ pub async fn delete_secret(
 /// layer namespaces everything under `secrets/`, so callers see plain key
 /// names without that prefix.)
 pub async fn list_secrets(State(state): State<AppState>) -> Result<axum::Json<Vec<String>>, AppError> {
+    require_audit_healthy(&state).await?;
     require_unsealed(&state).await?;
     let full_keys = state.storage.list("secrets/").await?;
     let keys = full_keys.into_iter().map(|k| k.trim_start_matches("secrets/").to_string()).collect();
@@ -620,5 +636,36 @@ mod tests {
         .expect("the seal should have been forwarded to the peers");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "forwarded exactly once");
         assert!(reason.lock().unwrap().contains("access rate anomaly"));
+    }
+
+    /// A sink that always fails, standing in for a full or failed disk.
+    #[derive(Debug)]
+    struct DeadDisk;
+    impl sentinel_audit::AuditSink for DeadDisk {
+        fn persist(&mut self, _: &sentinel_audit::AuditEntry) -> Result<(), sentinel_audit::AuditError> {
+            Err(sentinel_audit::AuditError::Io("disk full".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn when_the_audit_log_cannot_be_written_secret_operations_are_refused() {
+        let (state, _dir) = test_state().await;
+        let router = app(state.clone());
+
+        let put = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("v")).unwrap();
+        assert_eq!(router.clone().oneshot(put).await.unwrap().status(), StatusCode::OK, "healthy: works");
+
+        // The disk fails: the very next audit write is lost and the chain degrades.
+        *state.audit.lock().await = sentinel_audit::AuditChain::with_sink(vec![], Box::new(DeadDisk)).unwrap();
+        state.audit.lock().await.append("this entry cannot be saved");
+        assert!(!state.audit.lock().await.is_healthy());
+
+        for (method, uri, body) in [("GET", "/secrets/k", ""), ("PUT", "/secrets/k2", "v"), ("DELETE", "/secrets/k", ""), ("GET", "/secrets", "")] {
+            let req = axum::http::Request::builder().method(method).uri(uri).body(axum::body::Body::from(body)).unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} {uri} must be refused without a durable audit record");
+        }
+        assert!(state.storage.get("secrets/k2").await.is_err(), "the refused write must not have happened");
+        assert!(state.kek.lock().await.is_some(), "refusing is not the same as sealing");
     }
 }

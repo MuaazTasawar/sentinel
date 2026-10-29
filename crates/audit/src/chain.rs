@@ -14,11 +14,15 @@ pub enum AuditError {
     NonSequentialIndex { expected: u64, found: u64 },
     #[error("chain is empty")]
     EmptyChain,
+    #[error("audit log I/O error: {0}")]
+    Io(String),
+    #[error("audit log line {line} is not a valid entry: {reason}")]
+    Malformed { line: usize, reason: String },
 }
 
 /// One tamper-evident audit entry. `hash` commits to every other field
-/// plus the previous entry's hash, so altering *any* past entry — its
-/// event text, its timestamp, or its position — changes that entry's
+/// plus the previous entry's hash, so altering *any* past entry - its
+/// event text, its timestamp, or its position - changes that entry's
 /// hash and therefore breaks the link every entry after it depends on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
@@ -30,7 +34,7 @@ pub struct AuditEntry {
 }
 
 fn compute_hash(index: u64, timestamp: &DateTime<Utc>, event: &str, prev_hash: &[u8; 32]) -> [u8; 32] {
-    // Explicit, ordered byte concatenation rather than serde_json — this
+    // Explicit, ordered byte concatenation rather than serde_json - this
     // is the artifact that gets hashed and later re-verified, so its
     // encoding needs to be unambiguous and stable by construction, not
     // by accident of a serializer's field ordering.
@@ -42,25 +46,63 @@ fn compute_hash(index: u64, timestamp: &DateTime<Utc>, event: &str, prev_hash: &
     hasher.finalize().into()
 }
 
-/// An append-only, hash-chained audit log. Held in memory here; Phase 7
-/// wires this to durable storage (appending each entry to the `Storage`
-/// trait as it's created) so the log survives restarts without changing
-/// this type's verification logic.
+/// Where an [`AuditChain`] makes each new entry durable. Called once per
+/// appended entry, before `append` returns.
+pub trait AuditSink: Send + std::fmt::Debug {
+    fn persist(&mut self, entry: &AuditEntry) -> Result<(), AuditError>;
+}
+
+/// An append-only, hash-chained audit log. Purely in memory by default; give
+/// it a sink (see [`crate::open_persistent`]) and every entry is also written
+/// durably as it is appended, so the log survives restarts and `sentinel-cli
+/// verify` has a real file to check.
+///
+/// If the sink ever fails, the chain keeps accepting entries in memory but
+/// becomes *degraded* (sticky): [`is_healthy`](Self::is_healthy) turns false
+/// and callers that must not act without a durable record (the secret
+/// handlers) refuse to proceed.
 #[derive(Debug, Default)]
 pub struct AuditChain {
     entries: Vec<AuditEntry>,
+    sink: Option<Box<dyn AuditSink>>,
+    degraded: Option<String>,
 }
 
 impl AuditChain {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self::default()
+    }
+
+    /// Builds a persistent chain from entries already on disk, verifying them
+    /// first. A chain that fails verification is refused outright: starting
+    /// on top of a tampered log would launder the tampering.
+    pub fn with_sink(entries: Vec<AuditEntry>, sink: Box<dyn AuditSink>) -> Result<Self, AuditError> {
+        let chain = Self { entries, sink: Some(sink), degraded: None };
+        chain.verify()?;
+        Ok(chain)
+    }
+
+    /// True while every entry appended so far has reached the sink (always
+    /// true for a chain with no sink).
+    pub fn is_healthy(&self) -> bool {
+        self.degraded.is_none()
+    }
+
+    /// Why the chain is degraded, if it is.
+    pub fn degradation(&self) -> Option<&str> {
+        self.degraded.as_deref()
+    }
+
+    /// Whether entries are being written durably.
+    pub fn is_persistent(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// Reconstructs a chain from previously persisted entries (e.g. read
-    /// back from storage at startup). Does not verify — call `verify()`
+    /// back from storage at startup). Does not verify - call `verify()`
     /// explicitly after loading if you need that guarantee up front.
     pub fn from_entries(entries: Vec<AuditEntry>) -> Self {
-        Self { entries }
+        Self { entries, sink: None, degraded: None }
     }
 
     pub fn entries(&self) -> &[AuditEntry] {
@@ -77,6 +119,11 @@ impl AuditChain {
         let hash = compute_hash(index, &timestamp, &event, &prev_hash);
 
         self.entries.push(AuditEntry { index, timestamp, event, prev_hash, hash });
+        if let Some(sink) = self.sink.as_mut() {
+            if let Err(e) = sink.persist(self.entries.last().unwrap()) {
+                self.degraded.get_or_insert_with(|| e.to_string());
+            }
+        }
         self.entries.last().unwrap()
     }
 

@@ -1,3 +1,4 @@
+mod bootstrap;
 mod config;
 mod errors;
 mod handlers;
@@ -30,7 +31,31 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(node_id = cfg.node_id, "sentinel node starting");
 
     let storage: Arc<dyn sentinel_storage::Storage> = Arc::new(sentinel_storage::SledStorage::open(&cfg.storage_path)?);
-    let audit = Arc::new(tokio::sync::Mutex::new(sentinel_audit::AuditChain::new()));
+    if let Some(canary_file) = &cfg.canary_file {
+        match bootstrap::install_canary(&*storage, std::path::Path::new(canary_file)).await? {
+            bootstrap::CanaryOutcome::Installed => tracing::info!("installed the vault key canary from {canary_file}"),
+            bootstrap::CanaryOutcome::AlreadyPresent => tracing::info!("vault key canary already installed"),
+        }
+    }
+    if cfg.allow_canary_bootstrap {
+        tracing::warn!("allow_canary_bootstrap is ON: the first unseal of an empty vault will define its key canary (trust on first use). Development only.");
+    }
+    // The audit chain is durable: entries are appended to a file as they happen
+    // and the existing file is verified before anything else runs. A log that
+    // fails verification is refused, never quietly replaced.
+    let audit_path = cfg.audit_path();
+    let (mut chain, recovered_torn_tail) = sentinel_audit::open_persistent(&audit_path).map_err(|e| {
+        anyhow::anyhow!(
+            "the audit log {} failed to open or verify: {e}. Refusing to start. Investigate, and move the file aside only once you have preserved it as evidence",
+            audit_path.display()
+        )
+    })?;
+    if recovered_torn_tail {
+        tracing::warn!("the audit log ended in an incomplete record (a crash mid-write); it was discarded");
+        chain.append("audit log recovery: an incomplete final record from an earlier crash was discarded");
+    }
+    chain.append(format!("node {} started (audit log: {} entries before this one)", cfg.node_id, chain.entries().len()));
+    let audit = Arc::new(tokio::sync::Mutex::new(chain));
     // Sealed at startup, always: nothing in this bootstrap path ever
     // populates the KEK. A node that could unseal itself just by starting
     // up would defeat the entire point of the quorum. Unsealing is an
@@ -105,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         commit_timeout: Duration::from_millis(cfg.commit_timeout_ms),
         policy: policy.clone(),
         seal_forwarder,
+        allow_canary_bootstrap: cfg.allow_canary_bootstrap,
     };
     let router = routes::build_router(app_state);
 

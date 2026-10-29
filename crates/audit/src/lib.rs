@@ -1,2 +1,4 @@
 mod chain;
-pub use chain::{AuditChain, AuditEntry, AuditError, GENESIS_HASH};
+mod persist;
+pub use chain::{AuditChain, AuditEntry, AuditError, AuditSink, GENESIS_HASH};
+pub use persist::{open_persistent, parse_log, FileSink, ParsedLog};
