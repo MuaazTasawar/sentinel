@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 /// Controllable, fully deterministic network conditions between
-/// simulated nodes. A "partition" here is total and symmetric — neither
+/// simulated nodes. A "partition" here is total and symmetric - neither
 /// side of a partitioned pair can reach the other in either direction,
 /// matching a real network split rather than a one-way packet-loss
 /// scenario (which is a different, narrower fault this type doesn't
@@ -10,6 +10,10 @@ use std::collections::HashSet;
 pub struct NetworkConditions {
     partitioned_pairs: HashSet<(u64, u64)>,
     pub base_latency_ms: u64,
+    /// Percentage (0-100) of messages silently lost in transit.
+    pub loss_percent: u8,
+    /// Percentage (0-100) of messages delivered twice.
+    pub duplicate_percent: u8,
 }
 
 fn normalize(a: u64, b: u64) -> (u64, u64) {
@@ -22,7 +26,7 @@ fn normalize(a: u64, b: u64) -> (u64, u64) {
 
 impl NetworkConditions {
     pub fn new(base_latency_ms: u64) -> Self {
-        Self { partitioned_pairs: HashSet::new(), base_latency_ms }
+        Self { partitioned_pairs: HashSet::new(), base_latency_ms, loss_percent: 0, duplicate_percent: 0 }
     }
 
     /// Cuts all communication between `a` and `b` in both directions.
@@ -35,7 +39,7 @@ impl NetworkConditions {
         self.partitioned_pairs.remove(&normalize(a, b));
     }
 
-    /// Heals every partition at once — simulates a network-wide outage
+    /// Heals every partition at once - simulates a network-wide outage
     /// resolving.
     pub fn heal_all(&mut self) {
         self.partitioned_pairs.clear();
@@ -49,6 +53,12 @@ impl NetworkConditions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_network_loses_and_duplicates_nothing() {
+        let net = NetworkConditions::new(5);
+        assert_eq!((net.loss_percent, net.duplicate_percent), (0, 0));
+    }
 
     #[test]
     fn partition_is_symmetric() {

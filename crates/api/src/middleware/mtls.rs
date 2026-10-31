@@ -106,8 +106,8 @@ pub fn build_server_config(
 /// CA-signed certificate to exist.
 pub fn extract_cn(cert_der: &CertificateDer<'_>) -> Option<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref()).ok()?;
-    let cn = cert.subject().iter_common_name().next().and_then(|attr| attr.as_str().ok()).map(|s| s.to_string());
-    cn
+    
+    cert.subject().iter_common_name().next().and_then(|attr| attr.as_str().ok()).map(|s| s.to_string())
 }
 
 /// The certificate's serial number as canonical lowercase hex (no leading

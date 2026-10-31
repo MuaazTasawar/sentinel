@@ -93,11 +93,10 @@ impl AuditSink for FileSink {
 /// (cutting off a torn final record) fail with "Access is denied". Instead it is
 /// opened read+write and positioned at the end before every use.
 pub fn open_persistent(path: &Path) -> Result<(AuditChain, bool), AuditError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| AuditError::Io(e.to_string()))?;
         }
-    }
     let io = |e: std::io::Error| AuditError::Io(format!("{}: {e}", path.display()));
     let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(io)?;
 
@@ -222,7 +221,7 @@ mod tests {
         }
         let text = std::fs::read_to_string(&path).unwrap().replace("by alice", "by nobody");
         std::fs::write(&path, &text).unwrap();
-        let err = open_persistent(&path).err().expect("a tampered log must be refused");
+        let err = open_persistent(&path).expect_err("a tampered log must be refused");
         assert!(matches!(err, AuditError::HashMismatch { index: 0 }), "got {err:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "refusing must not modify the evidence");
     }

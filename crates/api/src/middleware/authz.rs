@@ -215,11 +215,10 @@ impl Policy {
 async fn enforce(state: AppState, permission: Permission, req: Request, next: Next) -> Response {
     let cn = req.extensions().get::<ClientIdentity>().map(|i| i.0.clone());
 
-    if let Some(cn) = &cn {
-        if state.policy.allows(cn, permission) {
+    if let Some(cn) = &cn
+        && state.policy.allows(cn, permission) {
             return next.run(req).await;
         }
-    }
 
     let who = cn.unwrap_or_else(|| "<no identity>".to_string());
     let what = format!("{} {}", req.method(), req.uri().path());

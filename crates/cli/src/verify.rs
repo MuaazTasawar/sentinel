@@ -50,12 +50,11 @@ pub fn run(path: PathBuf, opts: &VerifyOptions) -> anyhow::Result<()> {
         }
         println!("tip hash matches the expected value");
     }
-    if let Some(min) = opts.expect_entries {
-        if chain.entries().len() < min {
+    if let Some(min) = opts.expect_entries
+        && chain.entries().len() < min {
             println!("TOO FEW ENTRIES: expected at least {min}");
             bail!("the log has {} entries but at least {min} were expected: entries may have been removed", chain.entries().len());
         }
-    }
     Ok(())
 }
 

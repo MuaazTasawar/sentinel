@@ -119,11 +119,10 @@ impl AuditChain {
         let hash = compute_hash(index, &timestamp, &event, &prev_hash);
 
         self.entries.push(AuditEntry { index, timestamp, event, prev_hash, hash });
-        if let Some(sink) = self.sink.as_mut() {
-            if let Err(e) = sink.persist(self.entries.last().unwrap()) {
+        if let Some(sink) = self.sink.as_mut()
+            && let Err(e) = sink.persist(self.entries.last().unwrap()) {
                 self.degraded.get_or_insert_with(|| e.to_string());
             }
-        }
         self.entries.last().unwrap()
     }
 
@@ -196,7 +195,7 @@ mod tests {
     fn tampering_with_timestamp_breaks_verification() {
         let mut chain = AuditChain::new();
         chain.append("event a");
-        chain.entries[0].timestamp = chain.entries[0].timestamp + chrono::Duration::days(1);
+        chain.entries[0].timestamp += chrono::Duration::days(1);
         let err = chain.verify().unwrap_err();
         assert!(matches!(err, AuditError::HashMismatch { index: 0 }));
     }

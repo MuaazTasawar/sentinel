@@ -102,12 +102,11 @@ pub async fn submit_share(
     let share = decode_share(&req.share)?;
 
     let mut session = state.unseal.session.lock().await;
-    if let Some(started) = session.started {
-        if started.elapsed() > state.unseal.session_timeout {
+    if let Some(started) = session.started
+        && started.elapsed() > state.unseal.session_timeout {
             *session = state.unseal.fresh_session();
             state.audit.lock().await.append("unseal session expired; discarded partial shares");
         }
-    }
 
     session
         .quorum
@@ -249,7 +248,7 @@ fn decode_share(hex: &str) -> Result<ShamirShare, AppError> {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()

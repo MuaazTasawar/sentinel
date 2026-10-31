@@ -177,12 +177,11 @@ async fn main() -> anyhow::Result<()> {
                 let (_, conn) = tls_stream.get_ref();
                 conn.peer_certificates().and_then(|certs| certs.first()).and_then(mtls::cert_serial_hex)
             };
-            if let Some(serial) = &serial {
-                if policy.is_revoked(serial) {
+            if let Some(serial) = &serial
+                && policy.is_revoked(serial) {
                     tracing::warn!(peer = %peer_addr, identity = %identity.0, serial = %serial, "refusing a connection from a revoked certificate");
                     return;
                 }
-            }
 
             let router_with_identity = router.layer(axum::Extension(identity));
             let hyper_service = hyper_util::service::TowerToHyperService::new(router_with_identity);

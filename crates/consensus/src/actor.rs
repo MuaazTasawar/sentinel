@@ -230,11 +230,10 @@ fn drain_committed(
             let result = if proposed_term == entry.term { Ok(entry.index) } else { Err(ConsensusError::LeadershipLost) };
             let _ = waiter.send(result);
         }
-        if !entry.is_noop() {
-            if let Some(tx) = apply_tx {
+        if !entry.is_noop()
+            && let Some(tx) = apply_tx {
                 let _ = tx.send(entry);
             }
-        }
     }
 }
 
@@ -523,7 +522,7 @@ mod tests {
             let mut best: Option<(u64, u64)> = None; // (term, id)
             for &id in among {
                 let (role, term, _) = self.handles[&id].inspect().await;
-                if role == Role::Leader && best.map_or(true, |(t, _)| term > t) {
+                if role == Role::Leader && best.is_none_or(|(t, _)| term > t) {
                     best = Some((term, id));
                 }
             }
@@ -548,11 +547,10 @@ mod tests {
         async fn propose_ok(&self, among: &[u64], command: &[u8]) -> u64 {
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    if let Some(leader) = self.leader_among(among).await {
-                        if let Ok(index) = self.handles[&leader].propose_and_wait(command.to_vec(), Duration::from_millis(800)).await {
+                    if let Some(leader) = self.leader_among(among).await
+                        && let Ok(index) = self.handles[&leader].propose_and_wait(command.to_vec(), Duration::from_millis(800)).await {
                             return index;
                         }
-                    }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             })

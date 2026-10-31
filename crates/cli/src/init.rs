@@ -72,7 +72,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
@@ -226,40 +226,49 @@ fn write_all(params: &InitParams, passphrases: &HashMap<String, String>) -> anyh
 
     let instructions = params.out.join("PROVISIONING.txt");
     let holders = params.holders.join(", ");
-    let text = format!(
-        "Sentinel vault provisioning\n\
-         ===========================\n\n\
-         Holders ({}): {holders}\n\
-         Threshold: {} of {} holders must submit their share to unseal a node.\n\
-         Share format: {}\n\n\
-         1. Give each holder ONLY their own share-<name> file, over a channel you trust.\n\
-         {}\
-         2. Copy canary.bin to every node (it is not secret) and set in its config:\n\
-              canary_file     = \"/path/to/canary.bin\"\n\
-              unseal_threshold = {}\n\
-            The canary is installed into the node's storage at startup. With it in\n\
-            place the node never has to trust the first unseal.\n\
-         3. To unseal, each holder runs (separately, from anywhere that can reach the node):\n\
-              {}\n\
-         4. Delete this directory's share files from this machine once distributed.\n\n\
-         The root key was never written to disk.\n",
-        params.holders.len(),
-        params.threshold,
-        params.holders.len(),
-        match params.format {
-            ShareFormat::Passphrase => "passphrase-protected (Argon2id + AES-256-GCM)",
-            ShareFormat::Plain => "PLAIN HEX - development only; anyone holding a file holds that share outright",
-        },
-        match params.format {
-            ShareFormat::Passphrase => "   Each holder chose a passphrase; it is not recorded anywhere. A lost\n   passphrase means that share is lost.\n",
-            ShareFormat::Plain => "   WARNING: these files are unprotected. Encrypt them yourself before sending.\n",
-        },
-        params.threshold,
-        match params.format {
-            ShareFormat::Passphrase => "sentinel-cli unseal-file --node https://HOST:PORT --cert C --key K --ca CA --file share-<name>.enc",
-            ShareFormat::Plain => "sentinel-cli submit-share --node https://HOST:PORT --cert C --key K --ca CA --holder <name> < share-<name>.hex",
-        },
-    );
+    let (format_name, passphrase_note, unseal_cmd) = match params.format {
+        ShareFormat::Passphrase => (
+            "passphrase-protected (Argon2id + AES-256-GCM)",
+            "   Each holder chose a passphrase; it is not recorded anywhere. A lost\n   passphrase means that share is lost.\n",
+            "sentinel-cli unseal-file --node https://HOST:PORT --cert C --key K --ca CA --file share-<name>.enc",
+        ),
+        ShareFormat::Plain => (
+            "PLAIN HEX - development only; anyone holding a file holds that share outright",
+            "   WARNING: these files are unprotected. Encrypt them yourself before sending.\n",
+            "sentinel-cli submit-share --node https://HOST:PORT --cert C --key K --ca CA --holder <name> < share-<name>.hex",
+        ),
+    };
+    // A raw string, so the indentation below is exactly what lands in the file
+    // (a `\` line continuation in a normal string would swallow it).
+    let template = r#"Sentinel vault provisioning
+===========================
+
+Holders (@COUNT@): @HOLDERS@
+Threshold: @THRESHOLD@ of @COUNT@ holders must submit their share to unseal a node.
+Share format: @FORMAT@
+
+1. Give each holder ONLY their own share-<name> file, over a channel you trust.
+@NOTE@
+2. Copy canary.bin to every node (it is not secret) and set in its config:
+     canary_file      = "/path/to/canary.bin"
+     unseal_threshold = @THRESHOLD@
+   The canary is installed into the node's storage at startup. With it in
+   place the node never has to trust the first unseal.
+
+3. To unseal, each holder runs (separately, from anywhere that can reach the node):
+     @UNSEAL_CMD@
+
+4. Delete this directory's share files from this machine once distributed.
+
+The root key was never written to disk.
+"#;
+    let text = template
+        .replace("@COUNT@", &params.holders.len().to_string())
+        .replace("@HOLDERS@", &holders)
+        .replace("@THRESHOLD@", &params.threshold.to_string())
+        .replace("@FORMAT@", format_name)
+        .replace("@NOTE@", passphrase_note)
+        .replace("@UNSEAL_CMD@", unseal_cmd);
     std::fs::write(&instructions, text)?;
 
     Ok(InitReport { canary_file, share_files, instructions })
@@ -354,6 +363,22 @@ mod tests {
         let share: ShamirShare = bincode::deserialize(&from_hex(&hex).unwrap()).unwrap();
         assert!(share.x >= 1 && share.y.len() == KEY_LEN);
         assert!(std::fs::read_to_string(&report.instructions).unwrap().contains("PLAIN HEX"), "the file must say it is unprotected");
+    }
+
+    #[test]
+    fn the_instructions_file_keeps_its_indentation_and_fills_in_every_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = params(dir.path(), &["alice", "bob", "carol"], 2, ShareFormat::Passphrase);
+        let report = provision(&p, &pass(&["alice", "bob", "carol"])).unwrap();
+        let text = std::fs::read_to_string(&report.instructions).unwrap();
+
+        assert!(!text.contains('@'), "an unfilled placeholder is left in:\n{text}");
+        assert!(text.contains("Holders (3): alice, bob, carol"), "{text}");
+        assert!(text.contains("Threshold: 2 of 3 holders"), "{text}");
+        assert!(text.contains("\n     canary_file      = \"/path/to/canary.bin\"\n"), "config lines must stay indented:\n{text}");
+        assert!(text.contains("\n     unseal_threshold = 2\n"), "{text}");
+        assert!(text.contains("\n     sentinel-cli unseal-file "), "the command must stay indented:\n{text}");
+        assert!(text.contains("A lost\n   passphrase means that share is lost."), "{text}");
     }
 
     #[test]
