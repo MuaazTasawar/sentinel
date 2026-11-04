@@ -2,17 +2,17 @@
 
 # 🛡️ SENTINEL
 
-### A zero-trust, hardware-rooted, distributed secrets vault — written in Rust
+### A zero-trust, quorum-unsealed, distributed secrets vault — written in Rust
 
-Envelope encryption · Shamir quorum unsealing · YubiKey PIV · hand-rolled Raft · mutual TLS ·
-hash-chained audit log · statistical auto-seal · deterministic simulation testing
+Envelope encryption · Shamir quorum unsealing · hand-rolled replicated Raft · mutual TLS + roles ·
+durable hash-chained audit log · statistical auto-seal · deterministic simulation testing
 
 ![Rust](https://img.shields.io/badge/Rust-2024%20edition-DEA584?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/async-Tokio-1f6feb)
 ![Axum](https://img.shields.io/badge/HTTP-Axum%200.8-5b21b6)
 ![TLS](https://img.shields.io/badge/TLS-rustls%20mTLS-2ea043)
 ![Crypto](https://img.shields.io/badge/AEAD-AES--256--GCM-0f766e)
-![Tests](https://img.shields.io/badge/tests-113%20passing-2ea043)
+![Tests](https://img.shields.io/badge/tests-291%20passing-2ea043)
 ![Crates](https://img.shields.io/badge/workspace-9%20crates-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -54,11 +54,11 @@ Sentinel is an attempt at a middle ground: a **single static Rust binary** with 
 | Principle | How Sentinel approaches it |
 |---|---|
 | **Secrets are never stored in plaintext** | Every value is envelope-encrypted (AES-256-GCM, fresh DEK per secret) before it touches storage; the storage trait only ever sees ciphertext. |
-| **Unsealing requires physical hardware** | The master key (KEK) is designed to be split with Shamir's Secret Sharing across YubiKeys; no software-only path reconstructs it. |
-| **Every connection is mutually authenticated** | One mTLS listener serves clients *and* cluster peers; there is no plaintext port anywhere in the code. |
-| **History can't be silently edited** | Every operation is appended to a SHA-256 hash chain, attributed to the caller's certificate CN. |
+| **Unsealing needs a quorum of key holders** | The master key (KEK) is split with Shamir's Secret Sharing; each share is protected for its holder (passphrase-protected today; the YubiKey path is unverified, see [§13](#13-known-limitations--findings)). No single person can unseal, and a wrong or partial quorum is rejected by a key canary. |
+| **Every connection is mutually authenticated and authorized** | One mTLS listener serves clients *and* cluster peers; there is no plaintext port anywhere in the code. A default-deny role policy then decides what each certificate identity may do. |
+| **History can't be silently edited** | Every operation is appended to a SHA-256 hash chain, attributed to the caller's certificate CN, written durably, and verified at startup. |
 | **Attacks trigger lockdown, not just alerts** | A rolling z-score detector watches read rate and clears the in-memory KEK the moment access looks like exfiltration. |
-| **Consensus is proven, not assumed** | Raft is hand-written, and a deterministic simulator drives the *same* `RaftState` type through partitions, clock skew and reordering. |
+| **Writes are only acknowledged once a majority holds them** | Raft is hand-written, persists its state before replying, and a deterministic simulator drives the *same* `RaftState` type through partitions, crashes, message loss, duplication and reordering while checking its safety properties. |
 
 It is also a **learning artifact**: the code is heavily commented with the *why* behind each decision, and this README explains every primitive and concept used.
 
@@ -66,26 +66,31 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Sentinel is built in layers. The **building blocks are complete and tested**; the **end-to-end running node is a skeleton** with a few important gaps. This section is intentionally up-front so you know what you are getting. Everything below was verified by building the workspace (rustc 1.91.1) and running the real binaries.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (291 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
-| Envelope encryption, Shamir (GF(256)), HKDF/Argon2id, `mlock` + zeroize | ✅ Complete | 20 unit + 7 property tests |
-| Hash-chained audit log + `sentinel-cli verify` | ✅ Complete | 8 + 2 tests; CLI run on clean and tampered files |
-| Rolling z-score anomaly detector + `SealCommand` | ✅ Complete | 13 tests |
-| Sled storage backend | ✅ Complete | 4 tests |
-| Quorum logic (`QuorumUnseal`) | ✅ Complete | 5 tests |
-| Raft state machine, log, election actor | ✅ Elections work | 28 tests incl. anti-deadlock stress test |
-| Deterministic chaos simulator | ✅ Election Safety verified | 6 + 7 tests |
-| mTLS listener (rustls, mandatory client certs) | ✅ Works | Real handshakes: valid cert accepted; no cert / untrusted CA rejected |
-| Secrets CRUD handlers (encrypt → store → audit) | ✅ Works when a KEK is present | 7 handler tests |
-| **Raft log replication & commit advancement** | ❌ Not implemented | Leader sends empty heartbeats only |
-| **Unsealing a running node** | ❌ Not wired | Node starts sealed and nothing ever sets the KEK |
-| **YubiKey PIV decryption on real hardware** | ⚠️ Never executed | Reviewed against crate docs only |
-| **Web dashboard** | ⚠️ Built but not routed | `/` and `/api/status` return 404 (compiler warns both handlers are unused) |
-| **Fine-grained authorization** | ❌ Not implemented | Any valid client cert may do anything |
+| Envelope encryption, Shamir (GF(256)), HKDF/Argon2id, `mlock` + zeroize | ✅ | 25 unit + 7 property tests |
+| Key canary: a reconstructed key is *verified* before it is accepted | ✅ | 5 canary tests + unseal handler tests |
+| Raft elections, **log replication, majority commit, apply loop** | ✅ | 74 consensus tests incl. real multi-node clusters over a cuttable network |
+| **Durable Raft state** (term, vote, log; CRC-checked WAL, fsync before replying) | ✅ | Restart-the-whole-cluster test; disk-failure test; torn-tail recovery tests |
+| **Writes gated on majority commit**; storage changed only by the apply loop | ✅ | A leader without a majority returns 504 and writes nothing (tested) |
+| **Cluster-wide seal** (`Seal` command applied on every node) | ✅ | 3-node test; follower-detected anomalies are forwarded to the leader |
+| mTLS listener with mandatory client certificates | ✅ | Real handshakes; no cert / untrusted CA rejected |
+| **Role-based authorization** (peer / admin / writer / reader, default-deny) | ✅ | 24 policy and router tests; real-cluster run with an intruder certificate |
+| **Certificate revocation** (serial deny-list) | ✅ | Revoked client cannot connect (real run) |
+| Quorum unseal of a **running node** (`/sys/unseal`, node-side quorum) | ✅ | Handler tests; real 3-node unseal with passphrase-protected shares |
+| **Provisioning**: `sentinel-cli init`, `pki ca`, `pki issue` | ✅ | 14 CLI tests; whole vault provisioned with no `openssl` |
+| **Durable, verified audit log** + `sentinel-cli verify` (`--expect-tip`) | ✅ | 19 audit + 8 verify tests; tamper / truncate / torn-tail on real files |
+| Audit failure is **fail-closed** (secret operations refused if the log can't be written) | ✅ | Handler test with a failing sink |
+| Rolling z-score anomaly detector (counts **successful reads only**) | ✅ | 18 detector tests, the 404-flood test and a lone-read-after-idle regression test |
+| Web dashboard (`/`, `/api/status`) | ✅ | Router tests; served over mTLS |
+| Deterministic simulator: **replication, crashes, loss, duplication** + 4 safety checkers | ✅ | 31 sim tests incl. 200 random fault schedules |
+| CI on **Linux and Windows** | ✅ | `.github/workflows/ci.yml` |
+| **YubiKey PIV decryption on real hardware** | ⚠️ **Unverified, probably wrong** | Never run on a device; see [§13](#13-known-limitations--findings) |
+| Log compaction / snapshots, dynamic membership | ❌ | Not implemented |
 
-> **Bottom line:** if you launch `sentinel-node` today, it boots, elects itself leader (single node), serves mTLS, and answers `/cluster/status` — but every secret read/write returns `503 vault is sealed`, because the unseal hand-off is the next missing piece. The full secret path *is* exercised end-to-end in the test suite by injecting a KEK. See [§13](#13-known-limitations--findings) for the complete list.
+> **Bottom line:** you can provision a vault, run a 3-node mTLS cluster, unseal every node with a quorum of passphrase-protected shares, write secrets that are only acknowledged once a majority holds them, kill every node with `kill -9`, restart, and find the data, the audit chain and the cluster intact. What is *not* proven: the hardware-key path, and anything beyond a handful of nodes on a single machine. See [§13](#13-known-limitations--findings) for the full, honest list.
 
 ---
 
@@ -99,7 +104,7 @@ flowchart TB
         direction LR
         OP["Operator / client<br/>CA-signed client cert"]
         PEER["Peer sentinel-node<br/>same listener, same CA"]
-        CLI["sentinel-cli<br/>unseal / verify"]
+        CLI["sentinel-cli<br/>init / pki / unseal-file / verify"]
     end
 
     subgraph NODE["sentinel-node  (Tokio + Axum behind tokio-rustls)"]
@@ -115,7 +120,7 @@ flowchart TB
         subgraph STATE["AppState (shared handles)"]
             direction LR
             KEK[("KEK: Option of SecretBytes<br/>None = sealed")]
-            AUD["AuditChain<br/>(in memory)"]
+            AUD["AuditChain<br/>(durable, fsync per entry)"]
             DET["AnomalyDetector"]
             RH["RaftHandle<br/>(actor mailbox)"]
             ST["Storage trait"]
@@ -218,9 +223,11 @@ flowchart LR
 
 | Interface | Default | Notes |
 |---|---|---|
-| Client + cluster API | `api_bind_addr` (e.g. `127.0.0.1:8443`) | **Only** listener; TLS 1.2/1.3 via rustls with `ring` crypto provider. |
-| Peer RPC | Same port, paths `/raft/*` | Peers call each other with a `reqwest` client presenting the node's own cert (5 s timeout). |
-| Storage | Local directory (`storage_path`) | `sled` embedded KV store, `flush()` after every write. |
+| Client + cluster API | `api_bind_addr` (e.g. `127.0.0.1:8443`) | **Only** listener; TLS 1.2/1.3 via rustls with the `ring` provider. Every route is additionally guarded by an authorization role ([§12](#12-security-model)). |
+| Peer RPC | Same port, paths `/raft/*` | Peers call each other with a `reqwest` client presenting the node's own cert (5 s timeout). Only identities in `peer_cns` are admitted. |
+| Storage | `storage_path` | `sled` embedded KV store. Only the Raft apply loop writes secrets into it. |
+| Raft state | `raft_dir` (default `<storage_path>.raft`) | CRC-checked write-ahead log + atomically replaced vote file; fsync'd before the node replies. |
+| Audit log | `audit_path` (default `<storage_path>.audit.jsonl`) | JSON lines, one hash-chained entry per line, fsync'd per entry, verified at startup. |
 | Logging | stdout, JSON lines | `tracing` + `EnvFilter` (`RUST_LOG=info`). |
 
 ### 3.5 Node lifecycle
@@ -229,17 +236,17 @@ flowchart LR
 stateDiagram-v2
     direction LR
     [*] --> Booting
-    Booting --> Sealed: load config, open sled, start Raft actor, bind mTLS
-    Sealed --> Unsealed: KEK installed (quorum unseal, not yet wired)
-    Unsealed --> Sealed: auto-seal on anomalous read rate
-    Sealed --> Sealed: GET / PUT secret returns 503
+    Booting --> Sealed: load config, verify audit log, install canary, load Raft state, bind mTLS
+    Sealed --> Unsealed: quorum of shares rebuilds a key that opens the canary
+    Unsealed --> Sealed: POST /sys/seal, auto-seal on anomalous reads, or a committed cluster Seal command
+    Sealed --> Sealed: reads, writes, lists and deletes return 503
 
     Booting: Booting - KEK is None by design
-    Sealed: Sealed - KEK absent, secret reads and writes refused
+    Sealed: Sealed - KEK absent, secret operations refused
     Unsealed: Unsealed - KEK held in mlock-ed memory
 ```
 
-A node **always starts sealed** — nothing in the bootstrap path populates the KEK, deliberately, because a node that can unseal itself by starting up would defeat the purpose of the hardware quorum.
+A node **always starts sealed** — nothing in the bootstrap path populates the KEK, deliberately, because a node that could unseal itself by starting up would defeat the purpose of the quorum. A node also refuses to start if its audit log fails verification, if its storage holds a different vault's canary than `canary_file`, or if its authorization policy would lock everyone out.
 
 ---
 
@@ -250,41 +257,39 @@ A node **always starts sealed** — nothing in the bootstrap path populates the 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor C as Client (cert CN = alice-operator)
-    participant T as mTLS acceptor
-    participant H as put_secret handler
-    participant K as KEK (Option)
-    participant E as envelope::encrypt
-    participant R as Raft actor
-    participant S as sled storage
+    actor C as Client (cert CN = app-writer)
+    participant G as authz guard
+    participant H as put_secret
+    participant R as Raft leader
+    participant F as Followers
+    participant SM as apply loop (every node)
     participant A as AuditChain
 
-    C->>T: TLS handshake with client certificate
-    T->>T: Verify chain against CA, extract CN
-    T->>H: request + ClientIdentity extension
-    H->>K: lock and read KEK
-    alt vault sealed
-        H-->>C: 503 vault is sealed
-    else unsealed
-        H->>E: encrypt(KEK, body)
-        E->>E: random 32-byte DEK, AES-256-GCM encrypt data
-        E->>E: wrap DEK under KEK with AES-256-GCM
-        E-->>H: EnvelopeCiphertext
-        H->>H: bincode serialize
-        H->>R: propose(serialized)
-        alt not leader
-            R-->>H: NotLeader
-            H-->>C: 421 not the raft leader
-        else leader
-            R-->>H: log index (appended locally)
-            H->>S: put("secrets/key", ciphertext) then flush
-            H->>A: append "secret written: key (by alice-operator)"
-            H-->>C: 200 OK
-        end
+    C->>G: PUT /secrets/db-password (mTLS)
+    G->>G: CN must be in writer_cns, else 403
+    G->>H: request + ClientIdentity
+    H->>A: is the audit log writable? else 503
+    H->>H: sealed? else 503. Encrypt body with the KEK (envelope)
+    H->>R: propose_and_wait(Put{key, ciphertext})
+    alt not the leader
+        R-->>H: NotLeader
+        H-->>C: 421
+    else leader
+        R->>R: append to log, fsync
+        R->>F: AppendEntries (from each follower's next_index)
+        F->>F: fsync log, reply
+        F-->>R: success, match_index advances
+        R->>R: majority holds it and it is from the current term: committed
+        R-->>SM: committed entry (on the leader and on every follower)
+        SM->>SM: storage.put, record applied index
+        SM-->>H: applied index reached
+        H->>A: append secret written, fsync
+        H-->>C: 200 OK
     end
+    Note over H,C: No majority within commit_timeout gives 504, and nothing was written
 ```
 
-> ⚠️ The handler proposes to Raft and then writes to storage **without waiting for majority commit** — see [§13](#13-known-limitations--findings).
+The handler never writes storage itself. Only committed log entries do, so "200" means a majority of the cluster holds the ciphertext durably. Followers store ciphertext too and do not need to be unsealed to apply a write.
 
 ### 4.2 Reading a secret and the auto-seal path — `GET /secrets/{key}`
 
@@ -292,66 +297,76 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     actor C as Client
-    participant H as get_secret handler
-    participant D as AnomalyDetector
-    participant K as KEK
-    participant R as Raft actor
-    participant A as AuditChain
+    participant G as authz guard
+    participant H as get_secret
     participant S as Storage
+    participant D as AnomalyDetector
+    participant R as Raft / peers
+    participant A as AuditChain
 
-    C->>H: GET /secrets/db-password
-    H->>D: record_access(now) FIRST, before anything else
-    alt z-score above threshold
-        D-->>H: AnomalyReport (count, baseline mean, z)
-        H->>R: propose SealCommand (best effort, result ignored)
-        H->>K: set KEK = None (sealed immediately)
-        H->>A: append "AUTO-SEAL triggered by CN ..."
-        H-->>C: 503 vault is sealed
-    else normal rate
-        D-->>H: None
-        H->>K: read KEK (503 if sealed)
-        H->>S: get("secrets/db-password")
-        S-->>H: ciphertext (404 if missing)
-        H->>H: bincode decode, envelope::decrypt
-        H->>A: append "secret read: db-password (by CN)"
-        H-->>C: 200 plaintext bytes
+    C->>G: GET /secrets/db-password
+    G->>H: CN in reader_cns or writer_cns
+    H->>A: audit log writable? else 503
+    H->>H: sealed? else 503
+    H->>S: get and decrypt
+    alt missing key or failed decryption
+        H-->>C: 404 / 500 (NOT counted by the anomaly detector)
+    else secret decrypted
+        H->>D: record_access(now)
+        alt z-score above threshold
+            D-->>H: AnomalyReport (count, baseline mean, z)
+            H->>H: KEK = None. Plaintext dropped, never returned
+            H->>A: append AUTO-SEAL
+            alt this node is the leader
+                H->>R: propose Seal (applied on every node when committed)
+            else follower
+                H->>R: forward a seal request to the peers (only the leader accepts)
+            end
+            H-->>C: 503 vault is sealed
+        else normal rate
+            H->>A: append secret read
+            H-->>C: 200 plaintext
+        end
     end
 ```
 
 Design notes that matter:
 
-- Detection runs **before** the sealed check, so the triggering request is itself refused.
-- The local seal does **not** wait on Raft — a node that sees an attack must protect itself even if replication is degraded.
-- Reads are served locally (no leader required) — a stale follower may serve stale data.
+- Only **successful** reads count toward the rate. A flood of lookups for names that do not exist can never seal the vault.
+- The secret that trips the detector is withheld: it was decrypted but is dropped, not returned.
+- The local seal never waits on Raft: a node that sees an attack protects itself even if replication is degraded. If no leader is reachable, only the detecting node is sealed.
+- Reads are served from the node's own storage; a follower that is a moment behind the leader can briefly return an older value.
 
-### 4.3 Quorum unseal (CLI, designed flow)
+### 4.3 Quorum unseal — `sentinel-cli unseal-file` → `POST /sys/unseal`
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor O as Operators
-    participant CLI as sentinel-cli unseal
-    participant Q as QuorumUnseal
-    participant Y as YubiKeyUnsealer
-    participant HW as YubiKey (PIV slot 9d)
+    actor Al as Holder alice
+    actor Bo as Holder bob
+    participant CLI as sentinel-cli unseal-file
+    participant N as Node (/sys/unseal)
+    participant ST as Storage
 
-    O->>CLI: --threshold 2 --manifest unseal-manifest.json
-    CLI->>CLI: read manifest, load each encrypted share file
-    loop until threshold distinct holders contribute
-        CLI->>O: Insert holder's YubiKey and press Enter
-        O->>CLI: Enter, then PIN (hidden prompt)
-        CLI->>Y: decrypt_share(pin, encrypted_share)
-        Y->>HW: open device, verify PIN, PIV decrypt
-        HW-->>Y: share bytes (private key never leaves device)
-        Y-->>CLI: ShamirShare (bincode)
-        CLI->>Q: contribute(holder_id, share)
-        Q-->>CLI: rejects duplicate holder_id
+    Al->>CLI: share-alice.enc + passphrase
+    CLI->>CLI: Argon2id key, decrypt the share locally
+    CLI->>N: POST holder_id + share over mTLS (admin_cns only)
+    N-->>CLI: pending 1/2
+    Bo->>CLI: share-bob.enc + passphrase (separately, any machine)
+    CLI->>N: POST holder_id + share
+    N->>N: threshold met: Lagrange interpolation in GF(256)
+    N->>ST: read the key canary (installed from canary.bin at startup)
+    N->>N: does the rebuilt key open the canary?
+    alt yes
+        N->>N: KEK installed in mlock-ed memory, audit UNSEALED
+        N-->>CLI: unsealed
+    else no (wrong shares, wrong holders, too few)
+        N->>N: session discarded, audit UNSEAL FAILED
+        N-->>CLI: 400, node stays sealed
     end
-    CLI->>Q: try_reconstruct()
-    Q-->>CLI: KEK bytes (Lagrange interpolation in GF(256))
-    CLI->>O: "Quorum reached - vault unsealed."
-    Note over CLI,O: Today the CLI prints the KEK length and discards it. Delivering it to a running node is the missing hand-off.
 ```
+
+Each holder runs the command on their own, from any machine that can reach the node, and submits **only their own share**; no single request ever carries the whole key. The node holds the quorum session in memory for at most five minutes, rejects a second share from the same holder, and discards the session on any failure.
 
 ### 4.4 Raft roles (as implemented in `RaftState`)
 
@@ -433,7 +448,7 @@ Split a secret into `N` shares so that any `K` reconstruct it but any `K−1` re
 
 **Why hand-rolled:** an earlier attempt with the `vsss-rs` crate pulled in elliptic-curve scalar machinery just to split 32 raw bytes. GF(256) does it in ~120 lines with no extra surface. *(Housekeeping note: `vsss-rs` is still listed in `crates/crypto/Cargo.toml` but no code uses it — it can be removed.)*
 
-> **A property worth understanding:** Shamir has **no integrity check**. Combining too few or wrong shares does not error — it silently returns garbage that looks like a secret. A real deployment must verify the reconstructed KEK (e.g. by trial-decrypting a known canary). `combine_shares` does not know the threshold, and `QuorumUnseal` only guards the count; the verification step is documented as the caller's job and is **not implemented yet**.
+> **A property worth understanding:** Shamir has **no integrity check**. Combining too few or wrong shares does not error — it silently returns garbage that looks like a secret. That is why the node verifies every reconstructed KEK against a **key canary** (`sentinel_crypto::canary`: a known plaintext encrypted under the KEK, created by `sentinel-cli init` and installed at startup) before accepting it. `combine_shares` does not know the threshold and `QuorumUnseal` only guards the count, so the canary is what turns "some bytes came out" into "this is the vault's key".
 
 ### 5.3 Hardware-rooted unsealing (YubiKey PIV)
 
@@ -446,7 +461,7 @@ PIV is a smart-card standard; a PIV-enabled YubiKey holds a private key that **n
 | `hardware/src/quorum.rs` | Pure composition logic: collect fragments in any order, reject a repeated `holder_id`, reconstruct at threshold. Touches no `yubikey` types. | 5 unit tests, including "one holder touching twice cannot fake a 2-of-3 quorum" |
 | `hardware/src/yubikey_piv.rs` | `YubiKeyUnsealer::decrypt_share(pin, encrypted_share)` — open device, verify PIN, PIV-decrypt (slot 9d "Key Management"). | **Never run against a physical device.** |
 
-> ⚠️ **Worth double-checking before relying on it:** the code requests `AlgorithmId::EccP256` through `yubikey::piv::decrypt_data`. PIV's *decrypt* operation is defined for RSA keys, whereas ECC keys on PIV perform ECDH key agreement. Confirm against the `yubikey` crate's documentation (or use an RSA slot) when you first test on real hardware. There is also **no provisioning tool** in the repo that generates shares or encrypts them to a YubiKey.
+> ⚠️ **Worth double-checking before relying on it:** the code requests `AlgorithmId::EccP256` through `yubikey::piv::decrypt_data`. PIV's *decrypt* operation is defined for RSA keys, whereas ECC keys on PIV perform ECDH key agreement. Confirm against the `yubikey` crate's documentation (or use an RSA slot) when you first test on real hardware. This is not just a doubt: it is the main open finding in [§13](#13-known-limitations--findings). `sentinel-cli init` does **not** use hardware; it protects each share with its holder's passphrase (Argon2id + AES-256-GCM), and no tool in the repo encrypts a share to a YubiKey.
 
 ### 5.4 Memory hygiene: `mlock` and zeroize
 
@@ -470,7 +485,7 @@ PIV is a smart-card standard; a PIV-enabled YubiKey holds a private key that **n
 | **Argon2id** | Input may be low-entropy | Deliberately slow and memory-hard | `derive_kek_argon2(input, salt)` — crate defaults: **19 MiB memory, t=2, p=1**, 32-byte output |
 | **HKDF-SHA256** | Input is already high-entropy | Fast; derives independent per-purpose keys | `derive_key_hkdf(master, info, out_len)` |
 
-Plus `random_salt()` (16 bytes). Tests cover determinism, salt separation, context separation, and no-panic across all lengths. *(Neither KDF is called by the running node yet; they are ready for the unseal hand-off and audit-log keying.)*
+Plus `random_salt()` (16 bytes). Tests cover determinism, salt separation, context separation, and no-panic across all lengths. *(Argon2id derives the key that protects each holder's share file in `sentinel-cli init` / `unseal-file`. HKDF is available for context-separated subkeys but is not yet used by the node.)*
 
 ### 5.6 Raft consensus
 
@@ -493,9 +508,11 @@ Raft gets a cluster to agree on an ordered log despite crashes and partitions: o
 |---|---|---|
 | **Election Safety** — ≤ 1 leader per term | One vote per term; candidate's log must be at least as up-to-date | `SimWorld::check_election_safety()` across partition / heal / skew / reordering scenarios |
 | **Leader Append-Only** | Leader only ever calls `append_new` (push) | Structural |
-| **Log Matching** | `append_entries` rejects a mismatched `prev_log_term` and truncates conflicting suffixes | 9 log unit tests |
+| **Log Matching** | `append_entries` rejects a mismatched `prev_log_term` and truncates conflicting suffixes | Log unit tests, and `SimWorld::check_log_matching()` after every step of the chaos runs |
+| **State Machine Safety** — no two nodes apply different commands at one index | Only entries committed by a majority are applied; current-term rule for commit | `SimWorld` records the first command applied at each index and flags any later mismatch, including replays after a restart |
+| **Leader Completeness** — a new leader already holds every applied entry | Election restriction (a candidate's log must be at least as up-to-date) | Checked at the moment of every election in the simulator |
 
-> **Honest scope:** the simulator checks *Election Safety*. Log Matching is enforced and unit-tested, but because leaders do not yet send entries ([§13](#13-known-limitations--findings)), it is not yet exercised under chaos.
+> **Scope:** the simulator now checks all four properties above under partitions, crashes with restart, message loss, duplication and reordering (see [§5.11](#511-deterministic-simulation-testing) and [§11.2](#112-the-simulator)). One protection is covered by a unit test rather than the simulator: the "commit only entries of the current term" rule (Raft's Figure 8) cannot be reached from outside, because every leader appends a no-op and so an old entry always travels with a current-term one.
 
 ### 5.7 The actor model — and the deadlock that really happened
 
@@ -548,7 +565,7 @@ An explicit byte layout (not `serde_json`) is hashed, so the encoding is unambig
 
 **What it proves:** *tamper-evidence*, not tamper-prevention — someone who can rewrite the whole file consistently can recompute every hash. It defeats the realistic attack: editing one entry to cover tracks.
 
-> ⚠️ Today the chain lives **in memory** in the node (`AuditChain::new()` at boot) and nothing exports it, so `sentinel-cli verify` has no producer yet. The dashboard handler would expose a live `verified` flag, but it isn't routed.
+> **Persistence.** The node opens `audit_path` at startup, verifies the whole chain, and appends every new entry to it as one JSON line, fsync'd. A log that fails verification stops the node; a half-written final record from a crash is cut off and reported. If the file ever cannot be written, the chain is marked *degraded* and the secret endpoints refuse to operate until it is restored. `sentinel-cli verify` reads exactly this file. Truncation of the **newest** entries cannot be seen from the file alone; compare the tip hash against a copy recorded elsewhere (`--expect-tip`).
 
 ### 5.10 Rolling z-score anomaly detection
 
@@ -566,14 +583,15 @@ z    = (current_count − mean) / stddev        flag if  z > threshold
 | `max_history` | 60 buckets | Rolling baseline length |
 | `z_threshold` | 3.0 | Std-devs above mean that counts as anomalous |
 | `min_history_for_detection` | 5 | Warm-up — **no detection before 5 closed buckets** |
+| `min_burst` (`anomaly_min_burst`) | 10 | Count floor — **a bucket with fewer reads than this is never flagged**, whatever its z-score |
 
 Behaviours worth knowing:
 
 - **Idle gaps count as zero buckets** — silence is part of the baseline.
-- **Flat baseline (stddev = 0):** *any* count above the mean is flagged (`z = ∞`).
+- **Flat baseline (stddev = 0):** *any* count above the mean is flagged (`z = ∞`) — which is exactly why the count floor exists. After a quiet spell the baseline is all zeros, and without a floor a **single ordinary read** scores as an infinite-sigma outlier: with the node's old settings (1 s buckets, 60-bucket window, `z = 3.0`) two reads 20 s apart gave `z = 4.36` and would have sealed the vault. A bucket now needs at least `anomaly_min_burst` reads before it can flag (the library default is 1, i.e. no floor; the node sets 10). An application that reads N secrets in one burst at start-up needs a value greater than N, or it will seal its own vault.
 - **Worked example:** a baseline alternating 2 and 4 reads/second has mean 3, stddev 1, so with `z = 3.0` the current bucket is flagged once it exceeds `3 + 3×1 = 6` → on the **7th read** within that second.
 - Detection fires *during* a burst, not after (tested: flagged well before 40 requests land).
-- One detector covers **aggregate** node traffic, so a coordinated multi-identity attack still shows as one spike. Every `GET` counts — including 404s and requests made while sealed.
+- One detector covers **aggregate** node traffic, so a coordinated multi-identity attack still shows as one spike. Only **successful** reads count: lookups of names that do not exist (404), requests while sealed, and failed decryptions do not, so a client looping over made-up names cannot lock the vault.
 - Time is passed in as an `Instant` parameter (never read internally), which makes the detector fully deterministic to test.
 
 **`SealCommand`:** `{ reason, current_count, baseline_mean, z_score }`, encoded as the ASCII tag `SEAL:` + bincode payload so a log applier can distinguish it from other commands without a shared enum (which would invert the crate layering).
@@ -583,8 +601,8 @@ Behaviours worth knowing:
 Instead of real sockets and real timers, `sentinel-sim` replaces the network and clock with programmer-controlled versions:
 
 - **`SimTime`** — virtual milliseconds; a "30-second partition" costs microseconds of test time.
-- **`NetworkConditions`** — symmetric partitions (`partition`, `heal`, `heal_all`) plus base latency and 0–3 ms random jitter, which naturally reorders in-flight messages.
-- **`SimWorld`** — a discrete-event scheduler (binary heap ordered by `(time, seq)`) that calls the **production** `handle_request_vote`, `handle_append_entries`, `become_candidate`, `record_vote`. Same seed + same actions ⇒ byte-identical results.
+- **`NetworkConditions`** — symmetric partitions (`partition`, `heal`, `heal_all`), base latency, 0–3 ms random jitter (which naturally reorders in-flight messages), and a configurable percentage of messages **lost** or **delivered twice**.
+- **`SimWorld`** — a discrete-event scheduler (binary heap ordered by `(time, seq)`) that drives the **production** `RaftState`: elections, `build_append_entries` / `handle_append_entries_response`, majority commit, `take_newly_committed`, and `RaftState::restore` for crashed nodes. Same seed + same actions ⇒ byte-identical results.
 
 ```mermaid
 flowchart LR
@@ -593,22 +611,25 @@ flowchart LR
     S -->|"send()"| NET["NetworkConditions<br/>partition? latency + jitter"]
     NET -->|"schedule delivery"| Q
     P --> LOG["leadership_log<br/>(time, node, term)"]
-    LOG --> CHK["check_election_safety()"]
+    LOG --> CHK["check_all(): election safety,<br/>log matching, state machine safety,<br/>leader completeness"]
 ```
 
 **Scenarios tested** (all seeded):
 
 | Test | Asserts |
 |---|---|
-| Five nodes, no faults | Exactly one leader; Election Safety holds |
-| 2-node minority partitioned | Minority can't elect; one leader on the majority side |
-| Leader isolated, then healed | Majority elects a higher-term leader; old leader steps down to follower after healing |
-| One node with `-1000 ms` clock skew | Still converges to one leader |
-| Heavy jitter (15 ms latency) | Correctness holds under reordering |
-| Same seed twice | Identical `leadership_log` and event count |
-| 4 partition/heal cycles | Election Safety holds over the cumulative history |
+| Five nodes, no faults | One leader; every node applies the same commands in order |
+| 2-node minority partitioned; leader isolated then healed; clock skew; heavy jitter; 4 partition/heal cycles | Election Safety, stepping down, convergence (the original election suite) |
+| A deposed leader accepts a write while cut off | The orphaned write never commits, and is gone from the old leader's log after healing |
+| A node misses 30 commands, then reconnects | It catches up completely and in order |
+| 30% message loss, 25% duplication, reordering | Safety holds at every step; the cluster still commits; one history after the faults stop |
+| Every node crashes at once, then restarts | No committed command lost or reordered; the cluster keeps working |
+| The leader is crashed and restarted six times | Acknowledged commits survive |
+| **200 random fault schedules** (proposals, partitions, heals, crashes, restarts, loss) | All four properties after every step; after recovery the cluster converges and commits a fresh command |
+| Same seed twice | Identical commits, leadership history and event count, faults included |
+| Each checker, fed a deliberately corrupted node | The checker **fails**, so a silent checker means something |
 
-*Not modelled:* node crash/restart, message loss/duplication beyond partitions, disk faults, and log replication.
+*Not modelled:* disk corruption (the Raft storage layer has its own tests), Byzantine behaviour, and membership changes.
 
 ### 5.12 Property-based testing and fuzzing
 
@@ -623,175 +644,128 @@ Why both: the property tests catch regressions on every commit; the fuzzers find
 
 | Crate (package) | Path | Responsibility | Key public API | Tests |
 |---|---|---|---|:-:|
-| `sentinel-crypto` | `crates/crypto` | Cryptographic primitives | `envelope::{encrypt, decrypt, EnvelopeCiphertext}`, `shamir::{split_secret, combine_shares, ShamirShare}`, `kdf::{derive_kek_argon2, derive_key_hkdf, random_salt}`, `SecretBytes` | 20 + 7 property |
-| `sentinel-storage` | `crates/storage` | Pluggable ciphertext store | `trait Storage { get, put, delete, list }`, `SledStorage` (blocking calls in `spawn_blocking`) | 4 |
-| `sentinel-audit` | `crates/audit` | Tamper-evident log | `AuditChain::{append, verify, tip_hash, from_entries}`, `AuditEntry`, `GENESIS_HASH` | 8 |
-| `sentinel-consensus` | `crates/consensus` | Raft | `RaftState`, `ReplicatedLog`, RPC types, `spawn_raft_actor`, `RaftHandle::{request_vote, append_entries, propose, inspect}`, `Transport` | 28 |
-| `sentinel-hardware` | `crates/hardware` | Quorum + YubiKey | `QuorumUnseal`, `UnsealFragment`, `YubiKeyUnsealer`, `HardwareError` | 5 |
-| `sentinel-anomaly` | `crates/anomaly` | Detection + seal command | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `DetectorSnapshot`, `SealCommand` | 13 |
-| `sentinel-node` | `crates/api` | The server binary | mTLS listener, Axum router, handlers, `HttpTransport`, `NodeConfig` | 13 |
-| `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld`, `SimTime`, `NetworkConditions` | 6 + 7 |
-| `sentinel-cli` | `crates/cli` | Admin tool | `unseal`, `verify` subcommands | 2 |
+| `sentinel-crypto` | `crates/crypto` | Cryptographic primitives | `envelope::{encrypt, decrypt, EnvelopeCiphertext}`, `shamir::{split_secret, combine_shares, ShamirShare}`, `canary::{create, verify}`, `kdf::{derive_kek_argon2, derive_key_hkdf, random_salt}`, `SecretBytes` | 25 + 7 property |
+| `sentinel-storage` | `crates/storage` | Pluggable ciphertext store | `trait Storage { get, put, delete, list }`, `SledStorage` | 4 |
+| `sentinel-audit` | `crates/audit` | Tamper-evident, **durable** log | `AuditChain::{append, verify, tip_hash, is_healthy}`, `open_persistent`, `parse_log`, `AuditSink`, `FileSink` | 19 |
+| `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `RaftHandle::{propose, propose_and_wait, inspect, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 74 |
+| `sentinel-hardware` | `crates/hardware` | Quorum + YubiKey (**hardware path unverified**; the `yubikey` feature, on by default, is off for the server) | `QuorumUnseal`, `UnsealFragment`, `YubiKeyUnsealer` | 5 |
+| `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 18 |
+| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 79 |
+| `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld::{propose, crash, restart, check_all, ...}`, `NetworkConditions` | 16 + 8 + 7 |
+| `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 29 |
 
-**Total: 113 tests, all passing** (verified with `cargo test --workspace` on rustc 1.91.1).
+**Total: 291 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
 
-Key dependencies (resolved in `Cargo.lock`): `axum 0.8.9`, `tokio 1.53.1`, `rustls 0.23.43`, `tokio-rustls 0.26.4`, `hyper-util 0.1.20`, `reqwest 0.12.28` (rustls), `x509-parser 0.16`, `aes-gcm 0.10.3`, `argon2 0.5.3`, `hkdf 0.12.4`, `sled 0.34.7`, `yubikey 0.8.0`, `zeroize 1.9.0`, `proptest 1.11.0`, `chrono 0.4.45`.
+Key dependencies (resolved in `Cargo.lock`): `axum 0.8`, `tokio 1.53`, `rustls 0.23`, `tokio-rustls 0.26`, `hyper-util 0.1`, `reqwest 0.12` (rustls), `x509-parser 0.16`, `rcgen 0.13`, `aes-gcm 0.10`, `argon2 0.5`, `hkdf 0.12`, `sled 0.34`, `yubikey 0.8`, `zeroize 1.9`, `proptest 1.11`, `chrono 0.4`.
 
 ---
 
 ## 7. HTTP API Reference
 
-All routes are served **only** over the mTLS listener. Identity is the client certificate's CN; nothing in a request body can claim an identity.
+All routes are served **only** over mTLS, and every route group requires a role (see [§12](#12-security-model)). A valid certificate whose Common Name has no role gets `403`.
 
 ### 7.1 Routes
 
-| Method | Path | Description | Needs unsealed | Needs leader |
-|---|---|---|:-:|:-:|
-| `GET` | `/secrets` | List stored key names (the `secrets/` prefix is stripped) | no | no |
-| `GET` | `/secrets/{key}` | Decrypt and return the secret as raw bytes | **yes** | no |
-| `PUT` | `/secrets/{key}` | Encrypt and store the raw request body | **yes** | **yes** |
-| `DELETE` | `/secrets/{key}` | Delete a secret | no | **yes** |
-| `GET` | `/cluster/status` | `{ role, term, commit_index }` | no | no |
-| `POST` | `/raft/vote` | Peer `RequestVote` RPC (JSON) | no | no |
-| `POST` | `/raft/append-entries` | Peer `AppendEntries` RPC (JSON) | no | no |
-
-> The dashboard handlers (`GET /` and `GET /api/status`) exist in `handlers/dashboard.rs` but are **not mounted** in `routes/mod.rs`. Mounting them is a two-line change.
+| Method & path | Role | Behaviour |
+|---|---|---|
+| `GET /` | admin, reader, writer | Dashboard page (polls `/api/status`) |
+| `GET /api/status` | admin, reader, writer | JSON: role, term, commit index, sealed, audit (verified, persistent, healthy, tip hash, recent events), anomaly snapshot |
+| `GET /cluster/status` | admin, reader, writer | `{role, term, commit_index, applied_index}` |
+| `GET /secrets` | reader, writer | List secret names (`503` if sealed) |
+| `GET /secrets/{key}` | reader, writer | Decrypt and return. Successful reads feed the anomaly detector |
+| `PUT /secrets/{key}` | writer | Encrypt, replicate, return only after a **majority commit** and local apply. Leader only |
+| `DELETE /secrets/{key}` | writer | Same contract as `PUT` |
+| `POST /sys/unseal` | admin | Body `{"holder_id": "...", "share": "<hex>"}`; `{"status":"pending",...}` until the threshold, then `{"status":"unsealed"}` |
+| `DELETE /sys/unseal` | admin | Discard a half-finished unseal session |
+| `POST /sys/seal` | admin | Seal this node now |
+| `POST /raft/vote` | peer | Raft `RequestVote` |
+| `POST /raft/append-entries` | peer | Raft `AppendEntries` |
+| `POST /raft/seal-request` | peer | A follower asks the leader to seal the cluster; `202` from the leader, `421` otherwise |
 
 ### 7.2 Error model
 
-Errors are JSON `{ "error": "<message>" }`:
+Errors are JSON `{"error": "<message>"}`. Internal errors are logged server-side and returned as a generic `internal server error`.
 
-| Variant | HTTP status | Body message |
-|---|:-:|---|
-| `NotFound` | 404 | `not found` |
-| `Sealed` | 503 | `vault is sealed` |
-| `Unauthorized(_)` | 403 | *(reserved, not yet produced by any handler)* |
-| `NotLeader(_)` | 421 | `not the raft leader; redirect to node …` |
-| `Storage` / `Crypto` / `Internal` | 500 | `internal server error` (details only in the server log) |
+| Status | Meaning |
+|---|---|
+| `400` | Malformed input (bad share, bad holder id, bad secret name), or the submitted shares did not rebuild the vault key |
+| `403` | Authenticated, but the certificate's identity has no permission for this route (audited once per identity and permission per minute) |
+| `404` | Secret does not exist |
+| `409` | Conflict: already unsealed, duplicate holder in the session, or the vault has no canary and bootstrap is not allowed |
+| `421` | This node is not the Raft leader; write there instead |
+| `503` | Vault sealed, leadership changed before the write committed (retry), or the **audit log is not writable** (secret operations are refused) |
+| `504` | A write was not confirmed by a majority in time. **It may or may not have been applied**: check before retrying |
 
-### 7.3 Examples (verified against a running node)
+### 7.3 Examples
 
 ```bash
-# Set once. Certs from §10.3.
-C="curl -s --cacert pki/ca.crt --cert pki/client.crt --key pki/client.key"
-B=https://localhost:8443
+# Unseal (each holder runs this themselves, with their own share file)
+sentinel-cli unseal-file --node https://localhost:8443 --cert pki/alice-admin.crt \
+  --key pki/alice-admin.key --ca pki/ca.crt --file vault/share-alice.enc
 
-$C $B/cluster/status
-# {"commit_index":0,"role":"Leader","term":1}
+# Write and read as an application client
+curl --cacert pki/ca.crt --cert pki/app-writer.crt --key pki/app-writer.key \
+  -X PUT -d 'hunter2' https://localhost:8443/secrets/db-password        # 200
+curl --cacert pki/ca.crt --cert pki/app-writer.crt --key pki/app-writer.key \
+  https://localhost:8443/secrets/db-password                             # hunter2
 
-$C $B/secrets
-# []
-
-$C -X PUT -d 'hunter2' -w ' [%{http_code}]\n' $B/secrets/db-password
-# {"error":"vault is sealed"} [503]        <- expected until an unseal path exists
-
-$C -X DELETE -w ' [%{http_code}]\n' $B/secrets/db-password
-# [204]
-```
-
-Audit entries produced by handlers (when unsealed):
-
-```
-secret written: db-password (by alice-operator)
-secret read: db-password (by alice-operator)
-secret deleted: db-password (by alice-operator)
-AUTO-SEAL triggered by alice-operator: access rate anomaly (count=…, baseline_mean=…, z_score=…)
+# Role separation: an admin cannot read secrets
+curl --cacert pki/ca.crt --cert pki/alice-admin.crt --key pki/alice-admin.key \
+  https://localhost:8443/secrets/db-password                             # 403
 ```
 
 ---
 
 ## 8. CLI Reference
 
-`sentinel-cli` — "Sentinel vault admin tool".
+`sentinel-cli <COMMAND>` (build it with `cargo build -p sentinel-cli`; **`cargo test` does not rebuild the binary**).
 
-```text
-Usage: sentinel-cli <COMMAND>
+Commands that talk to a node take `--node <URL> --cert <PEM> --key <PEM> --ca <PEM>`: the client certificate to present and the CA that signed the node's certificate.
 
-Commands:
-  unseal  Unseal a node using a quorum of hardware keys
-  verify  Verify the tamper-evident audit log chain
-```
+| Command | Purpose |
+|---|---|
+| `pki ca --out DIR [--cn NAME] [--days N]` | Create a certificate authority (`ca.crt`, `ca.key`). Refuses to overwrite. |
+| `pki issue --ca DIR --out DIR --cn NAME [--kind node\|client] [--san HOST]... [--days N]` | Issue `<cn>.crt` / `<cn>.key`. `node` certs (server + client auth) need at least one `--san`; `client` certs are client-auth only. The CN is the identity the node's policy matches on. |
+| `init --holder NAME... --threshold K --out DIR [--format passphrase\|plain] [--passphrase-env-prefix P]` | Provision a vault: generate the root key (never written to disk), split it K-of-N, write `canary.bin`, one share file per holder, and `PROVISIONING.txt`. Self-tests by rebuilding the key from the files it wrote. Refuses to write into a non-empty directory. |
+| `unseal-file --file share-<name>.enc [--passphrase-env VAR]` + node flags | A holder decrypts their share locally and submits just that share. |
+| `submit-share --holder NAME` + node flags | Submit one already-decrypted share (hex on stdin). **Scripting and tests only**: it puts a plaintext share in your shell. |
+| `seal` / `reset-unseal` + node flags | Seal a node now / discard a half-finished unseal session. |
+| `verify [PATH] [--expect-tip HASH] [--expect-entries N] [--allow-torn-tail]` | Verify an audit log (the node's JSON-lines file or a JSON-array export). Exit code is non-zero on any failure. |
+| `unseal [--manifest FILE]` + node flags | Interactive YubiKey unseal. **Unverified on hardware**; see [§13](#13-known-limitations--findings). |
 
-### `verify [PATH]` (default `audit-log.json`)
+### `verify`: what it can and cannot prove
 
-Loads a JSON array of `AuditEntry`, verifies the chain, and exits **0** on success / **non-zero** on violation — safe in scripts (`sentinel-cli verify audit-log.json && ./deploy.sh`).
-
-```text
-$ sentinel-cli verify audit-ok.json
-chain OK — 3 entries, tip hash 3e7ecb6847116ef68c891e499ab5fbfced772eb5a26d3f7f23102117c6a18b32
-
-$ sentinel-cli verify audit-bad.json
-chain INTEGRITY VIOLATION: chain integrity violation at index 1: stored hash does not match recomputed hash
-```
-
-Entry format (hashes are arrays of 32 byte-values):
-
-```json
-[{ "index": 0, "timestamp": "2026-10-21T00:00:00Z", "event": "node started",
-   "prev_hash": [0, 0, "…32 numbers…"], "hash": [62, 126, "…32 numbers…"] }]
-```
-
-### `unseal --threshold <K> [--manifest unseal-manifest.json]`
-
-Interactive: for each holder in the manifest, prompts to insert the YubiKey and press Enter, then a hidden PIN prompt; stops as soon as `K` distinct holders have contributed.
-
-**Manifest format** — a JSON array of `[holder_id, path_to_encrypted_share]` pairs (despite the help text saying "mapping"):
-
-```json
-[["alice-yubikey", "shares/alice.bin"],
- ["bob-yubikey",   "shares/bob.bin"],
- ["carol-yubikey", "shares/carol.bin"]]
-```
-
-Each share file is a bincode-serialized `ShamirShare` encrypted to that holder's PIV key. Needs real hardware and currently only prints `Reconstructed KEK: N bytes (not persisted).`
+The hash chain makes any edit, insertion, deletion or reordering **inside** the log detectable. It cannot, by itself, show that the **newest** entries were cut off the end. Record the tip hash somewhere the log's custodian cannot edit (the dashboard shows it, `sentinel-cli verify` prints it) and check it later with `--expect-tip`.
 
 ---
 
 ## 9. Configuration
 
-`NodeConfig` (`crates/api/src/config.rs`) has seven fields, all required:
+Settings come from an optional **`.env.toml`** in the working directory and from environment variables named `SENTINEL__<KEY>` (note the **double underscore**). **The environment overrides the file.** List values from the environment are comma-separated: `SENTINEL__PEERS="2=https://h2:8443,3=https://h3:8443"`.
 
-| Field | Type | Example | Purpose |
-|---|---|---|---|
-| `node_id` | `u64` | `1` | This node's Raft id |
-| `api_bind_addr` | string | `"127.0.0.1:8443"` | mTLS listen address |
-| `peers` | list of strings | `["2=https://10.0.0.2:8443"]` | `"<node_id>=<base_url>"`; malformed entries fail at startup |
-| `storage_path` | string | `"/var/lib/sentinel/db"` | sled directory |
-| `tls_cert_path` | string | `"pki/server.crt"` | Node cert (**must allow both `serverAuth` and `clientAuth`** — it is reused for outbound peer calls) |
-| `tls_key_path` | string | `"pki/server.key"` | Private key (PKCS#8 recommended) |
-| `ca_cert_path` | string | `"pki/ca.crt"` | CA used to verify every client and peer |
+| Key | Default | Meaning |
+|---|---|---|
+| `node_id` | required | This node's Raft id (u64) |
+| `api_bind_addr` | required | Address of the mTLS listener |
+| `storage_path` | required | Directory for the `sled` store |
+| `tls_cert_path`, `tls_key_path`, `ca_cert_path` | required | This node's certificate and key, and the CA it trusts |
+| `peers` | `[]` | `"<node_id>=<base_url>"` entries for the other nodes; empty = single node |
+| `unseal_threshold` | `2` | Key holders needed to unseal; must match what `init` used; minimum 2 |
+| `raft_dir` | `<storage_path>.raft` | Raft's durable state. Keep it paired with `storage_path` |
+| `commit_timeout_ms` | `5000` | How long a write waits for a majority commit |
+| `peer_cns` | `[]` | Common Names of the other cluster nodes (required whenever `peers` is set) |
+| `admin_cns` | `[]` | Identities allowed to seal/unseal (at least one required) |
+| `writer_cns`, `reader_cns` | `[]` | Identities allowed to write/delete+read, or read only (at least one of the two required) |
+| `revoked_serials` | `[]` | Certificate serial numbers (hex) refused after the handshake |
+| `audit_path` | `<storage_path>.audit.jsonl` | The durable audit log |
+| `canary_file` | none | The `canary.bin` from `init`, installed into storage at startup |
+| `allow_canary_bootstrap` | `false` | **Dev only**: let the first unseal of an empty vault define the canary |
+| `anomaly_min_burst` | `10` | Auto-seal floor: a one-second bucket with fewer than this many secret reads is never flagged. An app that reads N secrets at start-up needs a value above N. Minimum 1 |
+| `insecure_allow_any_client` | `false` | **Dev only**: any valid certificate may do anything. Logs a warning at startup |
 
-### How config is actually loaded (verified)
+**Startup refuses**: a policy that would lock everyone out (no admins, no secret clients, peers without `peer_cns`, a node certificate that is also listed as a client); an audit log that fails verification; a storage directory whose canary differs from `canary_file`; `unseal_threshold < 2`; `anomaly_min_burst = 0`.
 
-Sources are `SENTINEL__*` environment variables, then an optional config file — **and the file wins** over the environment.
-
-- The environment prefix separator is `__`: `SENTINEL__NODE_ID=1`, `SENTINEL__API_BIND_ADDR=…`.
-- **`peers` cannot be supplied through the environment** — a string such as `[]` fails with *invalid type: string, expected a sequence*. Use the file.
-- The file is `File::with_name(".env")`; the `config` crate resolves that by trying known extensions, so the working file is **`.env.toml`** in the current directory. A file literally named `.env` is *not* read.
-- `dotenvy` is a declared dependency but is not called.
-
-### Example `.env.toml` (single node)
-
-```toml
-node_id        = 1
-api_bind_addr  = "127.0.0.1:8443"
-peers          = []
-storage_path   = "./sentinel.db"
-tls_cert_path  = "pki/server.crt"
-tls_key_path   = "pki/server.key"
-ca_cert_path   = "pki/ca.crt"
-```
-
-### Three-node example
-
-```toml
-# node 1
-node_id = 1
-api_bind_addr = "0.0.0.0:8443"
-peers = ["2=https://10.0.0.2:8443", "3=https://10.0.0.3:8443"]
-```
-
-Runtime tuning is currently in code: heartbeat 50 ms; election timeout 150–300 ms (`ElectionTimeoutRange::default`); anomaly detector 1 s buckets / 60 history / z = 3.0; peer HTTP timeout 5 s.
+A fully commented example is in [`.env.toml.example`](.env.toml.example).
 
 ---
 
@@ -799,118 +773,98 @@ Runtime tuning is currently in code: heartbeat 50 ms; election timeout 150–300
 
 ### 10.1 Prerequisites
 
-| Tool | Version | Notes |
-|---|---|---|
-| Rust toolchain | **1.85+** (edition 2024); verified with **1.91.1** | `rustup` recommended |
-| C toolchain + `pkg-config` | any | Needed to compile native dependencies |
-| PC/SC dev library | Linux: `libpcsclite-dev` | Required by the `yubikey` crate. Windows and macOS use the system smart-card service. |
-| OpenSSL (or any CA tooling) | any | To generate dev certificates |
-| Nightly Rust + `cargo-fuzz` | optional | Fuzzing and Miri only |
-| A YubiKey with PIV | optional | Only for real hardware unseal |
+Rust 1.85 or newer (edition 2024; `rust-toolchain.toml` selects `stable`). No `openssl` is needed: the CLI creates the PKI.
+
+**Linux only, for building and running `sentinel-cli`:** its (unverified) YubiKey support links the PC/SC smart-card library, so install `pkg-config` and `libpcsclite-dev` to build (`sudo apt install pkg-config libpcsclite-dev` on Debian/Ubuntu; `pcsc-lite-devel` on Fedora; `pcsclite` on Arch) and `libpcsclite1` to run it. **`sentinel-node` does not need it**: build it alone with `cargo build -p sentinel-node` on a machine with no smart-card stack. Windows needs nothing extra (it uses the built-in smart-card API). macOS is untested.
 
 ### 10.2 Build and test
 
 ```bash
-git clone https://github.com/MuaazTasawar/sentinel.git
-cd sentinel
-
 cargo build --workspace
-cargo test  --workspace          # 113 tests; ~15 s of runtime after compiling
+cargo test --workspace --no-fail-fast
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Expected: every `test result: ok`, **0 failed**. The build currently prints two warnings (`dashboard_status` / `dashboard_page` never used — the unmounted dashboard).
+The first build compiles `rustls`, `ring` and `sled` and takes a few minutes. The consensus and property tests take around 10-40 s.
 
-### 10.3 Generate development certificates
+### 10.3 Provision a vault (once)
 
 ```bash
-mkdir -p pki && cd pki
+CLI=target/debug/sentinel-cli
 
-# CA
-openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.crt -days 30 \
-  -subj "/CN=Sentinel Dev CA" \
-  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+$CLI pki ca --out ca
+mkdir pki && cp ca/ca.crt pki/
+$CLI pki issue --ca ca --out pki --cn node1       --kind node   --san localhost --san 127.0.0.1
+$CLI pki issue --ca ca --out pki --cn alice-admin --kind client
+$CLI pki issue --ca ca --out pki --cn app-writer  --kind client
 
-# Extensions shared by node and client leaf certs
-printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth,clientAuth\n" > ext.cnf
-
-# Node (server) cert — CN becomes the node's identity to peers
-openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=sentinel-node-1"
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 30 -extfile ext.cnf
-
-# Operator (client) cert — CN is what lands in the audit log
-openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=alice-operator"
-openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 30 -extfile ext.cnf
-cd ..
+$CLI init --holder alice --holder bob --holder carol --threshold 2 --out vault
+# prompts for each holder's passphrase (12+ characters, typed twice); read vault/PROVISIONING.txt next
 ```
 
-> The key must be a PEM private key that `rustls-pemfile` understands; OpenSSL 3 emits PKCS#8 (`BEGIN PRIVATE KEY`) by default, which is also what `reqwest`'s identity loader expects.
+On Windows PowerShell use `.\target\debug\sentinel-cli.exe`. **Run `init` as a single command on its own line**: pasting several lines can feed stray Enter keypresses to the hidden passphrase prompts.
 
 ### 10.4 Run a single node
 
-```bash
-cat > .env.toml <<'EOF'
-node_id        = 1
-api_bind_addr  = "127.0.0.1:8443"
-peers          = []
-storage_path   = "./sentinel.db"
-tls_cert_path  = "pki/server.crt"
-tls_key_path   = "pki/server.key"
-ca_cert_path   = "pki/ca.crt"
-EOF
+`.env.toml`:
 
-RUST_LOG=info cargo run -p sentinel-node
+```toml
+node_id          = 1
+api_bind_addr    = "127.0.0.1:8443"
+storage_path     = "data/node1"
+tls_cert_path    = "pki/node1.crt"
+tls_key_path     = "pki/node1.key"
+ca_cert_path     = "pki/ca.crt"
+canary_file      = "vault/canary.bin"
+unseal_threshold = 2
+admin_cns        = ["alice-admin"]
+writer_cns       = ["app-writer"]
 ```
-
-Expected log (JSON lines):
-
-```json
-{"level":"INFO","fields":{"message":"sentinel node starting","node_id":1}}
-{"level":"INFO","fields":{"message":"listening for mTLS connections","addr":"127.0.0.1:8443"}}
-```
-
-### 10.5 Talk to it
 
 ```bash
-C="curl -s --cacert pki/ca.crt --cert pki/client.crt --key pki/client.key"
-$C https://localhost:8443/cluster/status        # {"commit_index":0,"role":"Leader","term":1}
-
-# Prove mTLS is mandatory — both of these fail at the handshake:
-curl -s --cacert pki/ca.crt https://localhost:8443/cluster/status; echo "exit=$?"   # exit=56
+cargo run -p sentinel-node
 ```
 
-Server log for the rejected attempt:
-
-```json
-{"level":"WARN","fields":{"message":"mTLS handshake failed","error":"peer sent no certificates"}}
-```
-
-### 10.6 Exercise the full secret path (via tests)
-
-Because the running node has no unseal path yet, the encrypt → store → decrypt → audit → auto-seal flow is demonstrated by the handler tests, which inject a KEK:
+### 10.5 Unseal and use it
 
 ```bash
-cargo test -p sentinel-node -- --nocapture
-cargo test -p sentinel-node sudden_read_burst_triggers_auto_seal_and_is_audit_logged
+for h in alice bob; do
+  $CLI unseal-file --node https://localhost:8443 \
+    --cert pki/alice-admin.crt --key pki/alice-admin.key --ca pki/ca.crt \
+    --file vault/share-$h.enc          # each holder is prompted for their own passphrase
+done
+curl --cacert pki/ca.crt --cert pki/app-writer.crt --key pki/app-writer.key \
+  -X PUT -d 'hunter2' https://localhost:8443/secrets/db-password
 ```
 
-### 10.7 Run a 3-node cluster
+The dashboard is at `https://localhost:8443/` (your browser needs a client certificate whose CN is an admin, reader or writer).
 
-Create three certs (CNs `sentinel-node-1..3`), three `.env.toml` files listing the other two nodes in `peers`, and start each with its own working directory. Elections will converge to one leader (check `/cluster/status` on each). Note the current limits: heartbeats carry no entries and Raft state is in memory ([§13](#13-known-limitations--findings)).
+### 10.6 Run a 3-node cluster
+
+Issue one certificate per node (`--cn node1`, `node2`, `node3`, each with its own `--san`) and give every node:
+
+```toml
+peers    = ["2=https://host2:8443", "3=https://host3:8443"]   # the others, "<id>=<url>"
+peer_cns = ["node1", "node2", "node3"]
+```
+
+Start all three; they elect a leader. **Unseal every node** (the key lives only in memory), write through the leader, read from any node. A write sent to a follower returns `421`.
+
+### 10.7 Check the audit log
+
+```bash
+$CLI verify data/node1.audit.jsonl
+$CLI verify data/node1.audit.jsonl --expect-tip <hash shown on the dashboard earlier>
+```
 
 ### 10.8 Fuzzing and Miri (nightly)
 
 ```bash
-cargo install cargo-fuzz
-rustup toolchain install nightly --component miri
-
-cd crates/crypto
-cargo +nightly fuzz run decrypt -- -max_total_time=60
-cargo +nightly fuzz run combine_shares
-cargo +nightly fuzz run kdf
-cargo +nightly miri test -p sentinel-crypto      # Miri can't model mlock/VirtualLock syscalls
+cargo +nightly install cargo-fuzz
+cd crates/crypto && cargo +nightly fuzz run decrypt
 ```
 
-See `crates/crypto/fuzz/README.md` for crash-replay instructions and the Miri caveat.
+See [§11.3](#113-what-has-not-been-executed): these have not been run by the author.
 
 ---
 
@@ -918,33 +872,56 @@ See `crates/crypto/fuzz/README.md` for crash-replay instructions and the Miri ca
 
 ### 11.1 Test inventory
 
-| Package | Unit | Integration / property | Total | What they cover |
-|---|---:|---:|---:|---|
-| `sentinel-crypto` | 20 | 7 | 27 | Round-trips, tamper detection, GF(256) inverses, share-set validation, `Debug` non-leak, KDF determinism, no-panic properties |
-| `sentinel-consensus` | 28 | — | 28 | Vote rules, log conflict resolution, commit bounds, 3-node election, anti-deadlock stress, single-node leader |
-| `sentinel-anomaly` | 13 | — | 13 | Warm-up, steady traffic, burst detection, early firing, idle gaps, flat baseline, snapshots, seal encoding |
-| `sentinel-node` | 13 | — | 13 | Secrets CRUD, sealed → 503, audit recording, auto-seal, cluster status, dashboard payload, mTLS config/CN |
-| `sentinel-sim` | 6 | 7 | 13 | Clock/network primitives + chaos scenarios |
-| `sentinel-audit` | 8 | — | 8 | Tamper, splice, delete, genesis, reload |
-| `sentinel-hardware` | 5 | — | 5 | Quorum logic |
-| `sentinel-storage` | 4 | — | 4 | sled CRUD + prefix listing |
-| `sentinel-cli` | 2 | — | 2 | Verify clean / tampered file |
-| **Total** | | | **113** | |
+| Area | What is proven |
+|---|---|
+| Crypto | Round trips; wrong key and tampered ciphertext fail closed; Shamir for every subset; property tests (no panics on arbitrary input) |
+| Key canary | Only the right key verifies; wrong lengths and tampering do not panic |
+| Raft state machine | Vote rules, log rules, commit only by current-term replicas (Figure 8), one-step back-off per rejection, reordered/duplicated/stale replies |
+| Raft actor | Real multi-node clusters over a network that can be cut: ordering, catch-up, a deposed leader's write never applied, fail-stop on disk failure, restart of the **whole cluster** loses nothing, a restarted node cannot vote twice |
+| Persistence | CRC-checked WAL, torn-tail recovery, a damaged vote file is refused rather than read as zero |
+| Authorization | Every role against every route group; an identity with no role; denials audited once; the original `/raft/*` hole |
+| Audit | Tampered/deleted/reordered entries detected; torn tail recovered; a failing disk degrades the log; tail truncation shown to be detectable **only** by an external tip |
+| Provisioning | Any threshold of holders rebuilds a key that opens the canary, fewer cannot; never overwrites key material; certificates chain to the CA with the right identity and usages |
+| Simulator | See below |
 
-### 11.2 Bugs found by adversarial testing
+### 11.2 The simulator
 
-1. **Actor deadlock** (§5.7) — found by a timing stress test, reproduced against the buggy code, fixed, re-verified over repeated runs.
-2. **Single-node election bug** (§5.7) — found while writing a later phase's handler tests; regression test proven to fail before the fix and pass after.
-3. **Windows build break** — `mlock` doesn't exist on Windows; led to the `cfg`-gated `VirtualLock` implementation.
+`sentinel-sim` drives the **same `RaftState`** as the production actor on a discrete-event scheduler with virtual time. It adds replication, node **crashes with restart from persisted state**, message **loss, duplication and reordering**, and checks four Raft properties after every step: election safety, log matching, state machine safety, and leader completeness. 200 random fault schedules run in the suite, each followed by a recovery phase that must converge and commit a fresh command; identical seeds reproduce identical histories.
+
+The checkers are themselves tested: each has a test that deliberately corrupts a node and requires the checker to fail.
+
+**Mutation results** (deliberately breaking the production consensus code):
+
+| Bug introduced | Caught by |
+|---|---|
+| Followers never truncate conflicting entries | simulator (log matching) |
+| Election restriction removed | simulator (leader completeness) |
+| A node may vote for several candidates in a term | simulator (election safety) |
+| Commit on a minority | simulator (state machine safety) |
+| Commit old-term entries by counting replicas (Figure 8) | consensus unit test only: every leader appends a no-op, so a replica of an old entry always travels with a current-term entry, which makes this unreachable from outside |
+| A restarted node forgets its vote | consensus unit and actor tests (3 failures); the random fault runs do not reach it |
 
 ### 11.3 What has *not* been executed
 
 | Item | Why |
 |---|---|
-| YubiKey PIV decryption on hardware | No physical device |
-| `cargo-fuzz` under libFuzzer | Needs nightly; construction logic was checked on stable |
-| Miri | Needs nightly |
-| Multi-node `HttpTransport` | Only single-node paths are exercised end-to-end |
+| YubiKey PIV decryption on hardware | No device; the code is believed to be wrong for ECC keys (see §13) |
+| Long `cargo-fuzz` campaigns | Needs nightly. A **non-blocking** CI job (`continue-on-error`) fuzzes each of the three targets for 45 s. In CI run #8 the individual steps were checked and ticked (the fuzz step took 2 min 46 s) and no crash was reported. 45 s per target is a smoke test, not a campaign: it shows the targets build and survive a short run, not that `decrypt` and friends are robust. Since the job is non-blocking, check its steps (not just the overall tick) after any change to the crypto crate |
+| Miri | Needs nightly; the crypto crate calls `mlock`/`VirtualLock`, which Miri cannot execute |
+| Clusters larger than 5 nodes, real multi-host networks, sustained load | Only single-machine, loopback runs |
+| macOS | Not built or tested |
+
+### 11.4 Bugs found by adversarial testing and real runs
+
+1. **Actor deadlock** (§5.7), found by a timing stress test.
+2. **Single-node election bug** (§5.7).
+3. **Windows build break**: `mlock` does not exist on Windows; led to the `cfg`-gated `VirtualLock`.
+4. **Lagging followers started elections**: a follower reset its election timer only when an append *succeeded*, so a merely-behind follower would have disrupted the cluster once real replication began.
+5. **Audit file opened append-only**: on Windows an append-only handle cannot be truncated, so recovering from a torn final record failed with "Access is denied". Found by the Windows test run, not by Linux.
+6. **Timing assumptions in tests**: a test asserted "exactly one leader" from a single snapshot after a fixed sleep, which is not a Raft guarantee (only one leader *per term* is). Replaced by polling plus the real invariant.
+7. **`cargo test` does not rebuild binaries**: stale `sentinel-node`/`sentinel-cli` binaries produced misleading end-to-end failures.
+8. **Ubuntu CI failed on a clean machine**: building anything that depends on the `yubikey` crate needs `libpcsclite-dev`, which the development sandbox happened to have installed unnoticed, and this README had wrongly claimed it was not needed on Linux. Fixed by installing it in CI and by making YubiKey support an optional `yubikey` feature of `sentinel-hardware`, so the **server no longer depends on the smart-card stack at all** (a CI guard enforces that). The Ubuntu, Windows and clippy jobs have been green since (CI run #8).
+9. **Auto-seal flagged a lone read after idle time**: an unrelated flaky test (a read that should have returned 200 returned 503 on a loaded machine) turned out to be a real bug. With an all-zero baseline (mean 0, stddev 0) the detector flagged *any* single read; with the node's real settings, two reads 20 s apart would have sealed the vault. Existing tests only used bursts, so nobody saw it. Fixed with a count floor (`anomaly_min_burst`); the regression test (`one_ordinary_read_after_a_long_quiet_spell_does_not_seal_the_vault`) fails when the floor is removed.
 
 ---
 
@@ -952,99 +929,98 @@ See `crates/crypto/fuzz/README.md` for crash-replay instructions and the Miri ca
 
 ### 12.1 What Sentinel is designed to guarantee
 
-| Property | Mechanism | Status |
-|---|---|:-:|
-| Plaintext never persisted | Envelope encryption above the `Storage` trait | ✅ |
-| Authenticated encryption | AES-256-GCM (tag verified on decrypt) | ✅ |
-| Keys never swapped / lingering | `mlock` + zeroize | ✅ |
-| No unauthenticated network access | mTLS with mandatory client certs; no plaintext listener | ✅ |
-| Attributable actions | CN recorded in every audit entry | ✅ |
-| Tamper-evident history | SHA-256 hash chain | ✅ (in memory) |
-| Automatic lockdown on exfiltration-like reads | z-score → clear KEK | ✅ (local) |
-| Unsealing needs physical hardware | Shamir + PIV | ⚠️ components exist; hand-off and hardware path unverified |
-| Cluster-wide seal | `SealCommand` via Raft | ❌ needs replication |
+| Property | Mechanism |
+|---|---|
+| Secrets at rest are ciphertext | AES-256-GCM envelope encryption under the KEK; the Raft log and every follower's disk see only ciphertext |
+| The KEK never touches disk | Held in `mlock`-ed, zeroizing memory; rebuilt from shares at unseal; `init` never writes it |
+| No single person can unseal | Shamir K-of-N; each holder submits only their own share |
+| A wrong or partial quorum is rejected | The rebuilt key must open the provisioned canary; no trust-on-first-use by default |
+| Every client is authenticated and authorized | Mandatory mTLS, then a default-deny role policy; revoked serials refused |
+| A node certificate cannot read secrets; an admin cannot either | Roles are separate by design |
+| An acknowledged write is on a majority and survives restarts | Commit-gated writes; fsync'd Raft state; whole-cluster restart tested |
+| The audit trail is tamper-evident and durable | Hash chain, fsync per entry, verified at startup; a tampered log stops the node |
+| No secret operation without a durable audit record | Fail-closed when the audit log cannot be written |
+| An exfiltration burst seals the vault | Rolling z-score on successful reads; the triggering secret is withheld; the seal is replicated |
 
 ### 12.2 Threat model
 
-| Threat | Mitigation | Residual risk |
-|---|---|---|
-| Stolen disk / backup | Only ciphertext on disk; KEK never persisted | KEK wrap/unwrap strength = AES-256-GCM |
-| Swap / core-dump leakage | `mlock`, zeroize | Core dumps while unsealed aren't addressed |
-| Network eavesdropping / MITM | rustls mTLS | Cert management is manual |
-| Rogue node joining the cluster | Needs a CA-signed cert | See "any cert can call `/raft/*`" below |
-| Compromised token / client bulk-reading secrets | Auto-seal | Detection needs 5 s of baseline; anyone with a client cert can also trigger a seal (a DoS) |
-| Log tampering | Hash chain | Whole-file consistent rewrite; not persisted/replicated yet |
-| Insider with one YubiKey | k-of-n Shamir + duplicate-holder rejection | Needs real-hardware validation |
+| Threat | Mitigation |
+|---|---|
+| Stolen disk or backup | Only ciphertext; the KEK is not on disk. Share files are passphrase-protected |
+| Rogue application with a valid certificate | Role policy limits it to its role; auto-seal on abnormal read rates |
+| A stolen node certificate | Cannot read secrets or unseal; can still act as a Raft peer (see limits). Revoke the serial |
+| One malicious or coerced key holder | Needs K holders |
+| A client probing for names | 404s are not counted, cannot trigger a seal, and are not recorded as reads |
+| Tampering with the audit log | Detected at startup and by `verify`; truncation of the tail needs an external tip |
+| A node whose disk fails | Raft actor stops (fail-stop); audit degradation refuses secret operations |
+| Network eavesdropping or injection | TLS with mandatory client certificates |
 
 ### 12.3 Non-goals (today)
 
-Fine-grained authorization, key rotation tooling, certificate revocation, secret versioning/TTLs, HSM-backed server TLS keys, and protection from a root-level attacker on a running, unsealed node.
+- **Byzantine peers.** Raft tolerates crashes, not malicious nodes. Anyone holding a `peer_cns` certificate is fully trusted by the cluster.
+- **Defence against a fully compromised, *unsealed* node.** The KEK is in its memory.
+- **Protection of secret *names*.** Names appear in the audit log, and in storage keys.
+- **Side channels, core dumps and swap while unsealed** beyond best-effort `mlock`.
 
 ---
 
 ## 13. Known Limitations & Findings
 
-Stated plainly, because a security project that advertises only what works is less trustworthy than one that also says what doesn't. Items marked 🔬 were reproduced by running the code.
+The original list of problems in this project (functional gaps, security findings, housekeeping) was worked through in phases 12-18. Status:
 
-### 13.1 Functional gaps (most important first)
+### 13.1 Resolved
 
-1. 🔬 **A running node can never be unsealed.** `main.rs` creates `kek = Arc::new(Mutex::new(None))` and nothing writes to it; `sentinel-cli unseal` reconstructs the KEK but only prints its length. Reads and writes return `503`.
-2. **Raft does not replicate or commit.** `propose` appends to the leader's local log only; heartbeats are always `entries: vec![]`; `AppendEntries` responses are discarded; `commit_index` is never advanced on the leader (no `match_index` tracking); there is no apply loop. The simulator mirrors this simplification.
-3. **Writes aren't gated on commit.** `put_secret`/`delete_secret` propose and then write to storage immediately, so a partitioned old leader could apply a write that never reaches a majority. (Documented in the code as "the single biggest gap between 'looks like Raft' and 'is linearizable'".)
-4. **Raft state isn't persistent.** `current_term`, `voted_for`, and the log live in memory; a restart forgets them, which Raft's safety proof forbids.
-5. **`SealCommand` is proposed but never applied** by other nodes (consequence of 2 and 3). Only the local seal is effective.
-6. 🔬 **The dashboard isn't served.** `GET /` and `GET /api/status` → 404; `cargo build` warns both handlers are unused. The HTML (`crates/api/dashboard/index.html`, polls `/api/status` every 2 s, no external assets) and a tested status payload are ready.
-7. **The audit chain is in-memory only** and nothing exports it, so `sentinel-cli verify` has no producer.
-8. **Quorum KEK isn't verified.** Shamir returns garbage on a wrong/insufficient set; the comment in `QuorumUnseal::try_reconstruct` refers to an "audit-log HMAC" check that doesn't exist yet.
-9. **No provisioning tooling** — nothing generates shares, encrypts them to a PIV key, or writes the unseal manifest. The PIV path requests ECC P-256 via `decrypt_data` (see §5.3 caveat).
-10. **No node bootstrap tooling** — dev certs and config files are hand-made (§10).
+| Original problem | Resolution |
+|---|---|
+| A running node could never be unsealed | `/sys/unseal` with a node-side quorum; `unseal-file` |
+| Raft did not replicate or advance `commit_index` | `next_index`/`match_index`, majority commit, apply loop |
+| Writes were not gated on majority commit | Handlers propose and wait; only the apply loop writes storage |
+| Raft term, vote and log were not persisted | `FileStore` WAL, fsync before replying |
+| `SealCommand` was not applied cluster-wide | Replicated `Seal` command; follower anomalies forwarded to the leader |
+| Dashboard routes returned 404 | Mounted and tested |
+| Audit chain was in memory only; `verify` had no producer | Durable JSON-lines log; `verify` reads it |
+| A reconstructed KEK was not verified | Key canary |
+| No provisioning tooling | `init`, `pki ca`, `pki issue` |
+| Any client certificate could call `/raft/*`; no authorization | Role-based, default-deny policy |
+| `list`/`delete` worked while sealed | Refused with 503 |
+| 404 reads counted toward the auto-seal rate | Only successful reads count |
+| Auto-seal flagged a lone read after idle time (found later, by a flaky test) | Count floor `anomaly_min_burst` (§5.10) |
+| Unused dependencies, 9 stray lockfiles, mixed editions, config precedence and file-name confusion | Cleaned up; edition 2024 everywhere; environment overrides the file |
 
-### 13.2 Security-relevant findings
+### 13.2 Remaining
 
-- 🔬 **Any client with a CA-signed certificate can call `/raft/*`.** Peer and operator certs aren't distinguished. Sending `POST /raft/vote` with term 9 from an ordinary client cert made a leader at term 1 step down to follower at term 9. Fix: authorize `/raft/*` by an allow-list of peer CNs (or a separate peer CA/listener).
-- **Authorization is all-or-nothing.** `AppError::Unauthorized` exists as a placeholder but is never produced; every authenticated identity may read, write, delete and list everything.
-- 🔬 **`GET /secrets` and `DELETE /secrets/{key}` work while sealed** (list returns key names; delete returns 204). Consider gating both on unsealed state.
-- **Auto-seal is also a DoS lever.** Any authenticated client can trigger it by reading quickly — and with no unseal path, recovery isn't possible yet. Counting all `GET`s (including 404s) makes that easier.
-- **Cold-start blind spot.** No detection until 5 buckets of history exist.
-- **Identity is the certificate CN only**, so two certificates with the same CN are indistinguishable in the audit log.
-- **Revocation** isn't supported (no CRL/OCSP); rotate by re-issuing the CA.
-
-### 13.3 Config and housekeeping
-
-- 🔬 Config file must be named **`.env.toml`**; file overrides env; `peers` can't come from env (§9).
-- The previous README claimed **106** tests; the actual, verified total is **113** (the old table already summed to 113).
-- `vsss-rs` remains in `crates/crypto/Cargo.toml` (and the lockfile) but is unused; `dotenvy` is declared but unused.
-- Each crate directory carries its own stray `Cargo.lock` (9 of them) in addition to the workspace lock.
-- `sentinel-sim` uses `edition = "2021"` while the other crates use `2024`; `[workspace.package]` values aren't inherited by members.
-- `AuditChain` timestamps use `to_rfc3339()` in the hash input; keep that exact format if you ever re-implement verification elsewhere.
+1. **The YubiKey path is unverified and probably wrong.** `sentinel-hardware` calls PIV `decrypt_data` with an **ECC P-256** key. On a PIV card, ECC keys perform ECDH key agreement; they do not decrypt. The author has no device to confirm. Fixing it needs a device and a design decision (an RSA slot, or ECDH with a hybrid scheme). Until then use passphrase-protected shares from `init`; they are a weaker second factor than hardware.
+2. **No log compaction or snapshots.** The Raft WAL and log grow with every write; there is no truncation of the applied prefix.
+3. **No dynamic membership.** The peer set is static; no joint consensus.
+4. **Per-node audit logs.** Each node records what it saw; they are not merged or replicated. Tail truncation is detectable only against an externally recorded tip.
+5. **Reads are not linearizable.** They are served from the node's own storage, so a lagging follower can return an older value.
+6. **Revocation is a deny-list**, edited in config and applied on restart; not CRL or OCSP.
+7. **Identity is the certificate's Common Name.** Two certificates with the same CN are indistinguishable to the policy.
+8. **Auto-seal needs a warm-up and a minimum burst.** The detector needs history before it can flag anything, and a bucket needs at least `anomaly_min_burst` reads. A fast attacker on a freshly started node is not caught, and a slow read rate below the floor is never flagged. A reader with a valid certificate can also deliberately trigger a seal by reading fast: that is the defence working, but it is also a lever.
+9. **Forwarded seals are best-effort.** If no leader is reachable at that moment, only the detecting node is sealed.
+10. **A node holds the whole key in memory while unsealed, and briefly while a quorum assembles.** Anyone who can read that process's memory defeats the scheme.
+11. **Unsealing is manual per node.** The key lives only in memory, so every restart needs a new quorum on every node.
+12. **Share distribution is out of band.** `init` produces files; getting each to its holder safely is your responsibility.
+13. **`rustfmt` is not enforced.** The codebase was never formatted with it (running `cargo fmt` would touch nearly every file). `clippy -D warnings` *is* enforced.
+14. **Minor:** piping `sentinel-cli` output into something that closes early (`| head`) prints a broken-pipe panic.
 
 ---
 
 ## 14. Roadmap
 
-```mermaid
-timeline
-    title Sentinel path from skeleton to usable vault
-    Phase A - Make it usable : Wire unseal hand-off to a running node : Mount dashboard routes : Gate list and delete on sealed state : Persist audit chain to storage
-    Phase B - Make Raft real : Leader replication with next and match index : Commit advancement and apply loop : Persist term, vote and log : Apply SealCommand cluster-wide
-    Phase C - Harden : Peer-CN allow-list for raft routes : Per-identity authorization policy : KEK integrity check after reconstruction : Cert revocation
-    Phase D - Operate : sentinel-cli init and provision tooling : Config file and env list support : Metrics and structured audit export : Packaging and release builds
-    Phase E - Verify harder : Crash and restart faults in the simulator : Log Matching and Leader Completeness checks : Run cargo-fuzz and Miri in CI : Test on physical YubiKeys
-```
+**Next, in rough priority order:**
 
-Checklist:
+- [ ] Resolve the hardware-key design on a real device (see §13.2-1), then re-enable hardware shares in `init`.
+- [ ] Snapshots and log compaction for Raft and the WAL.
+- [ ] Linearizable reads (read-index or lease reads) as an option.
+- [ ] Replicate or merge audit logs; periodic external tip anchoring.
+- [ ] Dynamic membership (joint consensus).
+- [ ] CRL/OCSP or short-lived certificates instead of a restart-time deny-list.
+- [ ] Auto-unseal options (KMS) for restarts, with their own threat model.
+- [ ] Metrics, readiness endpoint, packaged releases.
+- [ ] `cargo fmt` the tree once, then enforce it.
 
-- [ ] Unseal RPC / local admin socket that installs the KEK (and audit it)
-- [ ] Mount `/` and `/api/status`
-- [ ] Leader-side replication: `next_index` / `match_index`, majority commit, apply loop
-- [ ] Persist Raft hard state and log; persist audit chain
-- [ ] Restrict `/raft/*` to peer identities; add authorization policy
-- [ ] Verify reconstructed KEK (canary decrypt or HMAC)
-- [ ] Provisioning command: generate shares → encrypt to PIV keys → write manifest
-- [ ] Validate the PIV path on hardware (algorithm/slot choice)
-- [ ] Simulator: crash/restart, message loss, Log Matching & State-Machine-Safety checks
-- [ ] Remove unused deps (`vsss-rs`, `dotenvy`) and stray per-crate lockfiles
-- [ ] CI: `cargo test`, `clippy`, nightly fuzz smoke + Miri
+**Done in phases 12-18:** everything in §13.1.
 
 ---
 
@@ -1052,48 +1028,37 @@ Checklist:
 
 ```
 sentinel/
-├── Cargo.toml                     # workspace: 9 members, release profile (LTO, panic=abort)
-├── Cargo.lock
-├── .gitignore                     # /target, .env, *.sled, sentinel.db/, *.log …
+├── Cargo.toml                    # workspace, shared package settings
+├── rust-toolchain.toml
+├── .env.toml.example             # every setting, commented
+├── .github/workflows/ci.yml      # Linux + Windows build/test, clippy gate, server-has-no-PC/SC guard
+├── README.md
 └── crates/
-    ├── crypto/                    # sentinel-crypto
-    │   ├── src/{envelope,kdf,secret,shamir,error,lib}.rs
-    │   ├── tests/fuzz_style_property_tests.rs   # 7 proptest properties
-    │   └── fuzz/                  # cargo-fuzz crate (isolated workspace)
-    │       ├── fuzz_targets/{decrypt,combine_shares,kdf}.rs
-    │       └── README.md          # fuzz + Miri instructions
-    ├── storage/                   # Storage trait + sled backend
-    ├── audit/                     # AuditChain
-    ├── consensus/                 # log.rs · rpc.rs · state.rs · actor.rs
-    ├── anomaly/                   # detector.rs · seal.rs
-    ├── hardware/                  # quorum.rs · yubikey_piv.rs
-    ├── sim/                       # mock_clock · mock_network · world · tests/raft_safety_test.rs
-    ├── cli/                       # main.rs · unseal.rs · verify.rs
-    └── api/                       # package: sentinel-node
-        ├── dashboard/index.html   # self-contained console UI (not yet routed)
-        └── src/
-            ├── main.rs            # bootstrap + raw mTLS accept loop
-            ├── config.rs · errors.rs · state.rs · transport.rs
-            ├── routes/mod.rs      # router
-            ├── middleware/mtls.rs # rustls server config, CN extraction
-            └── handlers/{secrets,cluster,raft,dashboard}.rs
+    ├── crypto/       src/{envelope,shamir,kdf,canary,secret}.rs   tests/ (property)   fuzz/ (own workspace)
+    ├── storage/      src/{lib,sled_backend}.rs
+    ├── audit/        src/{chain,persist}.rs
+    ├── consensus/    src/{state,log,actor,persist,rpc}.rs
+    ├── hardware/     src/{quorum,yubikey_piv}.rs                   (hardware path unverified)
+    ├── anomaly/      src/{detector,seal}.rs
+    ├── sim/          src/{world,mock_clock,mock_network}.rs   tests/{raft_safety,log_matching}_test.rs
+    ├── cli/          src/{main,init,pki,unseal,verify}.rs
+    └── api/          src/{main,config,state,statemachine,bootstrap,transport,errors}.rs
+                      src/handlers/{secrets,unseal,raft,cluster,dashboard}.rs
+                      src/middleware/{mtls,authz}.rs   src/routes/mod.rs   dashboard/index.html
 ```
 
 ---
 
 ## 16. Contributing & License
 
-**Workflow:**
+**Workflow** (CI runs the first two on Linux and Windows):
 
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
 ```
 
-The house rule from the project's history: *write it, prove it runs, then ship it* — never hand over code that was only reviewed. If something can't be executed (hardware, nightly tooling), say so explicitly in the code and docs, as this repo does.
-
-Good first contributions are the unchecked items in the [roadmap](#14-roadmap) — especially mounting the dashboard, restricting `/raft/*` to peers, and the leader replication loop.
+The house rule from this project's history: *write it, prove it runs, then ship it*, and never hand over code that was only reviewed. Break the code on purpose to confirm the tests can fail. If something can't be executed here (hardware, nightly tooling, another operating system), say so explicitly in the code and the docs, as this repo does. Platform-specific bugs are real: the audit-log bug in §11.4 passed on Linux and failed on Windows, which is why CI runs both.
 
 **License:** MIT — © MuaazTasawar.
 
@@ -1101,6 +1066,6 @@ Good first contributions are the unchecked items in the [roadmap](#14-roadmap) �
 
 <div align="center">
 
-*Built across 12 phases, each compiled and tested before being called done.*
+*Built across 19 phases (0-18), each compiled and tested before being called done.*
 
 </div>

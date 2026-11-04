@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single Shamir share: an x-coordinate and the y-value for every byte
 /// of the split secret (so an N-byte secret produces shares whose `y` is
-/// also N bytes — each byte is a separate, independent GF(256) polynomial
+/// also N bytes - each byte is a separate, independent GF(256) polynomial
 /// evaluation).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShamirShare {
@@ -147,6 +147,9 @@ pub fn combine_shares(shares: &[ShamirShare]) -> Result<Vec<u8>, ShamirError> {
     }
 
     let mut secret = vec![0u8; secret_len];
+    // `byte_idx` also indexes every share's `y` below, so clippy's "use an
+    // iterator over `secret`" suggestion does not apply here.
+    #[allow(clippy::needless_range_loop)]
     for byte_idx in 0..secret_len {
         let points: Vec<(u8, u8)> = shares.iter().map(|s| (s.x, s.y[byte_idx])).collect();
         secret[byte_idx] = combine_byte(&points);
