@@ -906,7 +906,7 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 | Item | Why |
 |---|---|
 | YubiKey PIV decryption on hardware | No device; the code is believed to be wrong for ECC keys (see §13) |
-| `cargo-fuzz` under libFuzzer | Needs nightly. A **non-blocking** CI job fuzzes each target for 45 s. It ran once and showed a green check, but because the job is `continue-on-error`, a green check does not by itself prove the fuzz steps passed: open the job log and look at the individual steps |
+| Long `cargo-fuzz` campaigns | Needs nightly. A **non-blocking** CI job (`continue-on-error`) fuzzes each of the three targets for 45 s. In CI run #8 the individual steps were checked and ticked (the fuzz step took 2 min 46 s) and no crash was reported. 45 s per target is a smoke test, not a campaign: it shows the targets build and survive a short run, not that `decrypt` and friends are robust. Since the job is non-blocking, check its steps (not just the overall tick) after any change to the crypto crate |
 | Miri | Needs nightly; the crypto crate calls `mlock`/`VirtualLock`, which Miri cannot execute |
 | Clusters larger than 5 nodes, real multi-host networks, sustained load | Only single-machine, loopback runs |
 | macOS | Not built or tested |
@@ -920,7 +920,7 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 5. **Audit file opened append-only**: on Windows an append-only handle cannot be truncated, so recovering from a torn final record failed with "Access is denied". Found by the Windows test run, not by Linux.
 6. **Timing assumptions in tests**: a test asserted "exactly one leader" from a single snapshot after a fixed sleep, which is not a Raft guarantee (only one leader *per term* is). Replaced by polling plus the real invariant.
 7. **`cargo test` does not rebuild binaries**: stale `sentinel-node`/`sentinel-cli` binaries produced misleading end-to-end failures.
-8. **Ubuntu CI failed on a clean machine**: building anything that depends on the `yubikey` crate needs `libpcsclite-dev`, which the development sandbox happened to have installed unnoticed, and this README had wrongly claimed it was not needed on Linux. Fixed by installing it in CI and by making YubiKey support an optional `yubikey` feature of `sentinel-hardware`, so the **server no longer depends on the smart-card stack at all** (a CI guard enforces that).
+8. **Ubuntu CI failed on a clean machine**: building anything that depends on the `yubikey` crate needs `libpcsclite-dev`, which the development sandbox happened to have installed unnoticed, and this README had wrongly claimed it was not needed on Linux. Fixed by installing it in CI and by making YubiKey support an optional `yubikey` feature of `sentinel-hardware`, so the **server no longer depends on the smart-card stack at all** (a CI guard enforces that). The Ubuntu, Windows and clippy jobs have been green since (CI run #8).
 9. **Auto-seal flagged a lone read after idle time**: an unrelated flaky test (a read that should have returned 200 returned 503 on a loaded machine) turned out to be a real bug. With an all-zero baseline (mean 0, stddev 0) the detector flagged *any* single read; with the node's real settings, two reads 20 s apart would have sealed the vault. Existing tests only used bursts, so nobody saw it. Fixed with a count floor (`anomaly_min_burst`); the regression test (`one_ordinary_read_after_a_long_quiet_spell_does_not_seal_the_vault`) fails when the floor is removed.
 
 ---
