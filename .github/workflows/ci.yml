@@ -35,6 +35,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # sentinel-cli links the PC/SC smart-card library for its (unverified)
+      # YubiKey support; GitHub's Ubuntu image does not ship the dev package.
+      # Windows and macOS use the operating system's own smart-card API.
+      - name: Install PC/SC development files (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
+
       # `cargo test` builds test executables, not the sentinel-node / sentinel-cli
       # binaries, so build everything explicitly.
       - name: Build everything
@@ -43,6 +50,15 @@ jobs:
       # --no-fail-fast: one failing crate must not hide failures in the rest.
       - name: Test
         run: cargo test --workspace --no-fail-fast
+
+      # Guard: the server must stay buildable on a machine with no smart-card
+      # stack. Only sentinel-cli (feature `yubikey`) may depend on it.
+      - name: The server must not depend on PC/SC or the YubiKey crate
+        if: runner.os == 'Linux'
+        run: |
+          if cargo tree -p sentinel-node -e normal --prefix none | grep -q -i -E 'pcsc|yubikey'; then
+            echo "sentinel-node must not depend on the smart-card stack"; exit 1
+          fi
 
   clippy:
     name: clippy (warnings are errors)
@@ -54,6 +70,13 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # sentinel-cli links the PC/SC smart-card library for its (unverified)
+      # YubiKey support; GitHub's Ubuntu image does not ship the dev package.
+      # Windows and macOS use the operating system's own smart-card API.
+      - name: Install PC/SC development files (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
+
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # NOT a gate (continue-on-error). Fuzzing needs nightly + libFuzzer and this
