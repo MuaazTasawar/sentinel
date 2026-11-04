@@ -373,13 +373,38 @@ mod tests {
         .expect("no leader")
     }
 
+    /// Proposes `command` through whichever node is leader *right now* and
+    /// waits for the commit, retrying across leadership changes. A single
+    /// "find the leader, then propose" snapshot is not enough on a loaded
+    /// machine: leadership can move in between and the proposal comes back
+    /// `NotLeader`. A retry after an error can in principle commit the
+    /// command twice (a timed-out proposal may still commit later), which is
+    /// harmless for the idempotent commands these tests use.
+    async fn commit_via_any_leader(nodes: &HashMap<u64, Node>, command: &Command) -> u64 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut last_error = String::from("no leader found");
+        while tokio::time::Instant::now() < deadline {
+            for n in nodes.values() {
+                if n.raft.inspect().await.0 == Role::Leader {
+                    match n.raft.propose_and_wait(command.encode(), Duration::from_secs(2)).await {
+                        Ok(index) => return index,
+                        Err(e) => last_error = e.to_string(),
+                    }
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("could not commit through any leader within 30 s (last error: {last_error})");
+    }
+
     #[tokio::test]
     async fn a_committed_write_reaches_every_nodes_storage_and_a_seal_seals_every_node() {
         let nodes = three_nodes().await;
-        let leader = leader_of(&nodes).await;
+        leader_of(&nodes).await;
 
         let put = Command::Put { key: "db-password".into(), value: vec![0xAA, 0xBB] };
-        let index = nodes[&leader].raft.propose_and_wait(put.encode(), Duration::from_secs(5)).await.unwrap();
+        let index = commit_via_any_leader(&nodes, &put).await;
 
         for (id, node) in &nodes {
             let mut rx = node.applied.clone();
@@ -392,7 +417,7 @@ mod tests {
 
         // A seal proposed on the leader seals the leader AND both followers.
         let seal = Command::Seal { reason: "cluster-wide test".into() };
-        let seal_index = nodes[&leader].raft.propose_and_wait(seal.encode(), Duration::from_secs(5)).await.unwrap();
+        let seal_index = commit_via_any_leader(&nodes, &seal).await;
         for (id, node) in &nodes {
             let mut rx = node.applied.clone();
             tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|&v| v >= seal_index))

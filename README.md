@@ -12,7 +12,7 @@ durable hash-chained audit log · statistical auto-seal · deterministic simulat
 ![Axum](https://img.shields.io/badge/HTTP-Axum%200.8-5b21b6)
 ![TLS](https://img.shields.io/badge/TLS-rustls%20mTLS-2ea043)
 ![Crypto](https://img.shields.io/badge/AEAD-AES--256--GCM-0f766e)
-![Tests](https://img.shields.io/badge/tests-283%20passing-2ea043)
+![Tests](https://img.shields.io/badge/tests-291%20passing-2ea043)
 ![Crates](https://img.shields.io/badge/workspace-9%20crates-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -66,7 +66,7 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (283 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (291 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
@@ -83,7 +83,7 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | **Provisioning**: `sentinel-cli init`, `pki ca`, `pki issue` | ✅ | 14 CLI tests; whole vault provisioned with no `openssl` |
 | **Durable, verified audit log** + `sentinel-cli verify` (`--expect-tip`) | ✅ | 19 audit + 8 verify tests; tamper / truncate / torn-tail on real files |
 | Audit failure is **fail-closed** (secret operations refused if the log can't be written) | ✅ | Handler test with a failing sink |
-| Rolling z-score anomaly detector (counts **successful reads only**) | ✅ | 13 detector tests + 404-flood test |
+| Rolling z-score anomaly detector (counts **successful reads only**) | ✅ | 18 detector tests, the 404-flood test and a lone-read-after-idle regression test |
 | Web dashboard (`/`, `/api/status`) | ✅ | Router tests; served over mTLS |
 | Deterministic simulator: **replication, crashes, loss, duplication** + 4 safety checkers | ✅ | 31 sim tests incl. 200 random fault schedules |
 | CI on **Linux and Windows** | ✅ | `.github/workflows/ci.yml` |
@@ -583,11 +583,12 @@ z    = (current_count − mean) / stddev        flag if  z > threshold
 | `max_history` | 60 buckets | Rolling baseline length |
 | `z_threshold` | 3.0 | Std-devs above mean that counts as anomalous |
 | `min_history_for_detection` | 5 | Warm-up — **no detection before 5 closed buckets** |
+| `min_burst` (`anomaly_min_burst`) | 10 | Count floor — **a bucket with fewer reads than this is never flagged**, whatever its z-score |
 
 Behaviours worth knowing:
 
 - **Idle gaps count as zero buckets** — silence is part of the baseline.
-- **Flat baseline (stddev = 0):** *any* count above the mean is flagged (`z = ∞`).
+- **Flat baseline (stddev = 0):** *any* count above the mean is flagged (`z = ∞`) — which is exactly why the count floor exists. After a quiet spell the baseline is all zeros, and without a floor a **single ordinary read** scores as an infinite-sigma outlier: with the node's old settings (1 s buckets, 60-bucket window, `z = 3.0`) two reads 20 s apart gave `z = 4.36` and would have sealed the vault. A bucket now needs at least `anomaly_min_burst` reads before it can flag (the library default is 1, i.e. no floor; the node sets 10). An application that reads N secrets in one burst at start-up needs a value greater than N, or it will seal its own vault.
 - **Worked example:** a baseline alternating 2 and 4 reads/second has mean 3, stddev 1, so with `z = 3.0` the current bucket is flagged once it exceeds `3 + 3×1 = 6` → on the **7th read** within that second.
 - Detection fires *during* a burst, not after (tested: flagged well before 40 requests land).
 - One detector covers **aggregate** node traffic, so a coordinated multi-identity attack still shows as one spike. Only **successful** reads count: lookups of names that do not exist (404), requests while sealed, and failed decryptions do not, so a client looping over made-up names cannot lock the vault.
@@ -648,12 +649,12 @@ Why both: the property tests catch regressions on every commit; the fuzzers find
 | `sentinel-audit` | `crates/audit` | Tamper-evident, **durable** log | `AuditChain::{append, verify, tip_hash, is_healthy}`, `open_persistent`, `parse_log`, `AuditSink`, `FileSink` | 19 |
 | `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `RaftHandle::{propose, propose_and_wait, inspect, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 74 |
 | `sentinel-hardware` | `crates/hardware` | Quorum + YubiKey (**hardware path unverified**; the `yubikey` feature, on by default, is off for the server) | `QuorumUnseal`, `UnsealFragment`, `YubiKeyUnsealer` | 5 |
-| `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 13 |
-| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 76 |
+| `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 18 |
+| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 79 |
 | `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld::{propose, crash, restart, check_all, ...}`, `NetworkConditions` | 16 + 8 + 7 |
 | `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 29 |
 
-**Total: 283 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
+**Total: 291 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
 
 Key dependencies (resolved in `Cargo.lock`): `axum 0.8`, `tokio 1.53`, `rustls 0.23`, `tokio-rustls 0.26`, `hyper-util 0.1`, `reqwest 0.12` (rustls), `x509-parser 0.16`, `rcgen 0.13`, `aes-gcm 0.10`, `argon2 0.5`, `hkdf 0.12`, `sled 0.34`, `yubikey 0.8`, `zeroize 1.9`, `proptest 1.11`, `chrono 0.4`.
 
@@ -759,9 +760,10 @@ Settings come from an optional **`.env.toml`** in the working directory and from
 | `audit_path` | `<storage_path>.audit.jsonl` | The durable audit log |
 | `canary_file` | none | The `canary.bin` from `init`, installed into storage at startup |
 | `allow_canary_bootstrap` | `false` | **Dev only**: let the first unseal of an empty vault define the canary |
+| `anomaly_min_burst` | `10` | Auto-seal floor: a one-second bucket with fewer than this many secret reads is never flagged. An app that reads N secrets at start-up needs a value above N. Minimum 1 |
 | `insecure_allow_any_client` | `false` | **Dev only**: any valid certificate may do anything. Logs a warning at startup |
 
-**Startup refuses**: a policy that would lock everyone out (no admins, no secret clients, peers without `peer_cns`, a node certificate that is also listed as a client); an audit log that fails verification; a storage directory whose canary differs from `canary_file`; `unseal_threshold < 2`.
+**Startup refuses**: a policy that would lock everyone out (no admins, no secret clients, peers without `peer_cns`, a node certificate that is also listed as a client); an audit log that fails verification; a storage directory whose canary differs from `canary_file`; `unseal_threshold < 2`; `anomaly_min_burst = 0`.
 
 A fully commented example is in [`.env.toml.example`](.env.toml.example).
 
@@ -919,6 +921,7 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 6. **Timing assumptions in tests**: a test asserted "exactly one leader" from a single snapshot after a fixed sleep, which is not a Raft guarantee (only one leader *per term* is). Replaced by polling plus the real invariant.
 7. **`cargo test` does not rebuild binaries**: stale `sentinel-node`/`sentinel-cli` binaries produced misleading end-to-end failures.
 8. **Ubuntu CI failed on a clean machine**: building anything that depends on the `yubikey` crate needs `libpcsclite-dev`, which the development sandbox happened to have installed unnoticed, and this README had wrongly claimed it was not needed on Linux. Fixed by installing it in CI and by making YubiKey support an optional `yubikey` feature of `sentinel-hardware`, so the **server no longer depends on the smart-card stack at all** (a CI guard enforces that).
+9. **Auto-seal flagged a lone read after idle time**: an unrelated flaky test (a read that should have returned 200 returned 503 on a loaded machine) turned out to be a real bug. With an all-zero baseline (mean 0, stddev 0) the detector flagged *any* single read; with the node's real settings, two reads 20 s apart would have sealed the vault. Existing tests only used bursts, so nobody saw it. Fixed with a count floor (`anomaly_min_burst`); the regression test (`one_ordinary_read_after_a_long_quiet_spell_does_not_seal_the_vault`) fails when the floor is removed.
 
 ---
 
@@ -981,6 +984,7 @@ The original list of problems in this project (functional gaps, security finding
 | Any client certificate could call `/raft/*`; no authorization | Role-based, default-deny policy |
 | `list`/`delete` worked while sealed | Refused with 503 |
 | 404 reads counted toward the auto-seal rate | Only successful reads count |
+| Auto-seal flagged a lone read after idle time (found later, by a flaky test) | Count floor `anomaly_min_burst` (§5.10) |
 | Unused dependencies, 9 stray lockfiles, mixed editions, config precedence and file-name confusion | Cleaned up; edition 2024 everywhere; environment overrides the file |
 
 ### 13.2 Remaining
@@ -992,7 +996,7 @@ The original list of problems in this project (functional gaps, security finding
 5. **Reads are not linearizable.** They are served from the node's own storage, so a lagging follower can return an older value.
 6. **Revocation is a deny-list**, edited in config and applied on restart; not CRL or OCSP.
 7. **Identity is the certificate's Common Name.** Two certificates with the same CN are indistinguishable to the policy.
-8. **Auto-seal needs a warm-up.** The detector needs history before it can flag anything. A fast attacker on a freshly started node is not caught. A reader with a valid certificate can also deliberately trigger a seal by reading fast: that is the defence working, but it is also a lever.
+8. **Auto-seal needs a warm-up and a minimum burst.** The detector needs history before it can flag anything, and a bucket needs at least `anomaly_min_burst` reads. A fast attacker on a freshly started node is not caught, and a slow read rate below the floor is never flagged. A reader with a valid certificate can also deliberately trigger a seal by reading fast: that is the defence working, but it is also a lever.
 9. **Forwarded seals are best-effort.** If no leader is reachable at that moment, only the detecting node is sealed.
 10. **A node holds the whole key in memory while unsealed, and briefly while a quorum assembles.** Anyone who can read that process's memory defeats the scheme.
 11. **Unsealing is manual per node.** The key lives only in memory, so every restart needs a new quorum on every node.

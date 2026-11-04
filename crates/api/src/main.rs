@@ -66,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("unseal_threshold must be at least 2 (got {}); a threshold of 1 is not a quorum", cfg.unseal_threshold);
     }
 
+    if cfg.anomaly_min_burst == 0 {
+        anyhow::bail!("anomaly_min_burst must be at least 1 (got 0); a floor of 0 would let a single ordinary read seal the vault");
+    }
+
     let peer_addrs = cfg.parse_peer_addrs()?;
 
     // Authorization is default-deny. A policy that would lock everyone out (no
@@ -111,12 +115,11 @@ async fn main() -> anyhow::Result<()> {
     // particular deployment's real traffic shape - an operator running
     // this in production should expect to tune bucket width and
     // threshold against their own access patterns before trusting it to
-    // seal automatically.
-    let anomaly_detector = Arc::new(tokio::sync::Mutex::new(sentinel_anomaly::AnomalyDetector::new(
-        Duration::from_secs(1),
-        60,
-        3.0,
-    )));
+    // seal automatically. On top of the z-score, a bucket needs at least
+    // `anomaly_min_burst` reads before it can flag: after a quiet spell the
+    // baseline is all zeros, and without the floor one ordinary read is an
+    // infinite-sigma outlier that would seal the vault.
+    let anomaly_detector = Arc::new(tokio::sync::Mutex::new(cfg.anomaly_detector()));
 
     let unseal = handlers::unseal::UnsealState::new(cfg.unseal_threshold);
     let app_state = AppState {

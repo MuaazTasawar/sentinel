@@ -222,6 +222,43 @@ mod tests {
             .with_state(state)
     }
 
+    // ---- anomaly-test helpers ------------------------------------------
+    //
+    // These tests drive the real clock, so they must not depend on how fast
+    // the machine is. The detector below has 100 ms buckets, a 10-bucket
+    // (1 s) window and a floor of 8 reads per bucket. Warm-up reads are one
+    // per bucket, so they can never reach the floor however slow the
+    // machine is; a burst needs 8 reads inside one bucket (12.5 ms each).
+
+    const WARM_UP_READS: usize = 8;
+
+    fn test_detector() -> sentinel_anomaly::AnomalyDetector {
+        sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(100), 10, 3.0).with_min_burst(8)
+    }
+
+    async fn status_of(router: &Router, uri: &str) -> StatusCode {
+        let req = axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap();
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    /// Ordinary, paced traffic: one read per bucket. Every read must succeed.
+    async fn warm_up(router: &Router, uri: &str) {
+        for i in 0..WARM_UP_READS {
+            assert_eq!(status_of(router, uri).await, StatusCode::OK, "warm-up read {i} must succeed");
+            tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+        }
+    }
+
+    /// Rapid reads until the vault answers 503. Returns whether it sealed.
+    async fn burst_until_sealed(router: &Router, uri: &str) -> bool {
+        for _ in 0..600 {
+            if status_of(router, uri).await == StatusCode::SERVICE_UNAVAILABLE {
+                return true;
+            }
+        }
+        false
+    }
+
     #[tokio::test]
     async fn write_then_read_round_trips_through_encryption() {
         let (state, _dir) = test_state().await;
@@ -329,8 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn sudden_read_burst_triggers_auto_seal_and_is_audit_logged() {
-        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
-        let (state, _dir) = test_state_with_detector(detector).await;
+        let (state, _dir) = test_state_with_detector(test_detector()).await;
         let audit = state.audit.clone();
         let kek = state.kek.clone();
         let router = app(state);
@@ -342,23 +378,9 @@ mod tests {
             .unwrap();
         router.clone().oneshot(put_req).await.unwrap();
 
-        for _ in 0..10 {
-            let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
-            let resp = router.clone().oneshot(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "baseline reads should succeed normally");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        warm_up(&router, "/secrets/db-password").await;
 
-        let mut sealed = false;
-        for _ in 0..40 {
-            let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
-            let resp = router.clone().oneshot(req).await.unwrap();
-            if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-                sealed = true;
-                break;
-            }
-        }
-        assert!(sealed, "a sudden read burst should trigger auto-seal");
+        assert!(burst_until_sealed(&router, "/secrets/db-password").await, "a sudden read burst should trigger auto-seal");
         assert!(kek.lock().await.is_none(), "KEK should be cleared once auto-seal fires");
 
         let chain = audit.lock().await;
@@ -369,9 +391,7 @@ mod tests {
         );
 
         drop(chain);
-        let req = axum::http::Request::builder().uri("/secrets/db-password").body(axum::body::Body::empty()).unwrap();
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status_of(&router, "/secrets/db-password").await, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -485,27 +505,17 @@ mod tests {
 
     #[tokio::test]
     async fn the_anomaly_seal_is_proposed_as_a_replicated_command_and_applied() {
-        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
-        let (state, _dir) = test_state_with_detector(detector).await;
+        let (state, _dir) = test_state_with_detector(test_detector()).await;
         let audit = state.audit.clone();
         let router = app(state);
 
         let put = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("v")).unwrap();
         router.clone().oneshot(put).await.unwrap();
-        for _ in 0..10 {
-            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
-            router.clone().oneshot(req).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        for _ in 0..40 {
-            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
-            if router.clone().oneshot(req).await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE {
-                break;
-            }
-        }
+        warm_up(&router, "/secrets/k").await;
+        assert!(burst_until_sealed(&router, "/secrets/k").await, "the burst should seal the vault");
 
         // The committed seal command comes back out of the log and is applied.
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if audit.lock().await.entries().iter().any(|e| e.event.contains("committed cluster-wide seal command")) {
                     return;
@@ -522,45 +532,33 @@ mod tests {
         // The DoS this fixes: any client with a valid certificate could loop
         // over made-up names, the 404s counted as "reads", and the whole
         // vault sealed itself.
-        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
-        let (state, _dir) = test_state_with_detector(detector).await;
+        let (state, _dir) = test_state_with_detector(test_detector()).await;
         let kek = state.kek.clone();
         let router = app(state);
 
         let put = axum::http::Request::builder().method("PUT").uri("/secrets/real").body(axum::body::Body::from("v")).unwrap();
         router.clone().oneshot(put).await.unwrap();
         // A normal baseline of successful reads...
-        for _ in 0..10 {
-            let req = axum::http::Request::builder().uri("/secrets/real").body(axum::body::Body::empty()).unwrap();
-            assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        warm_up(&router, "/secrets/real").await;
         // ...then a flood of misses far larger than the burst that DOES seal the vault.
-        for i in 0..400 {
-            let req = axum::http::Request::builder().uri(format!("/secrets/missing-{i}")).body(axum::body::Body::empty()).unwrap();
-            assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND, "request {i}");
+        for i in 0..600 {
+            assert_eq!(status_of(&router, &format!("/secrets/missing-{i}")).await, StatusCode::NOT_FOUND, "request {i}");
         }
         assert!(kek.lock().await.is_some(), "a flood of 404s must not seal the vault");
-
-        let req = axum::http::Request::builder().uri("/secrets/real").body(axum::body::Body::empty()).unwrap();
-        assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::OK, "and the vault still serves real reads");
+        assert_eq!(status_of(&router, "/secrets/real").await, StatusCode::OK, "and the vault still serves real reads");
     }
 
     #[tokio::test]
     async fn the_secret_that_triggers_the_seal_is_withheld() {
-        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
-        let (state, _dir) = test_state_with_detector(detector).await;
+        let (state, _dir) = test_state_with_detector(test_detector()).await;
         let router = app(state);
         let put = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("TOP-SECRET")).unwrap();
         router.clone().oneshot(put).await.unwrap();
-        for _ in 0..10 {
-            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
-            router.clone().oneshot(req).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        warm_up(&router, "/secrets/k").await;
+
         let mut leaked_after_seal = false;
         let mut sealed = false;
-        for _ in 0..60 {
+        for _ in 0..600 {
             let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
             let resp = router.clone().oneshot(req).await.unwrap();
             let status = resp.status();
@@ -574,6 +572,27 @@ mod tests {
         }
         assert!(sealed, "the burst should have sealed the vault");
         assert!(!leaked_after_seal, "once sealed, no later read may succeed");
+    }
+
+    #[tokio::test]
+    async fn one_ordinary_read_after_a_long_quiet_spell_does_not_seal_the_vault() {
+        // Regression: after a quiet spell the baseline is all-zero buckets,
+        // and the bare rule flagged a single, perfectly ordinary read as an
+        // infinite-sigma outlier and sealed the vault. The quiet spells here
+        // (1.5 s) are longer than the detector's whole 1 s window, so the
+        // baseline really is all zeros when the next read arrives.
+        let (state, _dir) = test_state_with_detector(test_detector()).await;
+        let kek = state.kek.clone();
+        let router = app(state);
+        let put = axum::http::Request::builder().method("PUT").uri("/secrets/k").body(axum::body::Body::from("v")).unwrap();
+        router.clone().oneshot(put).await.unwrap();
+
+        assert_eq!(status_of(&router, "/secrets/k").await, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(status_of(&router, "/secrets/k").await, StatusCode::OK, "a lone read after a quiet spell must succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(status_of(&router, "/secrets/k").await, StatusCode::OK, "and so must the next one");
+        assert!(kek.lock().await.is_some(), "the vault must still be unsealed");
     }
 
     #[tokio::test]
@@ -601,7 +620,7 @@ mod tests {
         }
 
         let kek = sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN]);
-        let detector = sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_millis(20), 20, 3.0);
+        let detector = test_detector();
         // Peers exist but never answer, so this node is permanently a follower.
         let (mut state, _dir) = build(Some(sentinel_crypto::SecretBytes::new(vec![0x42u8; KEY_LEN])), detector, UnsealState::new(2), vec![2, 3], Arc::new(Silent), std::time::Duration::from_secs(1)).await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -614,20 +633,11 @@ mod tests {
         let kek_handle = state.kek.clone();
         let router = app(state);
 
-        for _ in 0..10 {
-            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
-            router.clone().oneshot(req).await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        for _ in 0..60 {
-            let req = axum::http::Request::builder().uri("/secrets/k").body(axum::body::Body::empty()).unwrap();
-            if router.clone().oneshot(req).await.unwrap().status() == StatusCode::SERVICE_UNAVAILABLE {
-                break;
-            }
-        }
+        warm_up(&router, "/secrets/k").await;
+        assert!(burst_until_sealed(&router, "/secrets/k").await, "the burst should seal the follower");
         assert!(kek_handle.lock().await.is_none(), "the follower seals itself immediately");
 
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }

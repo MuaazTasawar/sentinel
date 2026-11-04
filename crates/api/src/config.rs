@@ -72,6 +72,16 @@ pub struct NodeConfig {
     /// provisioned with `sentinel-cli init`.
     #[serde(default)]
     pub allow_canary_bootstrap: bool,
+
+    // ---- auto-seal (anomaly detection) ----
+    /// The auto-seal never fires on a one-second bucket holding fewer than
+    /// this many secret reads. Without such a floor, a quiet vault has an
+    /// all-zero baseline and a single ordinary read after some idle time
+    /// looks like an infinite-sigma outlier and seals the vault. An
+    /// application that reads N secrets in one burst at start-up needs a
+    /// value greater than N. Must be at least 1.
+    #[serde(default = "default_anomaly_min_burst")]
+    pub anomaly_min_burst: u32,
 }
 
 fn default_unseal_threshold() -> u8 {
@@ -80,6 +90,10 @@ fn default_unseal_threshold() -> u8 {
 
 fn default_commit_timeout_ms() -> u64 {
     5_000
+}
+
+fn default_anomaly_min_burst() -> u32 {
+    10
 }
 
 impl NodeConfig {
@@ -92,6 +106,12 @@ impl NodeConfig {
             revoked_serials: self.revoked_serials.clone(),
             insecure_allow_any_client: self.insecure_allow_any_client,
         }
+    }
+
+    /// The node's auto-seal detector: 1 s buckets, a 60-bucket rolling
+    /// baseline, z > 3.0, plus the `anomaly_min_burst` count floor.
+    pub fn anomaly_detector(&self) -> sentinel_anomaly::AnomalyDetector {
+        sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_secs(1), 60, 3.0).with_min_burst(self.anomaly_min_burst)
     }
 
     pub fn audit_path(&self) -> std::path::PathBuf {
@@ -291,6 +311,48 @@ mod tests {
         assert_eq!(cfg.audit_path(), std::path::PathBuf::from("/var/log/sentinel/audit.jsonl"));
         assert_eq!(cfg.canary_file.as_deref(), Some("/etc/sentinel/canary.bin"));
         assert!(cfg.allow_canary_bootstrap);
+    }
+
+    #[test]
+    fn anomaly_min_burst_defaults_to_ten_and_can_be_overridden() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert_eq!(cfg.anomaly_min_burst, 10);
+
+        let mut env = base_env();
+        env.insert("SENTINEL__ANOMALY_MIN_BURST".into(), "25".into());
+        assert_eq!(NodeConfig::build(None, Some(env)).unwrap().anomaly_min_burst, 25);
+
+        let mut env = base_env();
+        env.insert("SENTINEL__ANOMALY_MIN_BURST".into(), "not-a-number".into());
+        assert!(NodeConfig::build(None, Some(env)).is_err(), "garbage must fail loudly, not fall back");
+    }
+
+    #[test]
+    fn the_node_detector_uses_the_configured_floor() {
+        // Synthetic clock, the node's real detector settings. Two reads 20 s
+        // apart are what used to seal the vault (z = 4.36 against 3.0).
+        let t0 = std::time::Instant::now();
+        let lone_reads_flagged = |cfg: &NodeConfig| {
+            let mut d = cfg.anomaly_detector();
+            let flagged: Vec<bool> = (0..6).map(|i| d.record_access(t0 + std::time::Duration::from_secs(i * 20)).is_some()).collect();
+            flagged.into_iter().any(|f| f)
+        };
+
+        let default_cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert!(!lone_reads_flagged(&default_cfg), "with the default floor, lone reads 20 s apart must never flag");
+
+        let mut env = base_env();
+        env.insert("SENTINEL__ANOMALY_MIN_BURST".into(), "1".into());
+        let no_floor = NodeConfig::build(None, Some(env)).unwrap();
+        assert!(lone_reads_flagged(&no_floor), "a floor of 1 is the old behaviour, which does flag them");
+
+        // And a real burst still flags under the default floor.
+        let mut d = default_cfg.anomaly_detector();
+        for i in 0..10 {
+            d.record_access(t0 + std::time::Duration::from_secs(i));
+        }
+        let burst = t0 + std::time::Duration::from_secs(30);
+        assert!((0..40).any(|_| d.record_access(burst).is_some()), "a 40-read burst in one second still flags");
     }
 
     #[test]

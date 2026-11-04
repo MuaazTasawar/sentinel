@@ -45,6 +45,7 @@ pub struct AnomalyDetector {
     max_history: usize,
     min_history_for_detection: usize,
     z_threshold: f64,
+    min_burst: u32,
     history: VecDeque<u32>,
     current_bucket_start: Option<Instant>,
     current_count: u32,
@@ -64,10 +65,29 @@ impl AnomalyDetector {
             max_history,
             min_history_for_detection: 5,
             z_threshold,
+            min_burst: 1,
             history: VecDeque::new(),
             current_bucket_start: None,
             current_count: 0,
         }
+    }
+
+    /// Sets an absolute floor on the current bucket's count: a bucket with
+    /// fewer than `n` accesses is never flagged, whatever the z-score says.
+    ///
+    /// Why this exists: after a quiet spell the baseline is all-zero
+    /// buckets (mean 0, stddev 0), and the bare rule "any count above a
+    /// flat baseline is anomalous" then flags a single, perfectly ordinary
+    /// read. With 1 s buckets and a 60-bucket window, two reads 20 s apart
+    /// score z = 4.36 against a threshold of 3.0. Statistics alone cannot
+    /// tell "one read after silence" from "an attack", so a count floor
+    /// says how many reads in one bucket it takes to be worth flagging.
+    ///
+    /// The default is 1, which keeps the original behaviour (no floor).
+    /// Values below 1 are clamped to 1.
+    pub fn with_min_burst(mut self, n: u32) -> Self {
+        self.min_burst = n.max(1);
+        self
     }
 
     /// Records one access at time `now`. Returns `Some(report)` if,
@@ -130,6 +150,9 @@ impl AnomalyDetector {
 
     fn check_anomaly(&self) -> Option<AnomalyReport> {
         if self.history.len() < self.min_history_for_detection {
+            return None;
+        }
+        if self.current_count < self.min_burst {
             return None;
         }
         let n = self.history.len() as f64;
@@ -318,5 +341,82 @@ mod tests {
         assert_eq!(snap.current_count, 0);
         assert_eq!(snap.baseline_mean, 0.0);
         assert_eq!(snap.baseline_stddev, 0.0);
+    }
+
+    // ---- count floor (`with_min_burst`) --------------------------------
+
+    /// Feed one read at each of the given offsets (seconds from t0).
+    fn reads_at(d: &mut AnomalyDetector, t0: Instant, offsets: &[u64]) -> Vec<bool> {
+        offsets
+            .iter()
+            .map(|&s| d.record_access(t0 + Duration::from_secs(s)).is_some())
+            .collect()
+    }
+
+    #[test]
+    fn bare_rule_flags_a_lone_read_after_a_quiet_spell() {
+        // Documents the flaw the floor exists to fix: with the node's real
+        // settings (1 s buckets, 60-bucket window, z = 3.0) and no floor,
+        // two ordinary reads 20 s apart trip the detector.
+        let mut d = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0);
+        let t0 = base();
+        let flagged = reads_at(&mut d, t0, &[0, 20]);
+        assert_eq!(flagged, vec![false, true], "the bare rule flags the second, lone read");
+    }
+
+    #[test]
+    fn a_floor_of_ten_never_flags_sparse_reads() {
+        let mut d = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0).with_min_burst(10);
+        let t0 = base();
+        // Gaps of 6 s up to 180 s between single reads.
+        let mut t = 0u64;
+        for gap in [6u64, 7, 10, 20, 30, 45, 60, 90, 120, 180, 6, 6, 6, 6, 6, 6] {
+            t += gap;
+            assert!(
+                d.record_access(t0 + Duration::from_secs(t)).is_none(),
+                "a lone read {gap}s after the previous one must not be flagged"
+            );
+        }
+    }
+
+    #[test]
+    fn a_floor_of_ten_flags_exactly_the_tenth_read_in_a_bucket() {
+        let mut d = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0).with_min_burst(10);
+        let t0 = base();
+        // Quiet baseline: one read per second for 10 s, then silence.
+        for s in 0..10 {
+            d.record_access(t0 + Duration::from_secs(s));
+        }
+        let burst = t0 + Duration::from_secs(40);
+        for i in 1..=9 {
+            assert!(d.record_access(burst).is_none(), "read #{i} in the bucket is below the floor");
+        }
+        let tenth = d.record_access(burst);
+        assert!(tenth.is_some(), "the 10th read in one bucket reaches the floor and is flagged");
+        assert_eq!(tenth.unwrap().current_count, 10);
+    }
+
+    #[test]
+    fn the_floor_does_not_hide_a_real_burst_over_a_busy_baseline() {
+        let mut d = AnomalyDetector::new(Duration::from_secs(1), 20, 3.0).with_min_burst(10);
+        let t0 = base();
+        for bucket in 0..10 {
+            let bucket_time = t0 + Duration::from_secs(bucket);
+            d.record_access(bucket_time);
+            d.record_access(bucket_time);
+        }
+        let burst_time = t0 + Duration::from_secs(10);
+        let fired = (0..40).any(|_| d.record_access(burst_time).is_some());
+        assert!(fired, "a 40x burst over a steady 2/sec baseline is still flagged with a floor of 10");
+    }
+
+    #[test]
+    fn the_floor_is_clamped_to_at_least_one() {
+        // 0 would mean "flag even an empty bucket"; it behaves as 1 instead,
+        // i.e. exactly the bare rule.
+        let mut zero = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0).with_min_burst(0);
+        let mut bare = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0);
+        let t0 = base();
+        assert_eq!(reads_at(&mut zero, t0, &[0, 20]), reads_at(&mut bare, t0, &[0, 20]));
     }
 }
