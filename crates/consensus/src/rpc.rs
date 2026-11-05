@@ -39,7 +39,12 @@ mod tests {
 
     #[test]
     fn request_vote_round_trips_through_json() {
-        let req = RequestVoteRequest { term: 3, candidate_id: 2, last_log_index: 5, last_log_term: 2 };
+        let req = RequestVoteRequest {
+            term: 3,
+            candidate_id: 2,
+            last_log_index: 5,
+            last_log_term: 2,
+        };
         let json = serde_json::to_string(&req).unwrap();
         let back: RequestVoteRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.term, 3);
@@ -53,7 +58,11 @@ mod tests {
             leader_id: 1,
             prev_log_index: 2,
             prev_log_term: 3,
-            entries: vec![LogEntry { term: 4, index: 3, command: vec![9, 9] }],
+            entries: vec![LogEntry {
+                term: 4,
+                index: 3,
+                command: vec![9, 9],
+            }],
             leader_commit: 2,
         };
         let json = serde_json::to_string(&req).unwrap();

@@ -1,9 +1,9 @@
-use aes_gcm::aead::{rand_core::RngCore, OsRng};
+use aes_gcm::aead::{OsRng, rand_core::RngCore};
 use argon2::Argon2;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-use crate::{secret::SecretBytes, CryptoError};
+use crate::{CryptoError, secret::SecretBytes};
 
 pub const SALT_LEN: usize = 16;
 
@@ -25,10 +25,15 @@ pub fn derive_kek_argon2(input: &[u8], salt: &[u8]) -> Result<SecretBytes, Crypt
 /// safely produce independent keys for different contexts (e.g.
 /// "dek-wrapping" vs "audit-log-hmac") without those keys being related
 /// in an exploitable way.
-pub fn derive_key_hkdf(master: &[u8], info: &[u8], out_len: usize) -> Result<SecretBytes, CryptoError> {
+pub fn derive_key_hkdf(
+    master: &[u8],
+    info: &[u8],
+    out_len: usize,
+) -> Result<SecretBytes, CryptoError> {
     let hk = Hkdf::<Sha256>::new(None, master);
     let mut out = vec![0u8; out_len];
-    hk.expand(info, &mut out).map_err(|_| CryptoError::KdfFailed)?;
+    hk.expand(info, &mut out)
+        .map_err(|_| CryptoError::KdfFailed)?;
     Ok(SecretBytes::new(out))
 }
 

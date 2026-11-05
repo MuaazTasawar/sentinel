@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use bincode::Options;
 use sentinel_crypto::envelope::EnvelopeCiphertext;
 use sentinel_storage::{Storage, StorageError};
@@ -24,7 +24,8 @@ pub enum CanaryOutcome {
 /// whose storage already holds a *different* canary belongs to a different
 /// vault (or the wrong directory) and refuses to start rather than guess.
 pub async fn install_canary(storage: &dyn Storage, path: &Path) -> anyhow::Result<CanaryOutcome> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading canary file {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading canary file {}", path.display()))?;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .reject_trailing_bytes()
@@ -39,7 +40,10 @@ pub async fn install_canary(storage: &dyn Storage, path: &Path) -> anyhow::Resul
             path.display()
         ),
         Err(StorageError::NotFound(_)) => {
-            storage.put(CANARY_KEY, bytes).await.context("storing the key canary")?;
+            storage
+                .put(CANARY_KEY, bytes)
+                .await
+                .context("storing the key canary")?;
             Ok(CanaryOutcome::Installed)
         }
         Err(e) => Err(e).context("reading the existing key canary"),
@@ -49,7 +53,7 @@ pub async fn install_canary(storage: &dyn Storage, path: &Path) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_crypto::{canary, SecretBytes};
+    use sentinel_crypto::{SecretBytes, canary};
     use sentinel_storage::SledStorage;
 
     fn canary_bytes(key_byte: u8) -> Vec<u8> {
@@ -58,7 +62,10 @@ mod tests {
 
     fn storage() -> (SledStorage, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        (SledStorage::open(dir.path().join("db").to_str().unwrap()).unwrap(), dir)
+        (
+            SledStorage::open(dir.path().join("db").to_str().unwrap()).unwrap(),
+            dir,
+        )
     }
 
     #[tokio::test]
@@ -67,9 +74,18 @@ mod tests {
         let file = dir.path().join("canary.bin");
         std::fs::write(&file, canary_bytes(1)).unwrap();
 
-        assert_eq!(install_canary(&st, &file).await.unwrap(), CanaryOutcome::Installed);
-        assert_eq!(st.get(CANARY_KEY).await.unwrap(), std::fs::read(&file).unwrap());
-        assert_eq!(install_canary(&st, &file).await.unwrap(), CanaryOutcome::AlreadyPresent);
+        assert_eq!(
+            install_canary(&st, &file).await.unwrap(),
+            CanaryOutcome::Installed
+        );
+        assert_eq!(
+            st.get(CANARY_KEY).await.unwrap(),
+            std::fs::read(&file).unwrap()
+        );
+        assert_eq!(
+            install_canary(&st, &file).await.unwrap(),
+            CanaryOutcome::AlreadyPresent
+        );
     }
 
     #[tokio::test]
@@ -82,22 +98,42 @@ mod tests {
 
         let err = install_canary(&st, &file).await.unwrap_err().to_string();
         assert!(err.contains("different vault"), "{err}");
-        assert_eq!(st.get(CANARY_KEY).await.unwrap(), original, "the existing canary must be left alone");
+        assert_eq!(
+            st.get(CANARY_KEY).await.unwrap(),
+            original,
+            "the existing canary must be left alone"
+        );
     }
 
     #[tokio::test]
     async fn missing_or_corrupt_files_are_clear_errors() {
         let (st, dir) = storage();
-        assert!(install_canary(&st, &dir.path().join("nope.bin")).await.is_err());
+        assert!(
+            install_canary(&st, &dir.path().join("nope.bin"))
+                .await
+                .is_err()
+        );
 
         let bad = dir.path().join("bad.bin");
         std::fs::write(&bad, b"not a canary").unwrap();
-        assert!(install_canary(&st, &bad).await.unwrap_err().to_string().contains("not a valid canary"));
+        assert!(
+            install_canary(&st, &bad)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not a valid canary")
+        );
 
         let mut trailing = canary_bytes(1);
         trailing.push(0);
         std::fs::write(&bad, trailing).unwrap();
-        assert!(install_canary(&st, &bad).await.is_err(), "trailing bytes are rejected");
-        assert!(st.get(CANARY_KEY).await.is_err(), "nothing may be stored from a bad file");
+        assert!(
+            install_canary(&st, &bad).await.is_err(),
+            "trailing bytes are rejected"
+        );
+        assert!(
+            st.get(CANARY_KEY).await.is_err(),
+            "nothing may be stored from a bad file"
+        );
     }
 }

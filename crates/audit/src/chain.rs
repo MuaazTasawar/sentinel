@@ -6,9 +6,13 @@ pub const GENESIS_HASH: [u8; 32] = [0u8; 32];
 
 #[derive(thiserror::Error, Debug)]
 pub enum AuditError {
-    #[error("chain integrity violation at index {index}: stored hash does not match recomputed hash")]
+    #[error(
+        "chain integrity violation at index {index}: stored hash does not match recomputed hash"
+    )]
     HashMismatch { index: u64 },
-    #[error("chain integrity violation at index {index}: prev_hash does not link to entry {index_minus_one}'s hash")]
+    #[error(
+        "chain integrity violation at index {index}: prev_hash does not link to entry {index_minus_one}'s hash"
+    )]
     BrokenLink { index: u64, index_minus_one: u64 },
     #[error("entry indices are not sequential: expected {expected}, found {found}")]
     NonSequentialIndex { expected: u64, found: u64 },
@@ -33,7 +37,12 @@ pub struct AuditEntry {
     pub hash: [u8; 32],
 }
 
-fn compute_hash(index: u64, timestamp: &DateTime<Utc>, event: &str, prev_hash: &[u8; 32]) -> [u8; 32] {
+fn compute_hash(
+    index: u64,
+    timestamp: &DateTime<Utc>,
+    event: &str,
+    prev_hash: &[u8; 32],
+) -> [u8; 32] {
     // Explicit, ordered byte concatenation rather than serde_json - this
     // is the artifact that gets hashed and later re-verified, so its
     // encoding needs to be unambiguous and stable by construction, not
@@ -76,8 +85,15 @@ impl AuditChain {
     /// Builds a persistent chain from entries already on disk, verifying them
     /// first. A chain that fails verification is refused outright: starting
     /// on top of a tampered log would launder the tampering.
-    pub fn with_sink(entries: Vec<AuditEntry>, sink: Box<dyn AuditSink>) -> Result<Self, AuditError> {
-        let chain = Self { entries, sink: Some(sink), degraded: None };
+    pub fn with_sink(
+        entries: Vec<AuditEntry>,
+        sink: Box<dyn AuditSink>,
+    ) -> Result<Self, AuditError> {
+        let chain = Self {
+            entries,
+            sink: Some(sink),
+            degraded: None,
+        };
         chain.verify()?;
         Ok(chain)
     }
@@ -102,7 +118,11 @@ impl AuditChain {
     /// back from storage at startup). Does not verify - call `verify()`
     /// explicitly after loading if you need that guarantee up front.
     pub fn from_entries(entries: Vec<AuditEntry>) -> Self {
-        Self { entries, sink: None, degraded: None }
+        Self {
+            entries,
+            sink: None,
+            degraded: None,
+        }
     }
 
     pub fn entries(&self) -> &[AuditEntry] {
@@ -118,11 +138,18 @@ impl AuditChain {
         let event = event.into();
         let hash = compute_hash(index, &timestamp, &event, &prev_hash);
 
-        self.entries.push(AuditEntry { index, timestamp, event, prev_hash, hash });
+        self.entries.push(AuditEntry {
+            index,
+            timestamp,
+            event,
+            prev_hash,
+            hash,
+        });
         if let Some(sink) = self.sink.as_mut()
-            && let Err(e) = sink.persist(self.entries.last().unwrap()) {
-                self.degraded.get_or_insert_with(|| e.to_string());
-            }
+            && let Err(e) = sink.persist(self.entries.last().unwrap())
+        {
+            self.degraded.get_or_insert_with(|| e.to_string());
+        }
         self.entries.last().unwrap()
     }
 
@@ -140,7 +167,10 @@ impl AuditChain {
         for (i, entry) in self.entries.iter().enumerate() {
             let expected_index = i as u64;
             if entry.index != expected_index {
-                return Err(AuditError::NonSequentialIndex { expected: expected_index, found: entry.index });
+                return Err(AuditError::NonSequentialIndex {
+                    expected: expected_index,
+                    found: entry.index,
+                });
             }
             if entry.prev_hash != expected_prev {
                 return Err(AuditError::BrokenLink {
@@ -148,7 +178,12 @@ impl AuditChain {
                     index_minus_one: entry.index.saturating_sub(1),
                 });
             }
-            let recomputed = compute_hash(entry.index, &entry.timestamp, &entry.event, &entry.prev_hash);
+            let recomputed = compute_hash(
+                entry.index,
+                &entry.timestamp,
+                &entry.event,
+                &entry.prev_hash,
+            );
             if recomputed != entry.hash {
                 return Err(AuditError::HashMismatch { index: entry.index });
             }
@@ -208,7 +243,13 @@ mod tests {
         chain.append("event c");
         chain.entries.remove(1);
         let err = chain.verify().unwrap_err();
-        assert!(matches!(err, AuditError::NonSequentialIndex { expected: 1, found: 2 }));
+        assert!(matches!(
+            err,
+            AuditError::NonSequentialIndex {
+                expected: 1,
+                found: 2
+            }
+        ));
     }
 
     #[test]
@@ -217,7 +258,8 @@ mod tests {
         chain.append("event a");
         chain.append("event b");
         let forged_prev = [0xAAu8; 32];
-        let forged_hash = compute_hash(1, &chain.entries[1].timestamp, "forged event", &forged_prev);
+        let forged_hash =
+            compute_hash(1, &chain.entries[1].timestamp, "forged event", &forged_prev);
         chain.entries[1] = AuditEntry {
             index: 1,
             timestamp: chain.entries[1].timestamp,

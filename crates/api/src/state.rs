@@ -6,7 +6,7 @@ use sentinel_audit::AuditChain;
 use sentinel_consensus::RaftHandle;
 use sentinel_crypto::SecretBytes;
 use sentinel_storage::Storage;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 
 use crate::handlers::unseal::UnsealState;
 use crate::middleware::authz::Policy;
@@ -66,14 +66,16 @@ pub mod test_support {
             &self,
             _peer_id: u64,
             _req: sentinel_consensus::RequestVoteRequest,
-        ) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError> {
+        ) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError>
+        {
             unreachable!("single-node test cluster has no peers")
         }
         async fn send_append_entries(
             &self,
             _peer_id: u64,
             _req: sentinel_consensus::AppendEntriesRequest,
-        ) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError> {
+        ) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError>
+        {
             unreachable!("single-node test cluster has no peers")
         }
     }
@@ -88,14 +90,19 @@ pub mod test_support {
             &self,
             _peer_id: u64,
             req: sentinel_consensus::RequestVoteRequest,
-        ) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError> {
-            Ok(sentinel_consensus::RequestVoteResponse { term: req.term, vote_granted: true })
+        ) -> Result<sentinel_consensus::RequestVoteResponse, sentinel_consensus::TransportError>
+        {
+            Ok(sentinel_consensus::RequestVoteResponse {
+                term: req.term,
+                vote_granted: true,
+            })
         }
         async fn send_append_entries(
             &self,
             peer_id: u64,
             _req: sentinel_consensus::AppendEntriesRequest,
-        ) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError> {
+        ) -> Result<sentinel_consensus::AppendEntriesResponse, sentinel_consensus::TransportError>
+        {
             Err(sentinel_consensus::TransportError::Unreachable(peer_id))
         }
     }
@@ -116,18 +123,27 @@ pub mod test_support {
         commit_timeout: Duration,
     ) -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(SledStorage::open(dir.path().to_str().unwrap()).unwrap());
+        let storage: Arc<dyn Storage> =
+            Arc::new(SledStorage::open(dir.path().to_str().unwrap()).unwrap());
         let peers_is_empty = peers.is_empty();
         let (raft, committed) = sentinel_consensus::spawn_raft_actor_with_apply(
             1,
             peers,
             transport,
             std::time::Duration::from_millis(20),
-            sentinel_consensus::ElectionTimeoutRange { min_ms: 30, max_ms: 60 },
+            sentinel_consensus::ElectionTimeoutRange {
+                min_ms: 30,
+                max_ms: 60,
+            },
         );
         let kek = Arc::new(Mutex::new(kek));
         let audit = Arc::new(Mutex::new(AuditChain::new()));
-        let applied = crate::statemachine::spawn_apply_loop(committed, storage.clone(), kek.clone(), audit.clone());
+        let applied = crate::statemachine::spawn_apply_loop(
+            committed,
+            storage.clone(),
+            kek.clone(),
+            audit.clone(),
+        );
         if peers_is_empty {
             // A single-node cluster elects itself; wait for that instead of
             // guessing how long it takes on a loaded machine.
@@ -166,7 +182,15 @@ pub mod test_support {
         detector: AnomalyDetector,
         unseal: UnsealState,
     ) -> (AppState, tempfile::TempDir) {
-        build(kek, detector, unseal, vec![], Arc::new(NoopTransport), Duration::from_secs(5)).await
+        build(
+            kek,
+            detector,
+            unseal,
+            vec![],
+            Arc::new(NoopTransport),
+            Duration::from_secs(5),
+        )
+        .await
     }
 
     pub async fn unsealed_state() -> (AppState, tempfile::TempDir) {

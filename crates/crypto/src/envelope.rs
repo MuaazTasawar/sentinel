@@ -1,9 +1,9 @@
 use aes_gcm::{
-    aead::{rand_core::RngCore, Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng, rand_core::RngCore},
 };
 
-use crate::{secret::SecretBytes, CryptoError};
+use crate::{CryptoError, secret::SecretBytes};
 
 pub const NONCE_LEN: usize = 12;
 pub const KEY_LEN: usize = 32;

@@ -30,15 +30,22 @@ async fn main() -> anyhow::Result<()> {
     let cfg = NodeConfig::load()?;
     tracing::info!(node_id = cfg.node_id, "sentinel node starting");
 
-    let storage: Arc<dyn sentinel_storage::Storage> = Arc::new(sentinel_storage::SledStorage::open(&cfg.storage_path)?);
+    let storage: Arc<dyn sentinel_storage::Storage> =
+        Arc::new(sentinel_storage::SledStorage::open(&cfg.storage_path)?);
     if let Some(canary_file) = &cfg.canary_file {
         match bootstrap::install_canary(&*storage, std::path::Path::new(canary_file)).await? {
-            bootstrap::CanaryOutcome::Installed => tracing::info!("installed the vault key canary from {canary_file}"),
-            bootstrap::CanaryOutcome::AlreadyPresent => tracing::info!("vault key canary already installed"),
+            bootstrap::CanaryOutcome::Installed => {
+                tracing::info!("installed the vault key canary from {canary_file}")
+            }
+            bootstrap::CanaryOutcome::AlreadyPresent => {
+                tracing::info!("vault key canary already installed")
+            }
         }
     }
     if cfg.allow_canary_bootstrap {
-        tracing::warn!("allow_canary_bootstrap is ON: the first unseal of an empty vault will define its key canary (trust on first use). Development only.");
+        tracing::warn!(
+            "allow_canary_bootstrap is ON: the first unseal of an empty vault will define its key canary (trust on first use). Development only."
+        );
     }
     // The audit chain is durable: entries are appended to a file as they happen
     // and the existing file is verified before anything else runs. A log that
@@ -51,10 +58,18 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
     if recovered_torn_tail {
-        tracing::warn!("the audit log ended in an incomplete record (a crash mid-write); it was discarded");
-        chain.append("audit log recovery: an incomplete final record from an earlier crash was discarded");
+        tracing::warn!(
+            "the audit log ended in an incomplete record (a crash mid-write); it was discarded"
+        );
+        chain.append(
+            "audit log recovery: an incomplete final record from an earlier crash was discarded",
+        );
     }
-    chain.append(format!("node {} started (audit log: {} entries before this one)", cfg.node_id, chain.entries().len()));
+    chain.append(format!(
+        "node {} started (audit log: {} entries before this one)",
+        cfg.node_id,
+        chain.entries().len()
+    ));
     let audit = Arc::new(tokio::sync::Mutex::new(chain));
     // Sealed at startup, always: nothing in this bootstrap path ever
     // populates the KEK. A node that could unseal itself just by starting
@@ -63,11 +78,16 @@ async fn main() -> anyhow::Result<()> {
     // `POST /sys/unseal` (see `sentinel-cli unseal`).
     let kek = Arc::new(tokio::sync::Mutex::new(None));
     if cfg.unseal_threshold < 2 {
-        anyhow::bail!("unseal_threshold must be at least 2 (got {}); a threshold of 1 is not a quorum", cfg.unseal_threshold);
+        anyhow::bail!(
+            "unseal_threshold must be at least 2 (got {}); a threshold of 1 is not a quorum",
+            cfg.unseal_threshold
+        );
     }
 
     if cfg.anomaly_min_burst == 0 {
-        anyhow::bail!("anomaly_min_burst must be at least 1 (got 0); a floor of 0 would let a single ordinary read seal the vault");
+        anyhow::bail!(
+            "anomaly_min_burst must be at least 1 (got 0); a floor of 0 would let a single ordinary read seal the vault"
+        );
     }
 
     let peer_addrs = cfg.parse_peer_addrs()?;
@@ -107,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(dir = %raft_dir.display(), "raft state loaded");
 
     // The only code path that changes the secret store: committed log entries.
-    let applied = statemachine::spawn_apply_loop(committed, storage.clone(), kek.clone(), audit.clone());
+    let applied =
+        statemachine::spawn_apply_loop(committed, storage.clone(), kek.clone(), audit.clone());
 
     // 1 bucket/second, 60-second rolling baseline, flag anything more
     // than 3 standard deviations above recent normal traffic. These are
@@ -178,20 +199,24 @@ async fn main() -> anyhow::Result<()> {
             // even though the CA signed it and the handshake succeeded.
             let serial = {
                 let (_, conn) = tls_stream.get_ref();
-                conn.peer_certificates().and_then(|certs| certs.first()).and_then(mtls::cert_serial_hex)
+                conn.peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .and_then(mtls::cert_serial_hex)
             };
             if let Some(serial) = &serial
-                && policy.is_revoked(serial) {
-                    tracing::warn!(peer = %peer_addr, identity = %identity.0, serial = %serial, "refusing a connection from a revoked certificate");
-                    return;
-                }
+                && policy.is_revoked(serial)
+            {
+                tracing::warn!(peer = %peer_addr, identity = %identity.0, serial = %serial, "refusing a connection from a revoked certificate");
+                return;
+            }
 
             let router_with_identity = router.layer(axum::Extension(identity));
             let hyper_service = hyper_util::service::TowerToHyperService::new(router_with_identity);
 
-            if let Err(e) = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), hyper_service)
-                .await
+            if let Err(e) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(hyper_util::rt::TokioIo::new(tls_stream), hyper_service)
+                    .await
             {
                 tracing::warn!(peer = %peer_addr, error = %e, "connection ended with error");
             }

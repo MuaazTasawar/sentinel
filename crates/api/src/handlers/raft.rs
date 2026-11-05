@@ -3,7 +3,9 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::Deserialize;
 
-use sentinel_consensus::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
+use sentinel_consensus::{
+    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+};
 
 use crate::errors::AppError;
 use crate::middleware::mtls::ClientIdentity;
@@ -13,7 +15,10 @@ use crate::statemachine::Command;
 /// Receives a `RequestVote` RPC from a peer. The route is guarded by the
 /// `peer` role (see `middleware::authz`): only configured cluster identities
 /// reach this, not every client that holds a valid certificate.
-pub async fn raft_vote(State(state): State<AppState>, Json(req): Json<RequestVoteRequest>) -> Json<RequestVoteResponse> {
+pub async fn raft_vote(
+    State(state): State<AppState>,
+    Json(req): Json<RequestVoteRequest>,
+) -> Json<RequestVoteResponse> {
     Json(state.raft.request_vote(req).await)
 }
 
@@ -39,9 +44,19 @@ pub async fn seal_request(
     Extension(identity): Extension<ClientIdentity>,
     Json(req): Json<SealRequest>,
 ) -> Result<StatusCode, AppError> {
-    let reason: String = req.reason.chars().filter(|c| !c.is_control()).take(MAX_REASON_LEN).collect();
-    let seal = Command::Seal { reason: format!("requested by peer {}: {reason}", identity.0) };
+    let reason: String = req
+        .reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REASON_LEN)
+        .collect();
+    let seal = Command::Seal {
+        reason: format!("requested by peer {}: {reason}", identity.0),
+    };
     state.raft.propose(seal.encode()).await?;
-    state.audit.lock().await.append(format!("cluster-wide seal requested by peer {}: {reason}", identity.0));
+    state.audit.lock().await.append(format!(
+        "cluster-wide seal requested by peer {}: {reason}",
+        identity.0
+    ));
     Ok(StatusCode::ACCEPTED)
 }

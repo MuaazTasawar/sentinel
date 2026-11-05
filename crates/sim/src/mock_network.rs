@@ -17,16 +17,17 @@ pub struct NetworkConditions {
 }
 
 fn normalize(a: u64, b: u64) -> (u64, u64) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 impl NetworkConditions {
     pub fn new(base_latency_ms: u64) -> Self {
-        Self { partitioned_pairs: HashSet::new(), base_latency_ms, loss_percent: 0, duplicate_percent: 0 }
+        Self {
+            partitioned_pairs: HashSet::new(),
+            base_latency_ms,
+            loss_percent: 0,
+            duplicate_percent: 0,
+        }
     }
 
     /// Cuts all communication between `a` and `b` in both directions.
@@ -65,7 +66,10 @@ mod tests {
         let mut net = NetworkConditions::new(10);
         net.partition(1, 2);
         assert!(net.is_partitioned(1, 2));
-        assert!(net.is_partitioned(2, 1), "a partition must block both directions");
+        assert!(
+            net.is_partitioned(2, 1),
+            "a partition must block both directions"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use clap::Args;
 use sentinel_hardware::{HardwareError, YubiKeyUnsealer};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Connection details for talking to a running `sentinel-node` over mTLS.
 /// The node only accepts clients whose certificate is signed by its CA, so
@@ -46,9 +46,13 @@ impl NodeClient {
         // purpose: `Err` just means a provider was already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let mut identity_pem = std::fs::read(&args.cert).with_context(|| format!("reading {}", args.cert.display()))?;
-        identity_pem.extend_from_slice(&std::fs::read(&args.key).with_context(|| format!("reading {}", args.key.display()))?);
-        let identity = reqwest::Identity::from_pem(&identity_pem).context("client cert/key are not a valid PEM identity")?;
+        let mut identity_pem = std::fs::read(&args.cert)
+            .with_context(|| format!("reading {}", args.cert.display()))?;
+        identity_pem.extend_from_slice(
+            &std::fs::read(&args.key).with_context(|| format!("reading {}", args.key.display()))?,
+        );
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .context("client cert/key are not a valid PEM identity")?;
         let ca = reqwest::Certificate::from_pem(
             &std::fs::read(&args.ca).with_context(|| format!("reading {}", args.ca.display()))?,
         )
@@ -60,7 +64,10 @@ impl NodeClient {
             .use_rustls_tls()
             .timeout(Duration::from_secs(10))
             .build()?;
-        Ok(Self { http, base: args.node.trim_end_matches('/').to_string() })
+        Ok(Self {
+            http,
+            base: args.node.trim_end_matches('/').to_string(),
+        })
     }
 
     /// Submits one key holder's decrypted share (already hex-encoded).
@@ -77,7 +84,11 @@ impl NodeClient {
     }
 
     pub fn seal(&self) -> anyhow::Result<()> {
-        let resp = self.http.post(format!("{}/sys/seal", self.base)).send().context("could not reach the node")?;
+        let resp = self
+            .http
+            .post(format!("{}/sys/seal", self.base))
+            .send()
+            .context("could not reach the node")?;
         if resp.status().is_success() {
             Ok(())
         } else {
@@ -86,11 +97,18 @@ impl NodeClient {
     }
 
     pub fn reset_session(&self) -> anyhow::Result<()> {
-        let resp = self.http.delete(format!("{}/sys/unseal", self.base)).send().context("could not reach the node")?;
+        let resp = self
+            .http
+            .delete(format!("{}/sys/unseal", self.base))
+            .send()
+            .context("could not reach the node")?;
         if resp.status().is_success() {
             Ok(())
         } else {
-            bail!("node refused to reset the unseal session: HTTP {}", resp.status())
+            bail!(
+                "node refused to reset the unseal session: HTTP {}",
+                resp.status()
+            )
         }
     }
 }
@@ -121,10 +139,13 @@ pub fn to_hex(bytes: &[u8]) -> String {
 /// key; this tool never assembles the key itself.
 pub fn run(client: &NodeClient, encrypted_shares: &[(String, Vec<u8>)]) -> anyhow::Result<()> {
     let unsealer = YubiKeyUnsealer::new(yubikey::piv::SlotId::KeyManagement);
-    println!("Sentinel unseal: {} key holders available.", encrypted_shares.len());
+    outln!(
+        "Sentinel unseal: {} key holders available.",
+        encrypted_shares.len()
+    );
 
     for (holder_id, encrypted_share) in encrypted_shares {
-        println!("\nInsert {holder_id}'s YubiKey and press Enter (or Ctrl+C to abort)...");
+        outln!("\nInsert {holder_id}'s YubiKey and press Enter (or Ctrl+C to abort)...");
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf)?;
 
@@ -133,21 +154,26 @@ pub fn run(client: &NodeClient, encrypted_shares: &[(String, Vec<u8>)]) -> anyho
         match unsealer.decrypt_share(pin.as_bytes(), encrypted_share) {
             Ok(decrypted) => match client.submit_share(holder_id, &to_hex(&decrypted)) {
                 Ok(SubmitOutcome::Unsealed) => {
-                    println!("  [ok] {holder_id} confirmed. Quorum reached: the node is unsealed.");
+                    outln!("  [ok] {holder_id} confirmed. Quorum reached: the node is unsealed.");
                     return Ok(());
                 }
-                Ok(SubmitOutcome::Pending { contributed, threshold }) => {
-                    println!("  [ok] {holder_id} confirmed ({contributed}/{threshold} so far)");
+                Ok(SubmitOutcome::Pending {
+                    contributed,
+                    threshold,
+                }) => {
+                    outln!("  [ok] {holder_id} confirmed ({contributed}/{threshold} so far)");
                 }
-                Err(e) => println!("  [x] {holder_id}: {e:#}"),
+                Err(e) => outln!("  [x] {holder_id}: {e:#}"),
             },
-            Err(HardwareError::NoDeviceFound) => println!("  [x] no YubiKey detected, try again"),
-            Err(HardwareError::IncorrectPin) => println!("  [x] incorrect PIN for {holder_id}"),
-            Err(e) => println!("  [x] {holder_id}: {e}"),
+            Err(HardwareError::NoDeviceFound) => outln!("  [x] no YubiKey detected, try again"),
+            Err(HardwareError::IncorrectPin) => outln!("  [x] incorrect PIN for {holder_id}"),
+            Err(e) => outln!("  [x] {holder_id}: {e}"),
         }
     }
 
-    bail!("ran out of key holders before the node reported a quorum; run again, or use `reset-unseal` to start clean")
+    bail!(
+        "ran out of key holders before the node reported a quorum; run again, or use `reset-unseal` to start clean"
+    )
 }
 
 #[cfg(test)]
@@ -163,17 +189,28 @@ mod tests {
     #[test]
     fn pending_response_is_parsed() {
         let body = json!({ "status": "pending", "contributed": 1, "threshold": 2 });
-        assert_eq!(parse_submit_response(200, &body).unwrap(), SubmitOutcome::Pending { contributed: 1, threshold: 2 });
+        assert_eq!(
+            parse_submit_response(200, &body).unwrap(),
+            SubmitOutcome::Pending {
+                contributed: 1,
+                threshold: 2
+            }
+        );
     }
 
     #[test]
     fn unsealed_response_is_parsed() {
-        assert_eq!(parse_submit_response(200, &json!({ "status": "unsealed" })).unwrap(), SubmitOutcome::Unsealed);
+        assert_eq!(
+            parse_submit_response(200, &json!({ "status": "unsealed" })).unwrap(),
+            SubmitOutcome::Unsealed
+        );
     }
 
     #[test]
     fn rejections_surface_the_nodes_message() {
-        let err = parse_submit_response(400, &json!({ "error": "bad request: nope" })).unwrap_err().to_string();
+        let err = parse_submit_response(400, &json!({ "error": "bad request: nope" }))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("400") && err.contains("nope"), "got: {err}");
     }
 

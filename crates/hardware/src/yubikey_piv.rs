@@ -25,10 +25,15 @@ impl YubiKeyUnsealer {
     /// slot's policy requires it (Yubico's PIV applet handles the
     /// touch-and-timeout mechanics at the device level; this call simply
     /// waits for the device to respond or return its own timeout error).
-    pub fn decrypt_share(&self, pin: &[u8], encrypted_share: &[u8]) -> Result<Vec<u8>, HardwareError> {
+    pub fn decrypt_share(
+        &self,
+        pin: &[u8],
+        encrypted_share: &[u8],
+    ) -> Result<Vec<u8>, HardwareError> {
         let mut yk = yubikey::YubiKey::open().map_err(|_| HardwareError::NoDeviceFound)?;
 
-        yk.verify_pin(pin).map_err(|_| HardwareError::IncorrectPin)?;
+        yk.verify_pin(pin)
+            .map_err(|_| HardwareError::IncorrectPin)?;
 
         let decrypted = yubikey::piv::decrypt_data(
             &mut yk,

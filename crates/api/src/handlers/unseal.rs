@@ -22,14 +22,14 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use bincode::Options;
+use sentinel_crypto::SecretBytes;
 use sentinel_crypto::canary;
 use sentinel_crypto::envelope::{EnvelopeCiphertext, KEY_LEN};
 use sentinel_crypto::shamir::ShamirShare;
-use sentinel_crypto::SecretBytes;
 use sentinel_hardware::{HardwareError, QuorumUnseal, UnsealFragment};
 use sentinel_storage::StorageError;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::errors::AppError;
@@ -70,12 +70,18 @@ impl UnsealState {
         Self {
             threshold,
             session_timeout,
-            session: Arc::new(Mutex::new(Session { quorum: QuorumUnseal::new(threshold), started: None })),
+            session: Arc::new(Mutex::new(Session {
+                quorum: QuorumUnseal::new(threshold),
+                started: None,
+            })),
         }
     }
 
     fn fresh_session(&self) -> Session {
-        Session { quorum: QuorumUnseal::new(self.threshold), started: None }
+        Session {
+            quorum: QuorumUnseal::new(self.threshold),
+            started: None,
+        }
     }
 }
 
@@ -103,18 +109,26 @@ pub async fn submit_share(
 
     let mut session = state.unseal.session.lock().await;
     if let Some(started) = session.started
-        && started.elapsed() > state.unseal.session_timeout {
-            *session = state.unseal.fresh_session();
-            state.audit.lock().await.append("unseal session expired; discarded partial shares");
-        }
+        && started.elapsed() > state.unseal.session_timeout
+    {
+        *session = state.unseal.fresh_session();
+        state
+            .audit
+            .lock()
+            .await
+            .append("unseal session expired; discarded partial shares");
+    }
 
     session
         .quorum
-        .contribute(UnsealFragment { holder_id: req.holder_id.clone(), share })
+        .contribute(UnsealFragment {
+            holder_id: req.holder_id.clone(),
+            share,
+        })
         .map_err(|e| match e {
-            HardwareError::DuplicateHolder(h) => {
-                AppError::Conflict(format!("holder {h:?} already contributed to this unseal session"))
-            }
+            HardwareError::DuplicateHolder(h) => AppError::Conflict(format!(
+                "holder {h:?} already contributed to this unseal session"
+            )),
             other => AppError::BadRequest(other.to_string()),
         })?;
     session.started.get_or_insert_with(Instant::now);
@@ -144,12 +158,18 @@ pub async fn submit_share(
     let kek = SecretBytes::new(bytes);
 
     if let Err(e) = verify_or_initialise_canary(&state, &kek).await {
-        state.audit.lock().await.append(format!("UNSEAL FAILED (quorum submitted by {}): {e}", identity.0));
+        state.audit.lock().await.append(format!(
+            "UNSEAL FAILED (quorum submitted by {}): {e}",
+            identity.0
+        ));
         return Err(e);
     }
 
     *state.kek.lock().await = Some(kek);
-    state.audit.lock().await.append(format!("vault UNSEALED (quorum completed by {})", identity.0));
+    state.audit.lock().await.append(format!(
+        "vault UNSEALED (quorum completed by {})",
+        identity.0
+    ));
     Ok(Json(json!({ "status": "unsealed" })))
 }
 
@@ -160,16 +180,27 @@ pub async fn reset_session(
     Extension(identity): Extension<ClientIdentity>,
 ) -> StatusCode {
     *state.unseal.session.lock().await = state.unseal.fresh_session();
-    state.audit.lock().await.append(format!("unseal session reset by {}", identity.0));
+    state
+        .audit
+        .lock()
+        .await
+        .append(format!("unseal session reset by {}", identity.0));
     StatusCode::NO_CONTENT
 }
 
 /// Manually seals the node: drops the in-memory KEK and any partial unseal
 /// session. Idempotent.
-pub async fn seal(State(state): State<AppState>, Extension(identity): Extension<ClientIdentity>) -> StatusCode {
+pub async fn seal(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ClientIdentity>,
+) -> StatusCode {
     *state.kek.lock().await = None;
     *state.unseal.session.lock().await = state.unseal.fresh_session();
-    state.audit.lock().await.append(format!("vault SEALED manually by {}", identity.0));
+    state
+        .audit
+        .lock()
+        .await
+        .append(format!("vault SEALED manually by {}", identity.0));
     StatusCode::NO_CONTENT
 }
 
@@ -182,8 +213,8 @@ async fn verify_or_initialise_canary(state: &AppState, kek: &SecretBytes) -> Res
 
     match state.storage.get(CANARY_KEY).await {
         Ok(blob) => {
-            let canary_blob: EnvelopeCiphertext =
-                bincode::deserialize(&blob).map_err(|e| AppError::Internal(anyhow::anyhow!("corrupt key canary: {e}")))?;
+            let canary_blob: EnvelopeCiphertext = bincode::deserialize(&blob)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("corrupt key canary: {e}")))?;
             if canary::verify(kek, &canary_blob) {
                 Ok(())
             } else {
@@ -209,9 +240,14 @@ async fn verify_or_initialise_canary(state: &AppState, kek: &SecretBytes) -> Res
                 ));
             }
             let canary_blob = canary::create(kek)?;
-            let bytes = bincode::serialize(&canary_blob).map_err(|e| AppError::Internal(e.into()))?;
+            let bytes =
+                bincode::serialize(&canary_blob).map_err(|e| AppError::Internal(e.into()))?;
             state.storage.put(CANARY_KEY, bytes).await?;
-            state.audit.lock().await.append("vault key canary initialised (first unseal of an empty vault)");
+            state
+                .audit
+                .lock()
+                .await
+                .append("vault key canary initialised (first unseal of an empty vault)");
             Ok(())
         }
         Err(other) => Err(other.into()),
@@ -221,7 +257,9 @@ async fn verify_or_initialise_canary(state: &AppState, kek: &SecretBytes) -> Res
 fn validate_holder_id(id: &str) -> Result<(), AppError> {
     let ok = !id.is_empty()
         && id.len() <= MAX_HOLDER_ID_LEN
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
     if ok {
         Ok(())
     } else {
@@ -251,15 +289,18 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::test_support::{default_detector, state_with};
-    use axum::routing::post;
     use axum::Router;
+    use axum::routing::post;
     use rand::rngs::OsRng;
     use sentinel_crypto::shamir;
     use tower::ServiceExt;
@@ -296,12 +337,21 @@ mod tests {
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
         let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     async fn post_empty(router: &Router, uri: &str) -> StatusCode {
-        let req = axum::http::Request::builder().method("POST").uri(uri).body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
         router.clone().oneshot(req).await.unwrap().status()
     }
 
@@ -319,19 +369,29 @@ mod tests {
         assert_eq!(body["status"], "pending");
         assert_eq!(body["contributed"], 1);
         assert_eq!(body["threshold"], 2);
-        assert!(kek.lock().await.is_none(), "one share must not unseal a 2-of-3 vault");
+        assert!(
+            kek.lock().await.is_none(),
+            "one share must not unseal a 2-of-3 vault"
+        );
 
         let (status, body) = submit(&router, "bob", &shares[2]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "unsealed");
         assert_eq!(kek.lock().await.as_ref().unwrap().expose(), &KEK_BYTES);
 
-        assert!(storage.get(CANARY_KEY).await.is_ok(), "first unseal must persist the canary");
+        assert!(
+            storage.get(CANARY_KEY).await.is_ok(),
+            "first unseal must persist the canary"
+        );
         let chain = audit.lock().await;
         assert!(chain.verify().is_ok());
         let events: Vec<&str> = chain.entries().iter().map(|e| e.event.as_str()).collect();
         assert!(events.iter().any(|e| e.starts_with("vault UNSEALED")));
-        assert!(events.iter().any(|e| e.starts_with("unseal share accepted from holder alice")));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.starts_with("unseal share accepted from holder alice"))
+        );
     }
 
     #[tokio::test]
@@ -346,18 +406,35 @@ mod tests {
         submit(&router, "alice", &shares[0]).await;
         let (status, body) = submit(&router, "bob", &shares[1]).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(body["error"].as_str().unwrap().contains("sentinel-cli init"), "the error must say what to do: {body}");
-        assert!(kek.lock().await.is_none(), "an unprovisioned vault must stay sealed");
-        assert!(storage.get(CANARY_KEY).await.is_err(), "and must not invent a canary");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("sentinel-cli init"),
+            "the error must say what to do: {body}"
+        );
+        assert!(
+            kek.lock().await.is_none(),
+            "an unprovisioned vault must stay sealed"
+        );
+        assert!(
+            storage.get(CANARY_KEY).await.is_err(),
+            "and must not invent a canary"
+        );
     }
 
     #[tokio::test]
-    async fn a_provisioned_canary_makes_trust_on_first_use_unnecessary_and_still_rejects_wrong_keys() {
+    async fn a_provisioned_canary_makes_trust_on_first_use_unnecessary_and_still_rejects_wrong_keys()
+     {
         let (mut state, _dir) = state_with(None, default_detector(), UnsealState::new(2)).await;
         state.allow_canary_bootstrap = false;
         // What `sentinel-cli init` + the node's startup installer put in storage.
         let canary_blob = canary::create(&SecretBytes::new(KEK_BYTES.to_vec())).unwrap();
-        state.storage.put(CANARY_KEY, bincode::serialize(&canary_blob).unwrap()).await.unwrap();
+        state
+            .storage
+            .put(CANARY_KEY, bincode::serialize(&canary_blob).unwrap())
+            .await
+            .unwrap();
         let kek = state.kek.clone();
         let router = app(state);
 
@@ -372,7 +449,10 @@ mod tests {
         let good = shares_for(&KEK_BYTES);
         submit(&router, "alice", &good[0]).await;
         let (status, body) = submit(&router, "bob", &good[2]).await;
-        assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("unsealed")));
+        assert_eq!(
+            (status, body["status"].as_str()),
+            (StatusCode::OK, Some("unsealed"))
+        );
     }
 
     #[tokio::test]
@@ -387,7 +467,10 @@ mod tests {
         submit(&router, "alice", &good[0]).await;
         submit(&router, "bob", &good[1]).await;
         assert!(kek.lock().await.is_some());
-        assert_eq!(post_empty(&router, "/sys/seal").await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            post_empty(&router, "/sys/seal").await,
+            StatusCode::NO_CONTENT
+        );
         assert!(kek.lock().await.is_none());
 
         // A quorum for a *different* key must be refused, and the vault stay sealed.
@@ -395,9 +478,24 @@ mod tests {
         submit(&router, "alice", &wrong[0]).await;
         let (status, body) = submit(&router, "bob", &wrong[1]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("did not reconstruct"));
-        assert!(kek.lock().await.is_none(), "a wrong key must never be accepted");
-        assert!(audit.lock().await.entries().iter().any(|e| e.event.starts_with("UNSEAL FAILED")));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not reconstruct")
+        );
+        assert!(
+            kek.lock().await.is_none(),
+            "a wrong key must never be accepted"
+        );
+        assert!(
+            audit
+                .lock()
+                .await
+                .entries()
+                .iter()
+                .any(|e| e.event.starts_with("UNSEAL FAILED"))
+        );
 
         // The failed attempt resets the session; the right quorum still works.
         submit(&router, "alice", &good[0]).await;
@@ -435,7 +533,11 @@ mod tests {
 
         for bad in ["", "zz", "abc", "00", &"ab".repeat(5000)] {
             let (status, _) = submit(&router, "alice", bad).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "share {bad:.10?} should be rejected");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "share {bad:.10?} should be rejected"
+            );
         }
         // A hostile bincode length prefix claiming a huge Vec must hit the size cap.
         let hostile = to_hex(&[1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
@@ -445,13 +547,22 @@ mod tests {
         let shares = shares_for(&KEK_BYTES);
         for bad_id in ["", "has space", "semi;colon", &"a".repeat(65), "new\nline"] {
             let (status, _) = submit(&router, bad_id, &shares[0]).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "holder id {bad_id:?} should be rejected");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "holder id {bad_id:?} should be rejected"
+            );
         }
     }
 
     #[tokio::test]
     async fn an_expired_partial_session_is_discarded() {
-        let (state, _dir) = state_with(None, default_detector(), UnsealState::with_timeout(2, Duration::from_millis(30))).await;
+        let (state, _dir) = state_with(
+            None,
+            default_detector(),
+            UnsealState::with_timeout(2, Duration::from_millis(30)),
+        )
+        .await;
         let kek = state.kek.clone();
         let router = app(state);
         let shares = shares_for(&KEK_BYTES);
@@ -460,7 +571,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let (status, body) = submit(&router, "bob", &shares[1]).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["status"], "pending", "alice's stale share must have been dropped");
+        assert_eq!(
+            body["status"], "pending",
+            "alice's stale share must have been dropped"
+        );
         assert!(kek.lock().await.is_none());
     }
 
@@ -471,11 +585,21 @@ mod tests {
         let shares = shares_for(&KEK_BYTES);
 
         submit(&router, "alice", &shares[0]).await;
-        let req = axum::http::Request::builder().method("DELETE").uri("/sys/unseal").body(axum::body::Body::empty()).unwrap();
-        assert_eq!(router.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/sys/unseal")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
 
         let (_, body) = submit(&router, "alice", &shares[0]).await;
-        assert_eq!(body["contributed"], 1, "after a reset alice may contribute again");
+        assert_eq!(
+            body["contributed"], 1,
+            "after a reset alice may contribute again"
+        );
     }
 
     #[tokio::test]
@@ -483,7 +607,11 @@ mod tests {
         let (state, _dir) = state_with(None, default_detector(), UnsealState::new(2)).await;
         let kek = state.kek.clone();
         // Simulate a vault with data but a missing canary.
-        state.storage.put("secrets/precious", vec![1, 2, 3]).await.unwrap();
+        state
+            .storage
+            .put("secrets/precious", vec![1, 2, 3])
+            .await
+            .unwrap();
         let router = app(state);
         let shares = shares_for(&KEK_BYTES);
 
@@ -501,10 +629,23 @@ mod tests {
         let audit = state.audit.clone();
         let router = app(state);
 
-        assert_eq!(post_empty(&router, "/sys/seal").await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            post_empty(&router, "/sys/seal").await,
+            StatusCode::NO_CONTENT
+        );
         assert!(kek.lock().await.is_none());
-        assert!(audit.lock().await.entries().iter().any(|e| e.event == "vault SEALED manually by admin"));
+        assert!(
+            audit
+                .lock()
+                .await
+                .entries()
+                .iter()
+                .any(|e| e.event == "vault SEALED manually by admin")
+        );
         // Idempotent.
-        assert_eq!(post_empty(&router, "/sys/seal").await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            post_empty(&router, "/sys/seal").await,
+            StatusCode::NO_CONTENT
+        );
     }
 }

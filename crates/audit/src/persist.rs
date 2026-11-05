@@ -33,8 +33,15 @@ pub struct ParsedLog {
 pub fn parse_log(text: &str) -> Result<ParsedLog, AuditError> {
     if text.trim_start().starts_with('[') {
         let entries: Vec<AuditEntry> =
-            serde_json::from_str(text).map_err(|e| AuditError::Malformed { line: 1, reason: e.to_string() })?;
-        return Ok(ParsedLog { entries, torn_tail: false, good_len: text.len() });
+            serde_json::from_str(text).map_err(|e| AuditError::Malformed {
+                line: 1,
+                reason: e.to_string(),
+            })?;
+        return Ok(ParsedLog {
+            entries,
+            torn_tail: false,
+            good_len: text.len(),
+        });
     }
 
     let mut entries = Vec::new();
@@ -58,12 +65,25 @@ pub fn parse_log(text: &str) -> Result<ParsedLog, AuditError> {
                 good_len = offset;
             }
             Err(_) if i == last && !terminated => {
-                return Ok(ParsedLog { entries, torn_tail: true, good_len });
+                return Ok(ParsedLog {
+                    entries,
+                    torn_tail: true,
+                    good_len,
+                });
             }
-            Err(e) => return Err(AuditError::Malformed { line: i + 1, reason: e.to_string() }),
+            Err(e) => {
+                return Err(AuditError::Malformed {
+                    line: i + 1,
+                    reason: e.to_string(),
+                });
+            }
         }
     }
-    Ok(ParsedLog { entries, torn_tail: false, good_len })
+    Ok(ParsedLog {
+        entries,
+        torn_tail: false,
+        good_len,
+    })
 }
 
 /// Appends entries to a file, one JSON object per line, syncing each one to disk.
@@ -76,8 +96,12 @@ impl AuditSink for FileSink {
     fn persist(&mut self, entry: &AuditEntry) -> Result<(), AuditError> {
         let mut line = serde_json::to_string(entry).map_err(|e| AuditError::Io(e.to_string()))?;
         line.push('\n');
-        self.file.write_all(line.as_bytes()).map_err(|e| AuditError::Io(e.to_string()))?;
-        self.file.sync_data().map_err(|e| AuditError::Io(e.to_string()))?;
+        self.file
+            .write_all(line.as_bytes())
+            .map_err(|e| AuditError::Io(e.to_string()))?;
+        self.file
+            .sync_data()
+            .map_err(|e| AuditError::Io(e.to_string()))?;
         Ok(())
     }
 }
@@ -94,11 +118,18 @@ impl AuditSink for FileSink {
 /// opened read+write and positioned at the end before every use.
 pub fn open_persistent(path: &Path) -> Result<(AuditChain, bool), AuditError> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| AuditError::Io(e.to_string()))?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| AuditError::Io(e.to_string()))?;
+    }
     let io = |e: std::io::Error| AuditError::Io(format!("{}: {e}", path.display()));
-    let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(io)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(io)?;
 
     let mut text = String::new();
     file.read_to_string(&mut text).map_err(io)?;
@@ -149,7 +180,11 @@ mod tests {
         let (chain, torn) = open_persistent(&path).unwrap();
         assert!(!torn);
         assert_eq!(chain.entries().len(), 3);
-        assert_eq!(chain.tip_hash(), tip, "the reloaded chain must end at exactly the same hash");
+        assert_eq!(
+            chain.tip_hash(),
+            tip,
+            "the reloaded chain must end at exactly the same hash"
+        );
         assert!(chain.verify().is_ok());
     }
 
@@ -178,7 +213,8 @@ mod tests {
         }
         // Simulate the process dying halfway through writing record three.
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"{\"index\":2,\"timestamp\":\"2026-01-01T00:0").unwrap();
+        f.write_all(b"{\"index\":2,\"timestamp\":\"2026-01-01T00:0")
+            .unwrap();
         drop(f);
 
         let (mut chain, torn) = open_persistent(&path).unwrap();
@@ -189,7 +225,11 @@ mod tests {
 
         let (again, torn_again) = open_persistent(&path).unwrap();
         assert!(!torn_again);
-        assert_eq!(again.entries().len(), 3, "the new entry landed on its own clean line");
+        assert_eq!(
+            again.entries().len(),
+            3,
+            "the new entry landed on its own clean line"
+        );
     }
 
     #[test]
@@ -219,11 +259,20 @@ mod tests {
             chain.append("secret read: db (by alice)");
             chain.append("secret read: db (by bob)");
         }
-        let text = std::fs::read_to_string(&path).unwrap().replace("by alice", "by nobody");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("by alice", "by nobody");
         std::fs::write(&path, &text).unwrap();
         let err = open_persistent(&path).expect_err("a tampered log must be refused");
-        assert!(matches!(err, AuditError::HashMismatch { index: 0 }), "got {err:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "refusing must not modify the evidence");
+        assert!(
+            matches!(err, AuditError::HashMismatch { index: 0 }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "refusing must not modify the evidence"
+        );
     }
 
     #[test]
@@ -240,11 +289,17 @@ mod tests {
 
         let without_second = [lines[0], lines[2], lines[3]].join("\n") + "\n";
         std::fs::write(&path, without_second).unwrap();
-        assert!(open_persistent(&path).is_err(), "a deleted middle entry must break the chain");
+        assert!(
+            open_persistent(&path).is_err(),
+            "a deleted middle entry must break the chain"
+        );
 
         let swapped = [lines[0], lines[2], lines[1], lines[3]].join("\n") + "\n";
         std::fs::write(&path, swapped).unwrap();
-        assert!(open_persistent(&path).is_err(), "reordered entries must break the chain");
+        assert!(
+            open_persistent(&path).is_err(),
+            "reordered entries must break the chain"
+        );
     }
 
     #[test]
@@ -265,8 +320,15 @@ mod tests {
         std::fs::write(&path, first_two).unwrap();
 
         let (chain, torn) = open_persistent(&path).unwrap();
-        assert!(!torn && chain.entries().len() == 2, "the truncated log still verifies");
-        assert_ne!(chain.tip_hash(), full_tip, "but its tip no longer matches the one recorded elsewhere");
+        assert!(
+            !torn && chain.entries().len() == 2,
+            "the truncated log still verifies"
+        );
+        assert_ne!(
+            chain.tip_hash(),
+            full_tip,
+            "but its tip no longer matches the one recorded elsewhere"
+        );
     }
 
     #[test]
@@ -281,7 +343,10 @@ mod tests {
         let mut lines: Vec<String> = text.lines().map(String::from).collect();
         lines.insert(1, "this is not json".to_string());
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-        assert!(matches!(open_persistent(&path), Err(AuditError::Malformed { line: 2, .. })));
+        assert!(matches!(
+            open_persistent(&path),
+            Err(AuditError::Malformed { line: 2, .. })
+        ));
     }
 
     #[test]
@@ -290,7 +355,11 @@ mod tests {
         chain.append("a");
         chain.append("b");
         let array = serde_json::to_string_pretty(chain.entries()).unwrap();
-        let lines: String = chain.entries().iter().map(|e| serde_json::to_string(e).unwrap() + "\n").collect();
+        let lines: String = chain
+            .entries()
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
 
         for text in [array, lines] {
             let parsed = parse_log(&text).unwrap();
@@ -320,7 +389,10 @@ mod tests {
         chain.append("later entries keep working in memory");
         assert!(!chain.is_healthy(), "degradation is sticky");
         assert_eq!(chain.entries().len(), 2);
-        assert!(chain.verify().is_ok(), "the in-memory chain itself is still consistent");
+        assert!(
+            chain.verify().is_ok(),
+            "the in-memory chain itself is still consistent"
+        );
     }
 
     #[test]

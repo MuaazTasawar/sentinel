@@ -1,0 +1,35 @@
+name: Dependency audit
+
+# Checks Cargo.lock against the RustSec advisory database.
+#
+# It runs when dependencies change AND every day, because a new advisory can
+# appear for a dependency that has not changed. A red run here is almost
+# always "update a dependency" (see `cargo update -p <crate>`), not a bug in
+# this repository's code. Advisories that are deliberately accepted, with the
+# reason, are listed in .cargo/audit.toml.
+
+on:
+  push:
+    branches: [main]
+    paths: ["**/Cargo.toml", "Cargo.lock", ".cargo/audit.toml", ".github/workflows/audit.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "Cargo.lock", ".cargo/audit.toml", ".github/workflows/audit.yml"]
+  schedule:
+    - cron: "41 4 * * *" # daily, 04:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      # Fails on a vulnerability. Warnings (unmaintained / unsound crates) are
+      # printed but do not fail the run; they are tracked in the README.
+      - run: cargo audit

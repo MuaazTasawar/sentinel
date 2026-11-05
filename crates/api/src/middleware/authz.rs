@@ -28,11 +28,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::json;
 
 use crate::middleware::mtls::ClientIdentity;
@@ -52,17 +52,25 @@ pub enum Permission {
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum PolicyError {
-    #[error("no admin_cns configured: nobody would be able to unseal the vault (list at least one identity)")]
+    #[error(
+        "no admin_cns configured: nobody would be able to unseal the vault (list at least one identity)"
+    )]
     NoAdmins,
-    #[error("neither reader_cns nor writer_cns is configured: nobody could ever read or write a secret")]
+    #[error(
+        "neither reader_cns nor writer_cns is configured: nobody could ever read or write a secret"
+    )]
     NoSecretClients,
     #[error("peers are configured but peer_cns is empty: the cluster's own nodes would be refused")]
     NoPeerIdentities,
-    #[error("identity {0:?} is listed as a peer and also as an admin/reader/writer; node certificates must not double as client identities")]
+    #[error(
+        "identity {0:?} is listed as a peer and also as an admin/reader/writer; node certificates must not double as client identities"
+    )]
     PeerIsAlsoClient(String),
     #[error("invalid identity {0:?}: must be 1-128 characters with no control characters")]
     BadIdentity(String),
-    #[error("invalid certificate serial {0:?}: expected hexadecimal digits (colons and a 0x prefix are allowed)")]
+    #[error(
+        "invalid certificate serial {0:?}: expected hexadecimal digits (colons and a 0x prefix are allowed)"
+    )]
     BadSerial(String),
 }
 
@@ -111,13 +119,21 @@ fn clean_identities(list: &[String]) -> Result<HashSet<String>, PolicyError> {
 /// Canonical form for comparing serials: lowercase hex, no `0x`, no colons, no
 /// leading zeros (`"00:AB"` and `"0xab"` both become `"ab"`).
 pub fn normalize_serial(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_start_matches("0x").trim_start_matches("0X").replace(':', "");
+    let s = raw
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .replace(':', "");
     if s.is_empty() || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let s = s.to_ascii_lowercase();
     let trimmed = s.trim_start_matches('0');
-    Some(if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() })
+    Some(if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    })
 }
 
 impl Policy {
@@ -130,7 +146,8 @@ impl Policy {
         let readers = clean_identities(&cfg.reader_cns)?;
         let mut revoked = HashSet::new();
         for raw in &cfg.revoked_serials {
-            revoked.insert(normalize_serial(raw).ok_or_else(|| PolicyError::BadSerial(raw.clone()))?);
+            revoked
+                .insert(normalize_serial(raw).ok_or_else(|| PolicyError::BadSerial(raw.clone()))?);
         }
 
         let mut warnings = Vec::new();
@@ -162,7 +179,16 @@ impl Policy {
             }
         }
 
-        Ok(Self { peers, admins, writers, readers, revoked, allow_any: cfg.insecure_allow_any_client, warnings, last_denial_audit: Mutex::new(HashMap::new()) })
+        Ok(Self {
+            peers,
+            admins,
+            writers,
+            readers,
+            revoked,
+            allow_any: cfg.insecure_allow_any_client,
+            warnings,
+            last_denial_audit: Mutex::new(HashMap::new()),
+        })
     }
 
     /// A policy that permits everything. Test fixtures only; production code
@@ -170,7 +196,14 @@ impl Policy {
     /// `insecure_allow_any_client` setting.
     #[cfg(test)]
     pub fn allow_any() -> Self {
-        Self::new(&PolicyConfig { insecure_allow_any_client: true, ..Default::default() }, false).expect("always valid")
+        Self::new(
+            &PolicyConfig {
+                insecure_allow_any_client: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .expect("always valid")
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -186,12 +219,16 @@ impl Policy {
             Permission::Admin => self.admins.contains(cn),
             Permission::ReadSecrets => self.readers.contains(cn) || self.writers.contains(cn),
             Permission::WriteSecrets => self.writers.contains(cn),
-            Permission::ViewStatus => self.admins.contains(cn) || self.readers.contains(cn) || self.writers.contains(cn),
+            Permission::ViewStatus => {
+                self.admins.contains(cn) || self.readers.contains(cn) || self.writers.contains(cn)
+            }
         }
     }
 
     pub fn is_revoked(&self, serial_hex: &str) -> bool {
-        normalize_serial(serial_hex).map(|s| self.revoked.contains(&s)).unwrap_or(false)
+        normalize_serial(serial_hex)
+            .map(|s| self.revoked.contains(&s))
+            .unwrap_or(false)
     }
 
     /// True if this denial should be written to the audit chain (the first one
@@ -213,18 +250,27 @@ impl Policy {
 }
 
 async fn enforce(state: AppState, permission: Permission, req: Request, next: Next) -> Response {
-    let cn = req.extensions().get::<ClientIdentity>().map(|i| i.0.clone());
+    let cn = req
+        .extensions()
+        .get::<ClientIdentity>()
+        .map(|i| i.0.clone());
 
     if let Some(cn) = &cn
-        && state.policy.allows(cn, permission) {
-            return next.run(req).await;
-        }
+        && state.policy.allows(cn, permission)
+    {
+        return next.run(req).await;
+    }
 
     let who = cn.unwrap_or_else(|| "<no identity>".to_string());
     let what = format!("{} {}", req.method(), req.uri().path());
     tracing::warn!(identity = %who, request = %what, required = ?permission, "access denied by policy");
-    if state.policy.should_audit_denial(&who, permission, Instant::now()) {
-        state.audit.lock().await.append(format!("ACCESS DENIED: {who} attempted {what} (requires {permission:?})"));
+    if state
+        .policy
+        .should_audit_denial(&who, permission, Instant::now())
+    {
+        state.audit.lock().await.append(format!(
+            "ACCESS DENIED: {who} attempted {what} (requires {permission:?})"
+        ));
     }
     (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden: this identity is not permitted to perform this operation" }))).into_response()
 }
@@ -270,7 +316,11 @@ mod tests {
         let all = [ClusterRpc, Admin, ReadSecrets, WriteSecrets, ViewStatus];
         let expect = |cn: &str, allowed: &[Permission]| {
             for perm in all {
-                assert_eq!(p.allows(cn, perm), allowed.contains(&perm), "{cn} / {perm:?}");
+                assert_eq!(
+                    p.allows(cn, perm),
+                    allowed.contains(&perm),
+                    "{cn} / {perm:?}"
+                );
             }
         };
         expect("node1", &[ClusterRpc]);
@@ -291,9 +341,22 @@ mod tests {
 
     #[test]
     fn the_insecure_switch_permits_everything_and_says_so() {
-        let p = Policy::new(&PolicyConfig { insecure_allow_any_client: true, ..Default::default() }, true).unwrap();
-        assert!(p.allows("anyone", Permission::ClusterRpc) && p.allows("anyone", Permission::Admin));
-        assert!(p.warnings().iter().any(|w| w.contains("insecure_allow_any_client")));
+        let p = Policy::new(
+            &PolicyConfig {
+                insecure_allow_any_client: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert!(
+            p.allows("anyone", Permission::ClusterRpc) && p.allows("anyone", Permission::Admin)
+        );
+        assert!(
+            p.warnings()
+                .iter()
+                .any(|w| w.contains("insecure_allow_any_client"))
+        );
     }
 
     #[test]
@@ -305,19 +368,31 @@ mod tests {
         let mut c = standard();
         c.writer_cns.clear();
         c.reader_cns.clear();
-        assert_eq!(Policy::new(&c, true).err(), Some(PolicyError::NoSecretClients));
+        assert_eq!(
+            Policy::new(&c, true).err(),
+            Some(PolicyError::NoSecretClients)
+        );
 
         let mut c = standard();
         c.peer_cns.clear();
-        assert_eq!(Policy::new(&c, true).err(), Some(PolicyError::NoPeerIdentities));
-        assert!(Policy::new(&c, false).is_ok(), "a single node needs no peer identities");
+        assert_eq!(
+            Policy::new(&c, true).err(),
+            Some(PolicyError::NoPeerIdentities)
+        );
+        assert!(
+            Policy::new(&c, false).is_ok(),
+            "a single node needs no peer identities"
+        );
     }
 
     #[test]
     fn a_node_certificate_cannot_also_be_a_client() {
         let mut c = standard();
         c.reader_cns.push("node1".into());
-        assert_eq!(Policy::new(&c, true).err(), Some(PolicyError::PeerIsAlsoClient("node1".into())));
+        assert_eq!(
+            Policy::new(&c, true).err(),
+            Some(PolicyError::PeerIsAlsoClient("node1".into()))
+        );
     }
 
     #[test]
@@ -325,7 +400,11 @@ mod tests {
         let mut c = standard();
         c.reader_cns.push("root".into());
         let p = Policy::new(&c, true).unwrap();
-        assert!(p.warnings().iter().any(|w| w.contains("root") && w.contains("separation of duties")));
+        assert!(
+            p.warnings()
+                .iter()
+                .any(|w| w.contains("root") && w.contains("separation of duties"))
+        );
     }
 
     #[test]
@@ -333,7 +412,10 @@ mod tests {
         for bad in ["", "   ", &"a".repeat(129), "bad\nname"] {
             let mut c = standard();
             c.admin_cns.push(bad.to_string());
-            assert!(matches!(Policy::new(&c, true), Err(PolicyError::BadIdentity(_))), "{bad:?}");
+            assert!(
+                matches!(Policy::new(&c, true), Err(PolicyError::BadIdentity(_))),
+                "{bad:?}"
+            );
         }
     }
 
@@ -354,7 +436,10 @@ mod tests {
 
         let mut c = standard();
         c.revoked_serials = list(&["zz"]);
-        assert!(matches!(Policy::new(&c, true), Err(PolicyError::BadSerial(_))));
+        assert!(matches!(
+            Policy::new(&c, true),
+            Err(PolicyError::BadSerial(_))
+        ));
     }
 
     #[test]
@@ -363,8 +448,18 @@ mod tests {
         let t0 = Instant::now();
         assert!(p.should_audit_denial("mallory", Permission::Admin, t0));
         assert!(!p.should_audit_denial("mallory", Permission::Admin, t0 + Duration::from_secs(1)));
-        assert!(p.should_audit_denial("mallory", Permission::ClusterRpc, t0), "a different permission is a new event");
-        assert!(p.should_audit_denial("eve", Permission::Admin, t0), "a different identity is a new event");
-        assert!(p.should_audit_denial("mallory", Permission::Admin, t0 + DENIAL_AUDIT_WINDOW + Duration::from_secs(1)));
+        assert!(
+            p.should_audit_denial("mallory", Permission::ClusterRpc, t0),
+            "a different permission is a new event"
+        );
+        assert!(
+            p.should_audit_denial("eve", Permission::Admin, t0),
+            "a different identity is a new event"
+        );
+        assert!(p.should_audit_denial(
+            "mallory",
+            Permission::Admin,
+            t0 + DENIAL_AUDIT_WINDOW + Duration::from_secs(1)
+        ));
     }
 }

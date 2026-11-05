@@ -1,0 +1,51 @@
+name: Scheduled checks
+
+# Slow checks that should not run on every push: a longer fuzzing run. It can
+# also be started by hand from the Actions tab (workflow_dispatch). The
+# dependency audit lives in audit.yml.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Seconds to fuzz each target"
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Unlike the 45 s smoke run in ci.yml, this one is NOT continue-on-error: a
+  # crash found by the fuzzer turns this run red and uploads the offending
+  # input. Nothing blocks on it, so a red run is a lead, not a broken build.
+  fuzz-long:
+    name: long fuzz run (nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/crypto/fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz each target
+        working-directory: crates/crypto
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '600' }}
+        run: |
+          for target in decrypt combine_shares kdf; do
+            cargo +nightly fuzz run "$target" -- -max_total_time="$FUZZ_SECONDS"
+          done
+      - name: Keep any crash input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: crates/crypto/fuzz/artifacts
+          if-no-files-found: ignore

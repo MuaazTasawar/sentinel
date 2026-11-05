@@ -137,7 +137,15 @@ impl AnomalyDetector {
             (0.0, 0.0)
         } else {
             let mean = self.history.iter().map(|&c| c as f64).sum::<f64>() / n;
-            let variance = self.history.iter().map(|&c| { let d = c as f64 - mean; d * d }).sum::<f64>() / n;
+            let variance = self
+                .history
+                .iter()
+                .map(|&c| {
+                    let d = c as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / n;
             (mean, variance.sqrt())
         };
         DetectorSnapshot {
@@ -157,12 +165,25 @@ impl AnomalyDetector {
         }
         let n = self.history.len() as f64;
         let mean = self.history.iter().map(|&c| c as f64).sum::<f64>() / n;
-        let variance = self.history.iter().map(|&c| { let d = c as f64 - mean; d * d }).sum::<f64>() / n;
+        let variance = self
+            .history
+            .iter()
+            .map(|&c| {
+                let d = c as f64 - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
         let stddev = variance.sqrt();
 
         if stddev == 0.0 {
             return if self.current_count as f64 > mean {
-                Some(AnomalyReport { current_count: self.current_count, baseline_mean: mean, baseline_stddev: stddev, z_score: f64::INFINITY })
+                Some(AnomalyReport {
+                    current_count: self.current_count,
+                    baseline_mean: mean,
+                    baseline_stddev: stddev,
+                    z_score: f64::INFINITY,
+                })
             } else {
                 None
             };
@@ -170,7 +191,12 @@ impl AnomalyDetector {
 
         let z = (self.current_count as f64 - mean) / stddev;
         if z > self.z_threshold {
-            Some(AnomalyReport { current_count: self.current_count, baseline_mean: mean, baseline_stddev: stddev, z_score: z })
+            Some(AnomalyReport {
+                current_count: self.current_count,
+                baseline_mean: mean,
+                baseline_stddev: stddev,
+                z_score: z,
+            })
         } else {
             None
         }
@@ -226,7 +252,10 @@ mod tests {
                 fired = true;
             }
         }
-        assert!(fired, "a 40x burst against a steady 2/sec baseline should be flagged");
+        assert!(
+            fired,
+            "a 40x burst against a steady 2/sec baseline should be flagged"
+        );
     }
 
     #[test]
@@ -246,8 +275,12 @@ mod tests {
                 break;
             }
         }
-        let first_detection_at = first_detection_at.expect("should detect at some point in the burst");
-        assert!(first_detection_at <= 10, "expected detection well before all 40 requests landed, got request #{first_detection_at}");
+        let first_detection_at =
+            first_detection_at.expect("should detect at some point in the burst");
+        assert!(
+            first_detection_at <= 10,
+            "expected detection well before all 40 requests landed, got request #{first_detection_at}"
+        );
     }
 
     #[test]
@@ -257,7 +290,10 @@ mod tests {
         d.record_access(t0);
         let t_later = t0 + Duration::from_secs(5);
         d.record_access(t_later);
-        assert!(d.history.contains(&0), "idle buckets should be recorded as zero-count history entries");
+        assert!(
+            d.history.contains(&0),
+            "idle buckets should be recorded as zero-count history entries"
+        );
     }
 
     #[test]
@@ -275,7 +311,10 @@ mod tests {
         d.record_access(next_bucket);
         d.record_access(next_bucket);
         let result = d.record_access(next_bucket);
-        assert!(result.is_some(), "any increase over a perfectly flat baseline should be flagged");
+        assert!(
+            result.is_some(),
+            "any increase over a perfectly flat baseline should be flagged"
+        );
         assert_eq!(result.unwrap().z_score, f64::INFINITY);
     }
 
@@ -328,7 +367,10 @@ mod tests {
 
         let snap = d.snapshot();
         assert_eq!(snap.current_count, 2);
-        assert!(snap.recent_history.is_empty(), "current (still-open) bucket isn't in history yet");
+        assert!(
+            snap.recent_history.is_empty(),
+            "current (still-open) bucket isn't in history yet"
+        );
 
         let snap2 = d.snapshot();
         assert_eq!(snap.current_count, snap2.current_count);
@@ -361,7 +403,11 @@ mod tests {
         let mut d = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0);
         let t0 = base();
         let flagged = reads_at(&mut d, t0, &[0, 20]);
-        assert_eq!(flagged, vec![false, true], "the bare rule flags the second, lone read");
+        assert_eq!(
+            flagged,
+            vec![false, true],
+            "the bare rule flags the second, lone read"
+        );
     }
 
     #[test]
@@ -389,10 +435,16 @@ mod tests {
         }
         let burst = t0 + Duration::from_secs(40);
         for i in 1..=9 {
-            assert!(d.record_access(burst).is_none(), "read #{i} in the bucket is below the floor");
+            assert!(
+                d.record_access(burst).is_none(),
+                "read #{i} in the bucket is below the floor"
+            );
         }
         let tenth = d.record_access(burst);
-        assert!(tenth.is_some(), "the 10th read in one bucket reaches the floor and is flagged");
+        assert!(
+            tenth.is_some(),
+            "the 10th read in one bucket reaches the floor and is flagged"
+        );
         assert_eq!(tenth.unwrap().current_count, 10);
     }
 
@@ -407,7 +459,10 @@ mod tests {
         }
         let burst_time = t0 + Duration::from_secs(10);
         let fired = (0..40).any(|_| d.record_access(burst_time).is_some());
-        assert!(fired, "a 40x burst over a steady 2/sec baseline is still flagged with a floor of 10");
+        assert!(
+            fired,
+            "a 40x burst over a steady 2/sec baseline is still flagged with a floor of 10"
+        );
     }
 
     #[test]
@@ -417,6 +472,9 @@ mod tests {
         let mut zero = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0).with_min_burst(0);
         let mut bare = AnomalyDetector::new(Duration::from_secs(1), 60, 3.0);
         let t0 = base();
-        assert_eq!(reads_at(&mut zero, t0, &[0, 20]), reads_at(&mut bare, t0, &[0, 20]));
+        assert_eq!(
+            reads_at(&mut zero, t0, &[0, 20]),
+            reads_at(&mut bare, t0, &[0, 20])
+        );
     }
 }

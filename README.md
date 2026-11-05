@@ -12,7 +12,7 @@ durable hash-chained audit log · statistical auto-seal · deterministic simulat
 ![Axum](https://img.shields.io/badge/HTTP-Axum%200.8-5b21b6)
 ![TLS](https://img.shields.io/badge/TLS-rustls%20mTLS-2ea043)
 ![Crypto](https://img.shields.io/badge/AEAD-AES--256--GCM-0f766e)
-![Tests](https://img.shields.io/badge/tests-291%20passing-2ea043)
+![Tests](https://img.shields.io/badge/tests-296%20passing-2ea043)
 ![Crates](https://img.shields.io/badge/workspace-9%20crates-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -66,7 +66,7 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (291 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (296 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
@@ -86,7 +86,9 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | Rolling z-score anomaly detector (counts **successful reads only**) | ✅ | 18 detector tests, the 404-flood test and a lone-read-after-idle regression test |
 | Web dashboard (`/`, `/api/status`) | ✅ | Router tests; served over mTLS |
 | Deterministic simulator: **replication, crashes, loss, duplication** + 4 safety checkers | ✅ | 31 sim tests incl. 200 random fault schedules |
-| CI on **Linux and Windows** | ✅ | `.github/workflows/ci.yml` |
+| CI on **Linux and Windows**, with a **rustfmt gate** and clippy `-D warnings` | ✅ | `.github/workflows/ci.yml` |
+| **Dependency audit** (RustSec) on every lockfile change and daily | ✅ | `.github/workflows/audit.yml`; accepted advisories are listed with reasons in `.cargo/audit.toml` |
+| CLI survives a closed pipe (`sentinel-cli ... \| head`) with unchanged exit codes | ✅ | Unit tests + an integration test that runs the real binary with a reader-less stdout |
 | **YubiKey PIV decryption on real hardware** | ⚠️ **Unverified, probably wrong** | Never run on a device; see [§13](#13-known-limitations--findings) |
 | Log compaction / snapshots, dynamic membership | ❌ | Not implemented |
 
@@ -652,9 +654,9 @@ Why both: the property tests catch regressions on every commit; the fuzzers find
 | `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 18 |
 | `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 79 |
 | `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld::{propose, crash, restart, check_all, ...}`, `NetworkConditions` | 16 + 8 + 7 |
-| `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 29 |
+| `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 32 + 2 |
 
-**Total: 291 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
+**Total: 296 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
 
 Key dependencies (resolved in `Cargo.lock`): `axum 0.8`, `tokio 1.53`, `rustls 0.23`, `tokio-rustls 0.26`, `hyper-util 0.1`, `reqwest 0.12` (rustls), `x509-parser 0.16`, `rcgen 0.13`, `aes-gcm 0.10`, `argon2 0.5`, `hkdf 0.12`, `sled 0.34`, `yubikey 0.8`, `zeroize 1.9`, `proptest 1.11`, `chrono 0.4`.
 
@@ -773,7 +775,7 @@ A fully commented example is in [`.env.toml.example`](.env.toml.example).
 
 ### 10.1 Prerequisites
 
-Rust 1.85 or newer (edition 2024; `rust-toolchain.toml` selects `stable`). No `openssl` is needed: the CLI creates the PKI.
+Rust 1.87 or newer (edition 2024; `rust-toolchain.toml` selects `stable`). A CI job checks that 1.87 really builds the workspace; it is non-blocking until it has been seen green. No `openssl` is needed: the CLI creates the PKI.
 
 **Linux only, for building and running `sentinel-cli`:** its (unverified) YubiKey support links the PC/SC smart-card library, so install `pkg-config` and `libpcsclite-dev` to build (`sudo apt install pkg-config libpcsclite-dev` on Debian/Ubuntu; `pcsc-lite-devel` on Fedora; `pcsclite` on Arch) and `libpcsclite1` to run it. **`sentinel-node` does not need it**: build it alone with `cargo build -p sentinel-node` on a machine with no smart-card stack. Windows needs nothing extra (it uses the built-in smart-card API). macOS is untested.
 
@@ -783,6 +785,7 @@ Rust 1.85 or newer (edition 2024; `rust-toolchain.toml` selects `stable`). No `o
 cargo build --workspace
 cargo test --workspace --no-fail-fast
 cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check      # CI gate; fix with `cargo fmt --all`
 ```
 
 The first build compiles `rustls`, `ring` and `sled` and takes a few minutes. The consensus and property tests take around 10-40 s.
@@ -909,7 +912,7 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 | Long `cargo-fuzz` campaigns | Needs nightly. A **non-blocking** CI job (`continue-on-error`) fuzzes each of the three targets for 45 s. In CI run #8 the individual steps were checked and ticked (the fuzz step took 2 min 46 s) and no crash was reported. 45 s per target is a smoke test, not a campaign: it shows the targets build and survive a short run, not that `decrypt` and friends are robust. Since the job is non-blocking, check its steps (not just the overall tick) after any change to the crypto crate |
 | Miri | Needs nightly; the crypto crate calls `mlock`/`VirtualLock`, which Miri cannot execute |
 | Clusters larger than 5 nodes, real multi-host networks, sustained load | Only single-machine, loopback runs |
-| macOS | Not built or tested |
+| macOS | A **non-blocking** CI job builds and tests it, but it had not been observed to run when this was written. Until it has been seen green, treat macOS as unsupported |
 
 ### 11.4 Bugs found by adversarial testing and real runs
 
@@ -922,6 +925,9 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 7. **`cargo test` does not rebuild binaries**: stale `sentinel-node`/`sentinel-cli` binaries produced misleading end-to-end failures.
 8. **Ubuntu CI failed on a clean machine**: building anything that depends on the `yubikey` crate needs `libpcsclite-dev`, which the development sandbox happened to have installed unnoticed, and this README had wrongly claimed it was not needed on Linux. Fixed by installing it in CI and by making YubiKey support an optional `yubikey` feature of `sentinel-hardware`, so the **server no longer depends on the smart-card stack at all** (a CI guard enforces that). The Ubuntu, Windows and clippy jobs have been green since (CI run #8).
 9. **Auto-seal flagged a lone read after idle time**: an unrelated flaky test (a read that should have returned 200 returned 503 on a loaded machine) turned out to be a real bug. With an all-zero baseline (mean 0, stddev 0) the detector flagged *any* single read; with the node's real settings, two reads 20 s apart would have sealed the vault. Existing tests only used bursts, so nobody saw it. Fixed with a count floor (`anomaly_min_burst`); the regression test (`one_ordinary_read_after_a_long_quiet_spell_does_not_seal_the_vault`) fails when the floor is removed.
+10. **`sentinel-cli ... | head` panicked**: `println!` panics when the reader of a pipe goes away, so the CLI printed a panic message and exited with status 101. The fix (`outln!`) discards only `BrokenPipe` and keeps running, so exit codes are unchanged: a tampered log still makes `verify` fail even when its report could not be printed. The first version of the integration test passed on broken code about one run in three, because it closed the pipe *after* spawning the child and so raced with the child's first print. It now creates the pipe and drops its reader *before* spawning, which makes the failure deterministic (it fails 5 of 5 runs with the fix removed).
+11. **Eleven known vulnerabilities in dependencies**, found by the first run of `cargo audit` (added in phase 19; nothing had checked before). Four in `rustls` (among them TLS 1.3 handshake messages accepted across encryption levels, and an unauthenticated ServerHello that could downgrade key exchange), one in `rustls-webpki` (certificate verification accepting distrusted intermediates), one in `webpki-roots`, three in `quinn-proto`, plus a `tokio` soundness warning. All of these were fixed by a lockfile-only update of five crates (`cargo update -p rustls -p rustls-webpki -p webpki-roots -p quinn-proto -p tokio`); the tests and clippy were re-run on the result. Two advisories remain and are accepted explicitly: see §13.2 item 13. How exploitable each one was *in this project* was not assessed. `rustls` and `rustls-webpki` are in the server's TLS path; `quinn-proto` was in the lockfile but not in the normal build graph that was inspected. The point is that nothing was checking: the audit now runs whenever dependencies change and daily, not once.
+12. **The anti-deadlock stress test failed on a slow machine**: `repeated_elections_do_not_deadlock_under_tight_simultaneous_timeouts` required exactly one leader within 2 s with 30-60 ms election timeouts. On a machine slowed roughly 20x it failed 8 of 8 runs, with the old and the new `tokio` alike (so it was not caused by the dependency update, which was suspected first): heartbeats later than the election timeout make leadership change continuously, which is not a deadlock. The deadline is now 20 s. A real deadlock never recovers, so it fails at any deadline: with the original bug reintroduced (awaiting vote replies inline) the test fails at exactly 20 s in about 6 of 10 runs, because the deadlock only occurs when two nodes happen to campaign at the same moment. It passes 6 of 6 under the load that failed 8 of 8 before.
 
 ---
 
@@ -986,6 +992,9 @@ The original list of problems in this project (functional gaps, security finding
 | 404 reads counted toward the auto-seal rate | Only successful reads count |
 | Auto-seal flagged a lone read after idle time (found later, by a flaky test) | Count floor `anomaly_min_burst` (§5.10) |
 | Unused dependencies, 9 stray lockfiles, mixed editions, config precedence and file-name confusion | Cleaned up; edition 2024 everywhere; environment overrides the file |
+| `rustfmt` was not enforced (566 diffs) | The tree is formatted and a CI job fails on any unformatted change |
+| `sentinel-cli ... \| head` printed a broken-pipe panic | `outln!` (§11.4 bug 10) |
+| Known vulnerabilities in `rustls`, `rustls-webpki`, `webpki-roots`, `quinn-proto`, `tokio` | Updated; audited by CI from now on (§11.4 bug 11) |
 
 ### 13.2 Remaining
 
@@ -1001,8 +1010,8 @@ The original list of problems in this project (functional gaps, security finding
 10. **A node holds the whole key in memory while unsealed, and briefly while a quorum assembles.** Anyone who can read that process's memory defeats the scheme.
 11. **Unsealing is manual per node.** The key lives only in memory, so every restart needs a new quorum on every node.
 12. **Share distribution is out of band.** `init` produces files; getting each to its holder safely is your responsibility.
-13. **`rustfmt` is not enforced.** The codebase was never formatted with it (running `cargo fmt` would touch nearly every file). `clippy -D warnings` *is* enforced.
-14. **Minor:** piping `sentinel-cli` output into something that closes early (`| head`) prints a broken-pipe panic.
+13. **Two dependency advisories are accepted, not fixed** (`.cargo/audit.toml`): `rsa` (Marvin timing attack, RUSTSEC-2023-0071, no patched release exists) and `crypto-bigint` 0.5 (RUSTSEC-2026-0387, needs `crypto-bigint` 0.7, which needs a new `yubikey` release). Both are reached **only** through the `yubikey` crate, i.e. the unverified hardware-key feature of `sentinel-cli`. The server does not depend on them, and CI fails if it ever starts to. They go away with the hardware-key redesign (item 1).
+14. **Unmaintained dependencies** (warnings, not vulnerabilities): `bincode` 1.x (used for the envelope and seal-command encodings, so replacing it is a stored-data format migration), `rustls-pemfile` (replaceable by the PEM parser in `rustls-pki-types`), and `fxhash` and `instant`, which come in through `sled` 0.34, itself unmaintained.
 
 ---
 
@@ -1010,7 +1019,8 @@ The original list of problems in this project (functional gaps, security finding
 
 **Next, in rough priority order:**
 
-- [ ] Resolve the hardware-key design on a real device (see §13.2-1), then re-enable hardware shares in `init`.
+- [ ] Resolve the hardware-key design on a real device (see §13.2-1), then re-enable hardware shares in `init`. This also removes the two accepted advisories (§13.2-13).
+- [ ] Replace `rustls-pemfile` with `rustls-pki-types`' PEM parser; plan the `bincode` 1.x format migration and a replacement for the `sled` backend (§13.2-14).
 - [ ] Snapshots and log compaction for Raft and the WAL.
 - [ ] Linearizable reads (read-index or lease reads) as an option.
 - [ ] Replicate or merge audit logs; periodic external tip anchoring.
@@ -1018,9 +1028,8 @@ The original list of problems in this project (functional gaps, security finding
 - [ ] CRL/OCSP or short-lived certificates instead of a restart-time deny-list.
 - [ ] Auto-unseal options (KMS) for restarts, with their own threat model.
 - [ ] Metrics, readiness endpoint, packaged releases.
-- [ ] `cargo fmt` the tree once, then enforce it.
 
-**Done in phases 12-18:** everything in §13.1.
+**Done in phases 12-19:** everything in §13.1.
 
 ---
 
@@ -1031,7 +1040,12 @@ sentinel/
 ├── Cargo.toml                    # workspace, shared package settings
 ├── rust-toolchain.toml
 ├── .env.toml.example             # every setting, commented
-├── .github/workflows/ci.yml      # Linux + Windows build/test, clippy gate, server-has-no-PC/SC guard
+├── .github/workflows/
+│   ├── ci.yml                    # Linux + Windows build/test, rustfmt and clippy gates, server-has-no-PC/SC guard;
+│   │                             # non-blocking: macOS, MSRV 1.87, 45 s fuzz smoke
+│   ├── audit.yml                 # cargo audit: on dependency changes and daily
+│   └── scheduled.yml             # weekly: 10-minute-per-target fuzzing
+├── .cargo/audit.toml             # advisories accepted on purpose, each with its reason
 ├── README.md
 └── crates/
     ├── crypto/       src/{envelope,shamir,kdf,canary,secret}.rs   tests/ (property)   fuzz/ (own workspace)
@@ -1051,9 +1065,10 @@ sentinel/
 
 ## 16. Contributing & License
 
-**Workflow** (CI runs the first two on Linux and Windows):
+**Workflow** (CI runs the tests on Linux and Windows, and the formatting and clippy checks on Linux):
 
 ```bash
+cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
@@ -1066,6 +1081,6 @@ The house rule from this project's history: *write it, prove it runs, then ship 
 
 <div align="center">
 
-*Built across 19 phases (0-18), each compiled and tested before being called done.*
+*Built across 20 phases (0-19), each compiled and tested before being called done.*
 
 </div>

@@ -5,8 +5,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use sentinel_consensus::{
-    AppendEntriesRequest, AppendEntriesResponse, ConsensusError, LogEntry, PersistedState, RaftState,
-    RequestVoteRequest, RequestVoteResponse, Role,
+    AppendEntriesRequest, AppendEntriesResponse, ConsensusError, LogEntry, PersistedState,
+    RaftState, RequestVoteRequest, RequestVoteResponse, Role,
 };
 
 use crate::mock_clock::SimTime;
@@ -14,15 +14,39 @@ use crate::mock_network::NetworkConditions;
 
 #[derive(Debug, Clone)]
 enum Event {
-    ElectionTimeout { node: u64, generation: u64 },
-    HeartbeatTick { node: u64 },
-    RequestVote { to: u64, from: u64, req: RequestVoteRequest },
-    RequestVoteResp { to: u64, from: u64, resp: RequestVoteResponse },
-    AppendEntries { to: u64, from: u64, req: AppendEntriesRequest },
+    ElectionTimeout {
+        node: u64,
+        generation: u64,
+    },
+    HeartbeatTick {
+        node: u64,
+    },
+    RequestVote {
+        to: u64,
+        from: u64,
+        req: RequestVoteRequest,
+    },
+    RequestVoteResp {
+        to: u64,
+        from: u64,
+        resp: RequestVoteResponse,
+    },
+    AppendEntries {
+        to: u64,
+        from: u64,
+        req: AppendEntriesRequest,
+    },
     /// Carries a description of the request it answers, exactly as the real
     /// actor does, so late, duplicated and reordered replies are handled the
     /// same way here as in production.
-    AppendEntriesResp { to: u64, from: u64, resp: AppendEntriesResponse, sent_term: u64, sent_prev: u64, sent_len: u64 },
+    AppendEntriesResp {
+        to: u64,
+        from: u64,
+        resp: AppendEntriesResponse,
+        sent_term: u64,
+        sent_prev: u64,
+        sent_len: u64,
+    },
 }
 
 struct Scheduled {
@@ -44,7 +68,10 @@ impl PartialOrd for Scheduled {
 }
 impl Ord for Scheduled {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.time.cmp(&self.time).then_with(|| other.seq.cmp(&self.seq))
+        other
+            .time
+            .cmp(&self.time)
+            .then_with(|| other.seq.cmp(&self.seq))
     }
 }
 
@@ -147,31 +174,52 @@ impl SimWorld {
     /// timer: a crude but effective model of clock skew. Intended to be
     /// called right after `new`, before running the simulation.
     pub fn skew_node_clock(&mut self, node: u64, offset_ms: i64) {
-        self.election_timer_gen.entry(node).and_modify(|g| *g += 1).or_insert(0);
+        self.election_timer_gen
+            .entry(node)
+            .and_modify(|g| *g += 1)
+            .or_insert(0);
         let generation = self.election_timer_gen[&node];
         let base = self.random_timeout();
         let skewed = (base as i64 + offset_ms).max(1) as u64;
-        self.schedule(self.now.advance(skewed), Event::ElectionTimeout { node, generation });
+        self.schedule(
+            self.now.advance(skewed),
+            Event::ElectionTimeout { node, generation },
+        );
     }
 
     fn random_timeout(&mut self) -> u64 {
-        self.rng.gen_range(self.election_timeout_range.0..=self.election_timeout_range.1)
+        self.rng
+            .gen_range(self.election_timeout_range.0..=self.election_timeout_range.1)
     }
 
     fn schedule(&mut self, time: SimTime, event: Event) {
         self.seq += 1;
-        self.queue.push(Scheduled { time, seq: self.seq, event });
+        self.queue.push(Scheduled {
+            time,
+            seq: self.seq,
+            event,
+        });
     }
 
     fn reset_election_timer(&mut self, node: u64) {
-        let generation = self.election_timer_gen.entry(node).and_modify(|g| *g += 1).or_insert(0);
+        let generation = self
+            .election_timer_gen
+            .entry(node)
+            .and_modify(|g| *g += 1)
+            .or_insert(0);
         let generation = *generation;
         let timeout = self.random_timeout();
-        self.schedule(self.now.advance(timeout), Event::ElectionTimeout { node, generation });
+        self.schedule(
+            self.now.advance(timeout),
+            Event::ElectionTimeout { node, generation },
+        );
     }
 
     fn schedule_heartbeat(&mut self, node: u64) {
-        self.schedule(self.now.advance(self.heartbeat_interval_ms), Event::HeartbeatTick { node });
+        self.schedule(
+            self.now.advance(self.heartbeat_interval_ms),
+            Event::HeartbeatTick { node },
+        );
     }
 
     /// Sends a message. Dropped if the pair is partitioned or the network
@@ -182,13 +230,20 @@ impl SimWorld {
             return;
         }
         let jitter = self.rng.gen_range(0..=3);
-        if self.network.loss_percent > 0 && self.rng.gen_range(0..100) < self.network.loss_percent as u32 {
+        if self.network.loss_percent > 0
+            && self.rng.gen_range(0..100) < self.network.loss_percent as u32
+        {
             return;
         }
         let deliver_at = self.now.advance(self.network.base_latency_ms + jitter);
-        if self.network.duplicate_percent > 0 && self.rng.gen_range(0..100) < self.network.duplicate_percent as u32 {
+        if self.network.duplicate_percent > 0
+            && self.rng.gen_range(0..100) < self.network.duplicate_percent as u32
+        {
             let extra = self.rng.gen_range(0..=6);
-            self.schedule(self.now.advance(self.network.base_latency_ms + extra), event.clone());
+            self.schedule(
+                self.now.advance(self.network.base_latency_ms + extra),
+                event.clone(),
+            );
         }
         self.schedule(deliver_at, event);
     }
@@ -211,7 +266,11 @@ impl SimWorld {
         let state = &self.nodes[&node];
         self.persisted.insert(
             node,
-            PersistedState { term: state.current_term, voted_for: state.voted_for, entries: state.log.entries_from(0) },
+            PersistedState {
+                term: state.current_term,
+                voted_for: state.voted_for,
+                entries: state.log.entries_from(0),
+            },
         );
     }
 
@@ -222,8 +281,12 @@ impl SimWorld {
         if self.up.contains(&node) {
             return;
         }
-        let persisted = self.persisted.remove(&node).expect("a crashed node always has persisted state");
-        let state = RaftState::restore(node, persisted).expect("what a node persisted is always a valid log");
+        let persisted = self
+            .persisted
+            .remove(&node)
+            .expect("a crashed node always has persisted state");
+        let state = RaftState::restore(node, persisted)
+            .expect("what a node persisted is always a valid log");
         self.nodes.insert(node, state);
         self.applied.insert(node, Vec::new());
         self.up.insert(node);
@@ -237,7 +300,11 @@ impl SimWorld {
         if !self.up.contains(&node) {
             return Err(ConsensusError::Stopped);
         }
-        let index = self.nodes.get_mut(&node).unwrap().append_as_leader(command)?;
+        let index = self
+            .nodes
+            .get_mut(&node)
+            .unwrap()
+            .append_as_leader(command)?;
         for peer in self.peers_of[&node].clone() {
             self.replicate_to(node, peer);
         }
@@ -280,8 +347,18 @@ impl SimWorld {
     }
 
     fn replicate_to(&mut self, leader: u64, peer: u64) {
-        let Some(req) = self.nodes[&leader].build_append_entries(peer) else { return };
-        self.send(leader, peer, Event::AppendEntries { to: peer, from: leader, req });
+        let Some(req) = self.nodes[&leader].build_append_entries(peer) else {
+            return;
+        };
+        self.send(
+            leader,
+            peer,
+            Event::AppendEntries {
+                to: peer,
+                from: leader,
+                req,
+            },
+        );
     }
 
     /// Hands newly committed entries to the node's state machine and checks
@@ -337,7 +414,9 @@ impl SimWorld {
     fn process(&mut self, event: Event) {
         match event {
             Event::ElectionTimeout { node, generation } => {
-                if !self.up.contains(&node) || self.election_timer_gen.get(&node) != Some(&generation) {
+                if !self.up.contains(&node)
+                    || self.election_timer_gen.get(&node) != Some(&generation)
+                {
                     return;
                 }
                 if self.nodes[&node].role == Role::Leader {
@@ -353,7 +432,15 @@ impl SimWorld {
                 }
                 for peer in peers {
                     let req = vote_req.clone();
-                    self.send(node, peer, Event::RequestVote { to: peer, from: node, req });
+                    self.send(
+                        node,
+                        peer,
+                        Event::RequestVote {
+                            to: peer,
+                            from: node,
+                            req,
+                        },
+                    );
                 }
             }
 
@@ -366,7 +453,15 @@ impl SimWorld {
                 if resp.vote_granted || term_current_or_newer {
                     self.reset_election_timer(to);
                 }
-                self.send(to, from, Event::RequestVoteResp { to: from, from: to, resp });
+                self.send(
+                    to,
+                    from,
+                    Event::RequestVoteResp {
+                        to: from,
+                        from: to,
+                        resp,
+                    },
+                );
             }
 
             Event::RequestVoteResp { to, from, resp } => {
@@ -374,7 +469,12 @@ impl SimWorld {
                     return;
                 }
                 let cluster_size = self.cluster_size;
-                if self.nodes.get_mut(&to).unwrap().record_vote(resp, from, cluster_size) {
+                if self
+                    .nodes
+                    .get_mut(&to)
+                    .unwrap()
+                    .record_vote(resp, from, cluster_size)
+                {
                     self.win_election(to);
                 }
             }
@@ -383,7 +483,8 @@ impl SimWorld {
                 if !self.up.contains(&to) {
                     return;
                 }
-                let (sent_term, sent_prev, sent_len) = (req.term, req.prev_log_index, req.entries.len() as u64);
+                let (sent_term, sent_prev, sent_len) =
+                    (req.term, req.prev_log_index, req.entries.len() as u64);
                 // Contact from a live leader resets the election clock even if
                 // the consistency check rejects it (matches the real actor).
                 let from_live_leader = req.term >= self.nodes[&to].current_term;
@@ -392,16 +493,37 @@ impl SimWorld {
                     self.reset_election_timer(to);
                 }
                 self.drain_applied(to);
-                self.send(to, from, Event::AppendEntriesResp { to: from, from: to, resp, sent_term, sent_prev, sent_len });
+                self.send(
+                    to,
+                    from,
+                    Event::AppendEntriesResp {
+                        to: from,
+                        from: to,
+                        resp,
+                        sent_term,
+                        sent_prev,
+                        sent_len,
+                    },
+                );
             }
 
-            Event::AppendEntriesResp { to, from, resp, sent_term, sent_prev, sent_len } => {
+            Event::AppendEntriesResp {
+                to,
+                from,
+                resp,
+                sent_term,
+                sent_prev,
+                sent_len,
+            } => {
                 if !self.up.contains(&to) {
                     return;
                 }
                 let was_leader = self.nodes[&to].role == Role::Leader;
-                let outcome =
-                    self.nodes.get_mut(&to).unwrap().handle_append_entries_response(from, sent_term, sent_prev, sent_len, resp);
+                let outcome = self
+                    .nodes
+                    .get_mut(&to)
+                    .unwrap()
+                    .handle_append_entries_response(from, sent_term, sent_prev, sent_len, resp);
                 if was_leader && self.nodes[&to].role != Role::Leader {
                     self.reset_election_timer(to);
                 }
@@ -431,18 +553,30 @@ impl SimWorld {
 
     /// Node ids currently up and in the `Leader` role.
     pub fn current_leaders(&self) -> Vec<u64> {
-        self.nodes.iter().filter(|(id, s)| self.up.contains(id) && s.role == Role::Leader).map(|(&id, _)| id).collect()
+        self.nodes
+            .iter()
+            .filter(|(id, s)| self.up.contains(id) && s.role == Role::Leader)
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// The commands a node has delivered to its state machine since it last
     /// started, in order (leader no-ops excluded).
     pub fn applied_commands(&self, node: u64) -> Vec<Vec<u8>> {
-        self.applied[&node].iter().filter(|e| !e.is_noop()).map(|e| e.command.clone()).collect()
+        self.applied[&node]
+            .iter()
+            .filter(|e| !e.is_noop())
+            .map(|e| e.command.clone())
+            .collect()
     }
 
     /// Every command any node has applied, in log order (no-ops excluded).
     pub fn committed_commands(&self) -> Vec<Vec<u8>> {
-        self.committed.values().filter(|e| !e.is_noop()).map(|e| e.command.clone()).collect()
+        self.committed
+            .values()
+            .filter(|e| !e.is_noop())
+            .map(|e| e.command.clone())
+            .collect()
     }
 
     /// Invariant violations recorded so far during the run.
@@ -470,7 +604,9 @@ impl SimWorld {
         for &(_, node, term) in &self.leadership_log {
             match seen.get(&term) {
                 Some(&existing) if existing != node => {
-                    return Err(format!("term {term} had two different leaders: node {existing} and node {node}"));
+                    return Err(format!(
+                        "term {term} had two different leaders: node {existing} and node {node}"
+                    ));
                 }
                 _ => {
                     seen.insert(term, node);
@@ -493,11 +629,16 @@ impl SimWorld {
                 for idx in 1..=shared {
                     let (ea, eb) = (la.get(idx).unwrap(), lb.get(idx).unwrap());
                     if ea.term == eb.term && ea.command != eb.command {
-                        return Err(format!("log matching: nodes {a} and {b} hold different commands at index {idx} in the same term {}", ea.term));
+                        return Err(format!(
+                            "log matching: nodes {a} and {b} hold different commands at index {idx} in the same term {}",
+                            ea.term
+                        ));
                     }
                     if ea == eb {
                         if let Some(d) = diverged_at {
-                            return Err(format!("log matching: nodes {a} and {b} differ at index {d} yet agree again at index {idx}"));
+                            return Err(format!(
+                                "log matching: nodes {a} and {b} differ at index {d} yet agree again at index {idx}"
+                            ));
                         }
                     } else if diverged_at.is_none() {
                         diverged_at = Some(idx);
@@ -515,14 +656,24 @@ impl SimWorld {
         }
         for (&node, state) in &self.nodes {
             if state.commit_index > state.log.last_index() {
-                return Err(format!("node {node}: commit_index {} is beyond its log ({})", state.commit_index, state.log.last_index()));
+                return Err(format!(
+                    "node {node}: commit_index {} is beyond its log ({})",
+                    state.commit_index,
+                    state.log.last_index()
+                ));
             }
             if state.last_applied > state.commit_index {
-                return Err(format!("node {node}: applied {} but only {} committed", state.last_applied, state.commit_index));
+                return Err(format!(
+                    "node {node}: applied {} but only {} committed",
+                    state.last_applied, state.commit_index
+                ));
             }
             for (pos, entry) in self.applied[&node].iter().enumerate() {
                 if entry.index != pos as u64 + 1 {
-                    return Err(format!("node {node}: applied entries are not contiguous at position {pos} (index {})", entry.index));
+                    return Err(format!(
+                        "node {node}: applied entries are not contiguous at position {pos} (index {})",
+                        entry.index
+                    ));
                 }
             }
         }
@@ -542,7 +693,11 @@ mod tests {
     use super::*;
 
     fn entry(term: u64, index: u64, cmd: &str) -> LogEntry {
-        LogEntry { term, index, command: cmd.as_bytes().to_vec() }
+        LogEntry {
+            term,
+            index,
+            command: cmd.as_bytes().to_vec(),
+        }
     }
 
     fn quiet_world() -> SimWorld {
@@ -562,7 +717,9 @@ mod tests {
     #[test]
     fn log_matching_catches_two_commands_at_the_same_index_and_term() {
         let mut w = quiet_world();
-        w.state_mut_for_tests(1).log.append_new(1, b"alpha".to_vec());
+        w.state_mut_for_tests(1)
+            .log
+            .append_new(1, b"alpha".to_vec());
         w.state_mut_for_tests(2).log.append_new(1, b"beta".to_vec());
         let err = w.check_log_matching().unwrap_err();
         assert!(err.contains("different commands at index 1"), "{err}");
@@ -572,7 +729,9 @@ mod tests {
     fn log_matching_catches_logs_that_diverge_and_then_agree_again() {
         let mut w = quiet_world();
         for (node, cmd) in [(1u64, "a"), (2, "b")] {
-            w.state_mut_for_tests(node).log.append_new(1, cmd.as_bytes().to_vec()); // index 1 differs (same term -> caught first)
+            w.state_mut_for_tests(node)
+                .log
+                .append_new(1, cmd.as_bytes().to_vec()); // index 1 differs (same term -> caught first)
         }
         // Make index 1 differ by TERM instead, then give both an identical index 2.
         let mut w = quiet_world();
@@ -594,7 +753,10 @@ mod tests {
             w.drain_applied_for_tests(node);
         }
         let err = w.check_state_machine_safety().unwrap_err();
-        assert!(err.contains("state machine safety") && err.contains("index 1"), "{err}");
+        assert!(
+            err.contains("state machine safety") && err.contains("index 1"),
+            "{err}"
+        );
         assert!(w.check_all().is_err());
     }
 
@@ -602,7 +764,11 @@ mod tests {
     fn bookkeeping_checks_catch_a_commit_index_beyond_the_log() {
         let mut w = quiet_world();
         w.state_mut_for_tests(1).commit_index = 5;
-        assert!(w.check_state_machine_safety().unwrap_err().contains("beyond its log"));
+        assert!(
+            w.check_state_machine_safety()
+                .unwrap_err()
+                .contains("beyond its log")
+        );
     }
 
     #[test]
@@ -612,7 +778,11 @@ mod tests {
         w.committed.insert(1, entry(1, 1, "precious"));
         // Node 3's log does not have it, and node 3 then "wins".
         w.check_leader_completeness(3);
-        assert!(w.violations()[0].contains("leader completeness"), "{:?}", w.violations());
+        assert!(
+            w.violations()[0].contains("leader completeness"),
+            "{:?}",
+            w.violations()
+        );
         assert!(w.check_state_machine_safety().is_err());
     }
 
@@ -632,8 +802,14 @@ mod tests {
         w.propose(leader, b"x".to_vec()).unwrap();
         w.run_until(SimTime(900));
         let victim = [1u64, 2, 3].into_iter().find(|&n| n != leader).unwrap();
-        let (term, last) = (w.state_of(victim).current_term, w.state_of(victim).log.last_index());
-        assert!(last >= 2, "the follower should have replicated the no-op and the command");
+        let (term, last) = (
+            w.state_of(victim).current_term,
+            w.state_of(victim).log.last_index(),
+        );
+        assert!(
+            last >= 2,
+            "the follower should have replicated the no-op and the command"
+        );
 
         w.crash(victim);
         assert!(!w.is_up(victim));
@@ -641,14 +817,24 @@ mod tests {
         assert!(w.is_up(victim));
         assert_eq!(w.state_of(victim).current_term, term);
         assert_eq!(w.state_of(victim).log.last_index(), last);
-        assert_eq!(w.state_of(victim).commit_index, 0, "commit knowledge is volatile and relearned");
+        assert_eq!(
+            w.state_of(victim).commit_index,
+            0,
+            "commit knowledge is volatile and relearned"
+        );
     }
 
     #[test]
     fn a_proposal_to_a_follower_or_a_dead_node_is_refused() {
         let mut w = quiet_world();
-        assert!(matches!(w.propose(1, b"x".to_vec()), Err(ConsensusError::NotLeader)));
+        assert!(matches!(
+            w.propose(1, b"x".to_vec()),
+            Err(ConsensusError::NotLeader)
+        ));
         w.crash(2);
-        assert!(matches!(w.propose(2, b"x".to_vec()), Err(ConsensusError::Stopped)));
+        assert!(matches!(
+            w.propose(2, b"x".to_vec()),
+            Err(ConsensusError::Stopped)
+        ));
     }
 }

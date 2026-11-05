@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sentinel_consensus::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse, Transport, TransportError};
+use sentinel_consensus::{
+    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+    Transport, TransportError,
+};
 
 /// Sends Raft RPCs to peers over mTLS using the same client identity
 /// this node presents for everything else. Peer addresses are resolved
@@ -19,7 +22,10 @@ impl HttpTransport {
     }
 
     fn base_url(&self, peer_id: u64) -> Result<&str, TransportError> {
-        self.peer_addrs.get(&peer_id).map(|s| s.as_str()).ok_or(TransportError::Unreachable(peer_id))
+        self.peer_addrs
+            .get(&peer_id)
+            .map(|s| s.as_str())
+            .ok_or(TransportError::Unreachable(peer_id))
     }
 }
 
@@ -86,7 +92,11 @@ impl<T: SealForwarder + ?Sized> SealForwarder for Arc<T> {
 
 #[async_trait::async_trait]
 impl Transport for HttpTransport {
-    async fn send_request_vote(&self, peer_id: u64, req: RequestVoteRequest) -> Result<RequestVoteResponse, TransportError> {
+    async fn send_request_vote(
+        &self,
+        peer_id: u64,
+        req: RequestVoteRequest,
+    ) -> Result<RequestVoteResponse, TransportError> {
         let url = format!("{}/raft/vote", self.base_url(peer_id)?);
         self.client
             .post(&url)
@@ -126,7 +136,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A tiny plain-HTTP stand-in for a peer's `/raft/seal-request`.
-    async fn fake_peer(status: StatusCode, hits: Arc<AtomicUsize>, last_reason: Arc<std::sync::Mutex<String>>) -> String {
+    async fn fake_peer(
+        status: StatusCode,
+        hits: Arc<AtomicUsize>,
+        last_reason: Arc<std::sync::Mutex<String>>,
+    ) -> String {
         let app = Router::new().route(
             "/raft/seal-request",
             post(move |Json(body): Json<serde_json::Value>| {
@@ -134,7 +148,8 @@ mod tests {
                 let last_reason = last_reason.clone();
                 async move {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    *last_reason.lock().unwrap() = body["reason"].as_str().unwrap_or("").to_string();
+                    *last_reason.lock().unwrap() =
+                        body["reason"].as_str().unwrap_or("").to_string();
                     status
                 }
             }),
@@ -150,14 +165,32 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let reason = Arc::new(std::sync::Mutex::new(String::new()));
         let leader = fake_peer(StatusCode::ACCEPTED, hits.clone(), reason.clone()).await;
-        let follower = fake_peer(StatusCode::MISDIRECTED_REQUEST, hits.clone(), reason.clone()).await;
+        let follower = fake_peer(
+            StatusCode::MISDIRECTED_REQUEST,
+            hits.clone(),
+            reason.clone(),
+        )
+        .await;
 
-        let peers: HashMap<u64, String> = [(2, leader), (3, follower), (4, "http://127.0.0.1:1".to_string())].into_iter().collect();
+        let peers: HashMap<u64, String> = [
+            (2, leader),
+            (3, follower),
+            (4, "http://127.0.0.1:1".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let transport = HttpTransport::new(reqwest::Client::new(), peers);
 
         let accepted = transport.forward_seal("anomaly on node 1").await;
-        assert_eq!(accepted, 1, "only the leader accepts; the follower and the dead peer do not");
-        assert_eq!(hits.load(Ordering::SeqCst), 2, "both reachable peers were asked");
+        assert_eq!(
+            accepted, 1,
+            "only the leader accepts; the follower and the dead peer do not"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "both reachable peers were asked"
+        );
         assert_eq!(&*reason.lock().unwrap(), "anomaly on node 1");
     }
 

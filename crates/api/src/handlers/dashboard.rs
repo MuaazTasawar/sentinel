@@ -1,7 +1,7 @@
-use axum::response::Html;
-use axum::extract::State;
 use axum::Json;
-use serde_json::{json, Value};
+use axum::extract::State;
+use axum::response::Html;
+use serde_json::{Value, json};
 
 use crate::state::AppState;
 
@@ -16,10 +16,21 @@ pub async fn dashboard_status(State(state): State<AppState>) -> Json<Value> {
 
     let sealed = state.kek.lock().await.is_none();
 
-    let (audit_verified, audit_entry_count, audit_tip_hash, recent_events, audit_persistent, audit_healthy) = {
+    let (
+        audit_verified,
+        audit_entry_count,
+        audit_tip_hash,
+        recent_events,
+        audit_persistent,
+        audit_healthy,
+    ) = {
         let chain = state.audit.lock().await;
         let verified = chain.verify().is_ok();
-        let tip_hash = chain.tip_hash().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let tip_hash = chain
+            .tip_hash()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let recent: Vec<Value> = chain
             .entries()
             .iter()
@@ -27,7 +38,14 @@ pub async fn dashboard_status(State(state): State<AppState>) -> Json<Value> {
             .take(10)
             .map(|e| json!({ "index": e.index, "timestamp": e.timestamp.to_rfc3339(), "event": e.event }))
             .collect();
-        (verified, chain.entries().len(), tip_hash, recent, chain.is_persistent(), chain.is_healthy())
+        (
+            verified,
+            chain.entries().len(),
+            tip_hash,
+            recent,
+            chain.is_persistent(),
+            chain.is_healthy(),
+        )
     };
 
     let anomaly_snapshot = state.anomaly_detector.lock().await.snapshot();
@@ -66,19 +84,26 @@ pub async fn dashboard_page() -> Html<&'static str> {
 mod tests {
     use super::*;
     use crate::state::test_support::sealed_state;
-    use axum::{routing::get, Router};
+    use axum::{Router, routing::get};
     use tower::ServiceExt;
 
     #[tokio::test]
     async fn status_payload_reflects_real_subsystem_state() {
         let (state, _dir) = sealed_state().await;
         state.audit.lock().await.append("node started");
-        let router = Router::new().route("/api/status", get(dashboard_status)).with_state(state);
+        let router = Router::new()
+            .route("/api/status", get(dashboard_status))
+            .with_state(state);
 
-        let req = axum::http::Request::builder().uri("/api/status").body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder()
+            .uri("/api/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(json["role"], "Leader");
@@ -86,7 +111,10 @@ mod tests {
         assert_eq!(json["sealed"], true);
         assert_eq!(json["audit"]["verified"], true);
         assert_eq!(json["audit"]["entry_count"], 1);
-        assert_eq!(json["audit"]["persistent"], false, "the test fixture uses an in-memory chain");
+        assert_eq!(
+            json["audit"]["persistent"], false,
+            "the test fixture uses an in-memory chain"
+        );
         assert_eq!(json["audit"]["healthy"], true);
         assert_eq!(json["audit"]["recent_events"][0]["event"], "node started");
         assert_eq!(json["anomaly"]["current_count"], 0);
@@ -95,10 +123,18 @@ mod tests {
     #[tokio::test]
     async fn dashboard_page_serves_html() {
         let router: Router = Router::new().route("/", get(dashboard_page));
-        let req = axum::http::Request::builder().uri("/").body(axum::body::Body::empty()).unwrap();
+        let req = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
-        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(content_type.contains("text/html"));
     }
 }
