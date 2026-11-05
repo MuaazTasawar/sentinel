@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::ConsensusError;
 use crate::log::{LogEntry, LogError, ReplicatedLog};
 use crate::persist::PersistedState;
-use crate::rpc::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse};
-use crate::ConsensusError;
+use crate::rpc::{
+    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+};
 
 /// Upper bound on entries carried by one AppendEntries message, so a
 /// far-behind follower is caught up in bounded chunks rather than one
@@ -87,14 +89,18 @@ impl RaftState {
 
     pub fn is_log_up_to_date(&self, candidate_last_term: u64, candidate_last_index: u64) -> bool {
         let (my_term, my_index) = (self.log.last_term(), self.log.last_index());
-        candidate_last_term > my_term || (candidate_last_term == my_term && candidate_last_index >= my_index)
+        candidate_last_term > my_term
+            || (candidate_last_term == my_term && candidate_last_index >= my_index)
     }
 
     pub fn handle_request_vote(&mut self, req: RequestVoteRequest) -> RequestVoteResponse {
         self.step_down_if_stale(req.term);
 
         if req.term < self.current_term {
-            return RequestVoteResponse { term: self.current_term, vote_granted: false };
+            return RequestVoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+            };
         }
 
         let can_vote = match self.voted_for {
@@ -105,9 +111,15 @@ impl RaftState {
 
         if can_vote && log_ok {
             self.voted_for = Some(req.candidate_id);
-            RequestVoteResponse { term: self.current_term, vote_granted: true }
+            RequestVoteResponse {
+                term: self.current_term,
+                vote_granted: true,
+            }
         } else {
-            RequestVoteResponse { term: self.current_term, vote_granted: false }
+            RequestVoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+            }
         }
     }
 
@@ -115,20 +127,35 @@ impl RaftState {
         self.step_down_if_stale(req.term);
 
         if req.term < self.current_term {
-            return AppendEntriesResponse { term: self.current_term, success: false, match_index: None };
+            return AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: None,
+            };
         }
 
         self.role = Role::Follower;
 
-        match self.log.append_entries(req.prev_log_index, req.prev_log_term, &req.entries) {
+        match self
+            .log
+            .append_entries(req.prev_log_index, req.prev_log_term, &req.entries)
+        {
             Ok(()) => {
                 let new_last_index = req.prev_log_index + req.entries.len() as u64;
                 if req.leader_commit > self.commit_index {
                     self.commit_index = req.leader_commit.min(new_last_index);
                 }
-                AppendEntriesResponse { term: self.current_term, success: true, match_index: Some(new_last_index) }
+                AppendEntriesResponse {
+                    term: self.current_term,
+                    success: true,
+                    match_index: Some(new_last_index),
+                }
             }
-            Err(_) => AppendEntriesResponse { term: self.current_term, success: false, match_index: None },
+            Err(_) => AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: None,
+            },
         }
     }
 
@@ -147,7 +174,12 @@ impl RaftState {
         }
     }
 
-    pub fn record_vote(&mut self, resp: RequestVoteResponse, voter_id: u64, cluster_size: usize) -> bool {
+    pub fn record_vote(
+        &mut self,
+        resp: RequestVoteResponse,
+        voter_id: u64,
+        cluster_size: usize,
+    ) -> bool {
         self.step_down_if_stale(resp.term);
         if self.role != Role::Candidate || resp.term != self.current_term {
             return false;
@@ -160,7 +192,11 @@ impl RaftState {
     }
 
     pub fn become_leader(&mut self) {
-        debug_assert_eq!(self.role, Role::Candidate, "only a candidate can become leader");
+        debug_assert_eq!(
+            self.role,
+            Role::Candidate,
+            "only a candidate can become leader"
+        );
         self.role = Role::Leader;
     }
 
@@ -234,10 +270,16 @@ impl RaftState {
 
         // A higher term anywhere means we are no longer the leader.
         self.step_down_if_stale(resp.term);
-        if self.role != Role::Leader || sent_term != self.current_term || resp.term != self.current_term {
+        if self.role != Role::Leader
+            || sent_term != self.current_term
+            || resp.term != self.current_term
+        {
             return outcome;
         }
-        let (Some(matched), Some(next)) = (self.match_index.get_mut(&peer), self.next_index.get_mut(&peer)) else {
+        let (Some(matched), Some(next)) = (
+            self.match_index.get_mut(&peer),
+            self.next_index.get_mut(&peer),
+        ) else {
             return outcome;
         };
 
@@ -314,7 +356,12 @@ mod tests {
     #[test]
     fn grants_vote_to_first_candidate_in_a_new_term() {
         let mut follower = RaftState::new(1);
-        let req = RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 };
+        let req = RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
         let resp = follower.handle_request_vote(req);
         assert!(resp.vote_granted);
         assert_eq!(follower.voted_for, Some(2));
@@ -323,16 +370,36 @@ mod tests {
     #[test]
     fn denies_second_candidate_in_the_same_term() {
         let mut follower = RaftState::new(1);
-        follower.handle_request_vote(RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
-        let resp = follower.handle_request_vote(RequestVoteRequest { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 });
+        follower.handle_request_vote(RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+        let resp = follower.handle_request_vote(RequestVoteRequest {
+            term: 1,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
         assert!(!resp.vote_granted);
     }
 
     #[test]
     fn regrants_vote_to_same_candidate_on_retry() {
         let mut follower = RaftState::new(1);
-        follower.handle_request_vote(RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
-        let resp = follower.handle_request_vote(RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
+        follower.handle_request_vote(RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+        let resp = follower.handle_request_vote(RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
         assert!(resp.vote_granted);
     }
 
@@ -340,7 +407,12 @@ mod tests {
     fn denies_vote_for_stale_term() {
         let mut follower = RaftState::new(1);
         follower.current_term = 5;
-        let resp = follower.handle_request_vote(RequestVoteRequest { term: 3, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
+        let resp = follower.handle_request_vote(RequestVoteRequest {
+            term: 3,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
         assert!(!resp.vote_granted);
         assert_eq!(resp.term, 5);
     }
@@ -350,7 +422,12 @@ mod tests {
         let mut follower = RaftState::new(1);
         follower.log.append_new(1, vec![1]);
         follower.log.append_new(2, vec![2]);
-        let req = RequestVoteRequest { term: 3, candidate_id: 2, last_log_index: 5, last_log_term: 1 };
+        let req = RequestVoteRequest {
+            term: 3,
+            candidate_id: 2,
+            last_log_index: 5,
+            last_log_term: 1,
+        };
         let resp = follower.handle_request_vote(req);
         assert!(!resp.vote_granted);
     }
@@ -358,10 +435,20 @@ mod tests {
     #[test]
     fn higher_term_forces_step_down_and_clears_prior_vote() {
         let mut node = RaftState::new(1);
-        node.handle_request_vote(RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
+        node.handle_request_vote(RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
         assert_eq!(node.voted_for, Some(2));
 
-        let resp = node.handle_request_vote(RequestVoteRequest { term: 2, candidate_id: 3, last_log_index: 0, last_log_term: 0 });
+        let resp = node.handle_request_vote(RequestVoteRequest {
+            term: 2,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
         assert!(resp.vote_granted);
         assert_eq!(node.current_term, 2);
         assert_eq!(node.voted_for, Some(3));
@@ -376,8 +463,16 @@ mod tests {
             prev_log_index: 0,
             prev_log_term: 0,
             entries: vec![
-                crate::log::LogEntry { term: 1, index: 1, command: vec![1] },
-                crate::log::LogEntry { term: 1, index: 2, command: vec![2] },
+                crate::log::LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: vec![1],
+                },
+                crate::log::LogEntry {
+                    term: 1,
+                    index: 2,
+                    command: vec![2],
+                },
             ],
             leader_commit: 1,
         };
@@ -394,7 +489,11 @@ mod tests {
             leader_id: 2,
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![crate::log::LogEntry { term: 1, index: 1, command: vec![1] }],
+            entries: vec![crate::log::LogEntry {
+                term: 1,
+                index: 1,
+                command: vec![1],
+            }],
             leader_commit: 10,
         };
         let resp = follower.handle_append_entries(req);
@@ -462,7 +561,12 @@ mod tests {
         let mut follower_a = RaftState::new(4);
         let mut follower_b = RaftState::new(5);
 
-        let vote_req_2 = RequestVoteRequest { term: 1, candidate_id: 2, last_log_index: 0, last_log_term: 0 };
+        let vote_req_2 = RequestVoteRequest {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
         follower_a.handle_request_vote(vote_req_2.clone());
         follower_b.handle_request_vote(vote_req_2);
 
@@ -471,7 +575,12 @@ mod tests {
         candidate_3.role = Role::Candidate;
         candidate_3.voted_for = Some(3);
 
-        let vote_req_3 = RequestVoteRequest { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
+        let vote_req_3 = RequestVoteRequest {
+            term: 1,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
         let resp_a = follower_a.handle_request_vote(vote_req_3.clone());
         let resp_b = follower_b.handle_request_vote(vote_req_3);
 
@@ -485,22 +594,54 @@ mod tests {
             term: 9,
             voted_for: Some(3),
             entries: vec![
-                LogEntry { term: 2, index: 1, command: vec![1] },
-                LogEntry { term: 9, index: 2, command: vec![2] },
+                LogEntry {
+                    term: 2,
+                    index: 1,
+                    command: vec![1],
+                },
+                LogEntry {
+                    term: 9,
+                    index: 2,
+                    command: vec![2],
+                },
             ],
         };
         let s = RaftState::restore(1, persisted).unwrap();
-        assert_eq!((s.current_term, s.voted_for, s.role), (9, Some(3), Role::Follower));
+        assert_eq!(
+            (s.current_term, s.voted_for, s.role),
+            (9, Some(3), Role::Follower)
+        );
         assert_eq!((s.log.last_index(), s.log.last_term()), (2, 9));
         assert_eq!((s.commit_index, s.last_applied), (0, 0));
     }
 
     #[test]
     fn a_restored_node_cannot_vote_twice_in_the_term_it_already_voted_in() {
-        let mut s = RaftState::restore(1, PersistedState { term: 4, voted_for: Some(2), entries: vec![] }).unwrap();
-        let other = s.handle_request_vote(RequestVoteRequest { term: 4, candidate_id: 3, last_log_index: 0, last_log_term: 0 });
-        assert!(!other.vote_granted, "the vote for node 2 in term 4 survived the restart");
-        let same = s.handle_request_vote(RequestVoteRequest { term: 4, candidate_id: 2, last_log_index: 0, last_log_term: 0 });
+        let mut s = RaftState::restore(
+            1,
+            PersistedState {
+                term: 4,
+                voted_for: Some(2),
+                entries: vec![],
+            },
+        )
+        .unwrap();
+        let other = s.handle_request_vote(RequestVoteRequest {
+            term: 4,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+        assert!(
+            !other.vote_granted,
+            "the vote for node 2 in term 4 survived the restart"
+        );
+        let same = s.handle_request_vote(RequestVoteRequest {
+            term: 4,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
         assert!(same.vote_granted);
     }
 
@@ -516,10 +657,18 @@ mod tests {
     }
 
     fn ok(match_index: u64, term: u64) -> AppendEntriesResponse {
-        AppendEntriesResponse { term, success: true, match_index: Some(match_index) }
+        AppendEntriesResponse {
+            term,
+            success: true,
+            match_index: Some(match_index),
+        }
     }
     fn rejected(term: u64) -> AppendEntriesResponse {
-        AppendEntriesResponse { term, success: false, match_index: None }
+        AppendEntriesResponse {
+            term,
+            success: false,
+            match_index: None,
+        }
     }
 
     #[test]
@@ -536,21 +685,33 @@ mod tests {
     #[test]
     fn a_single_node_leader_commits_its_own_entries_immediately() {
         let mut s = leader_of(1, 1, &[]);
-        assert_eq!(s.commit_index, 1, "the no-op is committed by the lone node's own vote");
+        assert_eq!(
+            s.commit_index, 1,
+            "the no-op is committed by the lone node's own vote"
+        );
         let idx = s.append_as_leader(b"x".to_vec()).unwrap();
         assert_eq!(idx, 2);
         assert_eq!(s.commit_index, 2);
         let applied: Vec<u64> = s.take_newly_committed().iter().map(|e| e.index).collect();
         assert_eq!(applied, vec![1, 2]);
-        assert!(s.take_newly_committed().is_empty(), "each entry is delivered exactly once");
+        assert!(
+            s.take_newly_committed().is_empty(),
+            "each entry is delivered exactly once"
+        );
     }
 
     #[test]
     fn only_the_leader_accepts_commands_and_empty_commands_are_reserved() {
         let mut follower = RaftState::new(2);
-        assert!(matches!(follower.append_as_leader(b"x".to_vec()), Err(ConsensusError::NotLeader)));
+        assert!(matches!(
+            follower.append_as_leader(b"x".to_vec()),
+            Err(ConsensusError::NotLeader)
+        ));
         let mut leader = leader_of(1, 1, &[2, 3]);
-        assert!(matches!(leader.append_as_leader(vec![]), Err(ConsensusError::EmptyCommand)));
+        assert!(matches!(
+            leader.append_as_leader(vec![]),
+            Err(ConsensusError::EmptyCommand)
+        ));
     }
 
     #[test]
@@ -573,7 +734,10 @@ mod tests {
         // Peer 3 hasn't acked anything, so it still gets the full backlog.
         assert_eq!(s.build_append_entries(3).unwrap().entries.len(), 3);
         assert!(s.build_append_entries(99).is_none(), "unknown peer");
-        assert!(RaftState::new(1).build_append_entries(2).is_none(), "not a leader");
+        assert!(
+            RaftState::new(1).build_append_entries(2).is_none(),
+            "not a leader"
+        );
     }
 
     #[test]
@@ -582,7 +746,10 @@ mod tests {
         for i in 0..(MAX_ENTRIES_PER_APPEND + 10) {
             s.append_as_leader(vec![(i % 250) as u8 + 1]).unwrap();
         }
-        assert_eq!(s.build_append_entries(2).unwrap().entries.len(), MAX_ENTRIES_PER_APPEND);
+        assert_eq!(
+            s.build_append_entries(2).unwrap().entries.len(),
+            MAX_ENTRIES_PER_APPEND
+        );
     }
 
     #[test]
@@ -591,7 +758,10 @@ mod tests {
         s.append_as_leader(b"a".to_vec()).unwrap(); // index 2
 
         let out = s.handle_append_entries_response(2, 1, 0, 2, ok(2, 1));
-        assert!(out.commit_advanced, "leader + one peer is a majority of three");
+        assert!(
+            out.commit_advanced,
+            "leader + one peer is a majority of three"
+        );
         assert_eq!(s.commit_index, 2);
 
         // The second peer acknowledging later changes nothing further.
@@ -623,7 +793,10 @@ mod tests {
 
         // A majority acknowledges only the old entry.
         s.handle_append_entries_response(2, 2, 0, 1, ok(1, 2));
-        assert_eq!(s.commit_index, 0, "index 1 is from term 1; it must not commit by replica count");
+        assert_eq!(
+            s.commit_index, 0,
+            "index 1 is from term 1; it must not commit by replica count"
+        );
 
         // Once a majority holds the current-term no-op, both commit together.
         s.handle_append_entries_response(2, 2, 0, 2, ok(2, 2));
@@ -671,7 +844,17 @@ mod tests {
     #[test]
     fn a_reply_with_a_higher_term_deposes_the_leader() {
         let mut s = leader_of(1, 1, &[2, 3]);
-        let out = s.handle_append_entries_response(2, 1, 0, 1, AppendEntriesResponse { term: 5, success: false, match_index: None });
+        let out = s.handle_append_entries_response(
+            2,
+            1,
+            0,
+            1,
+            AppendEntriesResponse {
+                term: 5,
+                success: false,
+                match_index: None,
+            },
+        );
         assert_eq!(out, ReplicationOutcome::default());
         assert_eq!(s.role, Role::Follower);
         assert_eq!(s.current_term, 5);
@@ -698,7 +881,11 @@ mod tests {
 
         let out = s.handle_append_entries_response(2, 2, 1, 0, rejected(3));
         assert_eq!(out, ReplicationOutcome::default());
-        assert_eq!(s.replication_progress(2), Some((2, 1)), "progress must be untouched");
+        assert_eq!(
+            s.replication_progress(2),
+            Some((2, 1)),
+            "progress must be untouched"
+        );
     }
 
     #[test]
@@ -719,11 +906,20 @@ mod tests {
         s.append_as_leader(b"a".to_vec()).unwrap();
         s.handle_append_entries_response(2, 1, 0, 2, ok(2, 1));
         // Lose leadership, then win again in a later term.
-        s.handle_request_vote(RequestVoteRequest { term: 2, candidate_id: 3, last_log_index: 9, last_log_term: 9 });
+        s.handle_request_vote(RequestVoteRequest {
+            term: 2,
+            candidate_id: 3,
+            last_log_index: 9,
+            last_log_term: 9,
+        });
         assert_eq!(s.role, Role::Follower);
         s.become_candidate();
         s.become_leader();
         s.on_elected(&[2, 3]);
-        assert_eq!(s.replication_progress(2).unwrap().1, 0, "match_index must restart from zero");
+        assert_eq!(
+            s.replication_progress(2).unwrap().1,
+            0,
+            "match_index must restart from zero"
+        );
     }
 }

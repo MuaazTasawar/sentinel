@@ -111,7 +111,8 @@ impl NodeConfig {
     /// The node's auto-seal detector: 1 s buckets, a 60-bucket rolling
     /// baseline, z > 3.0, plus the `anomaly_min_burst` count floor.
     pub fn anomaly_detector(&self) -> sentinel_anomaly::AnomalyDetector {
-        sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_secs(1), 60, 3.0).with_min_burst(self.anomaly_min_burst)
+        sentinel_anomaly::AnomalyDetector::new(std::time::Duration::from_secs(1), 60, 3.0)
+            .with_min_burst(self.anomaly_min_burst)
     }
 
     pub fn audit_path(&self) -> std::path::PathBuf {
@@ -138,10 +139,16 @@ impl NodeConfig {
 
     /// Testable core of `load`. `env_override` replaces the real process
     /// environment when `Some`, so tests never have to mutate global state.
-    pub(crate) fn build(file: Option<&Path>, env_override: Option<HashMap<String, String>>) -> anyhow::Result<Self> {
+    pub(crate) fn build(
+        file: Option<&Path>,
+        env_override: Option<HashMap<String, String>>,
+    ) -> anyhow::Result<Self> {
         let mut builder = config::Config::builder();
         if let Some(path) = file {
-            builder = builder.add_source(config::File::new(&path.to_string_lossy(), config::FileFormat::Toml).required(false));
+            builder = builder.add_source(
+                config::File::new(&path.to_string_lossy(), config::FileFormat::Toml)
+                    .required(false),
+            );
         }
         let env = config::Environment::with_prefix("SENTINEL")
             .prefix_separator("__")
@@ -172,15 +179,17 @@ impl NodeConfig {
             if entry.is_empty() {
                 continue;
             }
-            let (id_str, addr) = entry
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("malformed peer entry {entry:?}, expected \"<node_id>=<url>\""))?;
+            let (id_str, addr) = entry.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("malformed peer entry {entry:?}, expected \"<node_id>=<url>\"")
+            })?;
             let id: u64 = id_str
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid node id in peer entry {entry:?}"))?;
             if id == self.node_id {
-                anyhow::bail!("peer entry {entry:?} lists this node's own id ({id}); a node must not be its own peer");
+                anyhow::bail!(
+                    "peer entry {entry:?} lists this node's own id ({id}); a node must not be its own peer"
+                );
             }
             if out.insert(id, addr.trim().to_string()).is_some() {
                 anyhow::bail!("duplicate peer id {id} in config");
@@ -212,7 +221,10 @@ mod tests {
     #[test]
     fn peers_can_come_from_a_comma_separated_env_var() {
         let mut env = base_env();
-        env.insert("SENTINEL__PEERS".into(), "2=https://10.0.0.2:8443,3=https://10.0.0.3:8443".into());
+        env.insert(
+            "SENTINEL__PEERS".into(),
+            "2=https://10.0.0.2:8443,3=https://10.0.0.3:8443".into(),
+        );
         let cfg = NodeConfig::build(None, Some(env)).unwrap();
         let peers = cfg.parse_peer_addrs().unwrap();
         assert_eq!(peers.len(), 2);
@@ -249,7 +261,10 @@ mod tests {
         env.insert("SENTINEL__NODE_ID".to_string(), "4".to_string());
         let cfg = NodeConfig::build(Some(&path), Some(env)).unwrap();
         assert_eq!(cfg.node_id, 4, "env must beat the file");
-        assert_eq!(cfg.storage_path, "file-data", "file values not overridden by env still apply");
+        assert_eq!(
+            cfg.storage_path, "file-data",
+            "file values not overridden by env still apply"
+        );
         assert_eq!(cfg.parse_peer_addrs().unwrap()[&2], "https://file:1");
     }
 
@@ -260,7 +275,10 @@ mod tests {
 
         let mut env = base_env();
         env.insert("SENTINEL__UNSEAL_THRESHOLD".into(), "3".into());
-        assert_eq!(NodeConfig::build(None, Some(env)).unwrap().unseal_threshold, 3);
+        assert_eq!(
+            NodeConfig::build(None, Some(env)).unwrap().unseal_threshold,
+            3
+        );
     }
 
     #[test]
@@ -273,15 +291,23 @@ mod tests {
         env.insert("SENTINEL__RAFT_DIR".into(), "/var/lib/sentinel/raft".into());
         env.insert("SENTINEL__COMMIT_TIMEOUT_MS".into(), "250".into());
         let cfg = NodeConfig::build(None, Some(env)).unwrap();
-        assert_eq!(cfg.raft_dir(), std::path::PathBuf::from("/var/lib/sentinel/raft"));
+        assert_eq!(
+            cfg.raft_dir(),
+            std::path::PathBuf::from("/var/lib/sentinel/raft")
+        );
         assert_eq!(cfg.commit_timeout_ms, 250);
     }
 
     #[test]
     fn authorization_lists_come_from_comma_separated_env_vars_and_default_to_empty_and_secure() {
         let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
-        assert!(cfg.admin_cns.is_empty() && cfg.peer_cns.is_empty() && cfg.revoked_serials.is_empty());
-        assert!(!cfg.insecure_allow_any_client, "the insecure switch must default to off");
+        assert!(
+            cfg.admin_cns.is_empty() && cfg.peer_cns.is_empty() && cfg.revoked_serials.is_empty()
+        );
+        assert!(
+            !cfg.insecure_allow_any_client,
+            "the insecure switch must default to off"
+        );
 
         let mut env = base_env();
         env.insert("SENTINEL__ADMIN_CNS".into(), "root,deputy".into());
@@ -299,16 +325,31 @@ mod tests {
     #[test]
     fn audit_and_provisioning_settings_default_to_safe_values() {
         let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
-        assert_eq!(cfg.audit_path(), std::path::PathBuf::from("data.audit.jsonl"));
+        assert_eq!(
+            cfg.audit_path(),
+            std::path::PathBuf::from("data.audit.jsonl")
+        );
         assert!(cfg.canary_file.is_none());
-        assert!(!cfg.allow_canary_bootstrap, "trust-on-first-use must be opt-in");
+        assert!(
+            !cfg.allow_canary_bootstrap,
+            "trust-on-first-use must be opt-in"
+        );
 
         let mut env = base_env();
-        env.insert("SENTINEL__AUDIT_PATH".into(), "/var/log/sentinel/audit.jsonl".into());
-        env.insert("SENTINEL__CANARY_FILE".into(), "/etc/sentinel/canary.bin".into());
+        env.insert(
+            "SENTINEL__AUDIT_PATH".into(),
+            "/var/log/sentinel/audit.jsonl".into(),
+        );
+        env.insert(
+            "SENTINEL__CANARY_FILE".into(),
+            "/etc/sentinel/canary.bin".into(),
+        );
         env.insert("SENTINEL__ALLOW_CANARY_BOOTSTRAP".into(), "true".into());
         let cfg = NodeConfig::build(None, Some(env)).unwrap();
-        assert_eq!(cfg.audit_path(), std::path::PathBuf::from("/var/log/sentinel/audit.jsonl"));
+        assert_eq!(
+            cfg.audit_path(),
+            std::path::PathBuf::from("/var/log/sentinel/audit.jsonl")
+        );
         assert_eq!(cfg.canary_file.as_deref(), Some("/etc/sentinel/canary.bin"));
         assert!(cfg.allow_canary_bootstrap);
     }
@@ -320,11 +361,19 @@ mod tests {
 
         let mut env = base_env();
         env.insert("SENTINEL__ANOMALY_MIN_BURST".into(), "25".into());
-        assert_eq!(NodeConfig::build(None, Some(env)).unwrap().anomaly_min_burst, 25);
+        assert_eq!(
+            NodeConfig::build(None, Some(env))
+                .unwrap()
+                .anomaly_min_burst,
+            25
+        );
 
         let mut env = base_env();
         env.insert("SENTINEL__ANOMALY_MIN_BURST".into(), "not-a-number".into());
-        assert!(NodeConfig::build(None, Some(env)).is_err(), "garbage must fail loudly, not fall back");
+        assert!(
+            NodeConfig::build(None, Some(env)).is_err(),
+            "garbage must fail loudly, not fall back"
+        );
     }
 
     #[test]
@@ -334,17 +383,28 @@ mod tests {
         let t0 = std::time::Instant::now();
         let lone_reads_flagged = |cfg: &NodeConfig| {
             let mut d = cfg.anomaly_detector();
-            let flagged: Vec<bool> = (0..6).map(|i| d.record_access(t0 + std::time::Duration::from_secs(i * 20)).is_some()).collect();
+            let flagged: Vec<bool> = (0..6)
+                .map(|i| {
+                    d.record_access(t0 + std::time::Duration::from_secs(i * 20))
+                        .is_some()
+                })
+                .collect();
             flagged.into_iter().any(|f| f)
         };
 
         let default_cfg = NodeConfig::build(None, Some(base_env())).unwrap();
-        assert!(!lone_reads_flagged(&default_cfg), "with the default floor, lone reads 20 s apart must never flag");
+        assert!(
+            !lone_reads_flagged(&default_cfg),
+            "with the default floor, lone reads 20 s apart must never flag"
+        );
 
         let mut env = base_env();
         env.insert("SENTINEL__ANOMALY_MIN_BURST".into(), "1".into());
         let no_floor = NodeConfig::build(None, Some(env)).unwrap();
-        assert!(lone_reads_flagged(&no_floor), "a floor of 1 is the old behaviour, which does flag them");
+        assert!(
+            lone_reads_flagged(&no_floor),
+            "a floor of 1 is the old behaviour, which does flag them"
+        );
 
         // And a real burst still flags under the default floor.
         let mut d = default_cfg.anomaly_detector();
@@ -352,7 +412,10 @@ mod tests {
             d.record_access(t0 + std::time::Duration::from_secs(i));
         }
         let burst = t0 + std::time::Duration::from_secs(30);
-        assert!((0..40).any(|_| d.record_access(burst).is_some()), "a 40-read burst in one second still flags");
+        assert!(
+            (0..40).any(|_| d.record_access(burst).is_some()),
+            "a 40-read burst in one second still flags"
+        );
     }
 
     #[test]
@@ -367,10 +430,23 @@ mod tests {
     fn a_node_cannot_list_itself_or_a_peer_twice() {
         let mut env = base_env();
         env.insert("SENTINEL__PEERS".into(), "1=https://self:1".into());
-        assert!(NodeConfig::build(None, Some(env)).unwrap().parse_peer_addrs().is_err());
+        assert!(
+            NodeConfig::build(None, Some(env))
+                .unwrap()
+                .parse_peer_addrs()
+                .is_err()
+        );
 
         let mut env = base_env();
-        env.insert("SENTINEL__PEERS".into(), "2=https://a:1,2=https://b:1".into());
-        assert!(NodeConfig::build(None, Some(env)).unwrap().parse_peer_addrs().is_err());
+        env.insert(
+            "SENTINEL__PEERS".into(),
+            "2=https://a:1,2=https://b:1".into(),
+        );
+        assert!(
+            NodeConfig::build(None, Some(env))
+                .unwrap()
+                .parse_peer_addrs()
+                .is_err()
+        );
     }
 }

@@ -19,12 +19,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
-use rand::rngs::OsRng;
+use anyhow::{Context, bail};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use sentinel_crypto::envelope::{self, EnvelopeCiphertext, KEY_LEN};
 use sentinel_crypto::shamir::{self, ShamirShare};
-use sentinel_crypto::{canary, kdf, SecretBytes};
+use sentinel_crypto::{SecretBytes, canary, kdf};
 use serde::{Deserialize, Serialize};
 
 pub const MIN_PASSPHRASE_LEN: usize = 12;
@@ -75,11 +75,15 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn passphrase_key(passphrase: &str, salt: &[u8]) -> anyhow::Result<SecretBytes> {
-    kdf::derive_kek_argon2(passphrase.as_bytes(), salt).map_err(|_| anyhow::anyhow!("key derivation failed"))
+    kdf::derive_kek_argon2(passphrase.as_bytes(), salt)
+        .map_err(|_| anyhow::anyhow!("key derivation failed"))
 }
 
 /// Encrypts a holder's bincode-encoded share under their passphrase.
@@ -89,9 +93,18 @@ pub fn seal_share(holder: &str, share_bytes: &[u8], passphrase: &str) -> anyhow:
     }
     let salt = kdf::random_salt();
     let key = passphrase_key(passphrase, &salt)?;
-    let payload = bincode::serialize(&SharePayload { holder: holder.to_string(), share: share_bytes.to_vec() })?;
-    let envelope = envelope::encrypt(&key, &payload).map_err(|_| anyhow::anyhow!("encryption failed"))?;
-    let file = ShareFile { version: 1, kdf: "argon2id".into(), salt: to_hex(&salt), envelope };
+    let payload = bincode::serialize(&SharePayload {
+        holder: holder.to_string(),
+        share: share_bytes.to_vec(),
+    })?;
+    let envelope =
+        envelope::encrypt(&key, &payload).map_err(|_| anyhow::anyhow!("encryption failed"))?;
+    let file = ShareFile {
+        version: 1,
+        kdf: "argon2id".into(),
+        salt: to_hex(&salt),
+        envelope,
+    };
     Ok(serde_json::to_string_pretty(&file)?)
 }
 
@@ -99,14 +112,23 @@ pub fn seal_share(holder: &str, share_bytes: &[u8], passphrase: &str) -> anyhow:
 /// bincode-encoded share. A wrong passphrase and a damaged file are
 /// deliberately indistinguishable.
 pub fn open_share(file_json: &str, passphrase: &str) -> anyhow::Result<(String, Vec<u8>)> {
-    let file: ShareFile = serde_json::from_str(file_json).context("this is not a Sentinel share file")?;
+    let file: ShareFile =
+        serde_json::from_str(file_json).context("this is not a Sentinel share file")?;
     if file.version != 1 || file.kdf != "argon2id" {
-        bail!("unsupported share file (version {}, kdf {})", file.version, file.kdf);
+        bail!(
+            "unsupported share file (version {}, kdf {})",
+            file.version,
+            file.kdf
+        );
     }
-    let salt = from_hex(&file.salt).filter(|s| s.len() == kdf::SALT_LEN).context("the share file's salt is damaged")?;
+    let salt = from_hex(&file.salt)
+        .filter(|s| s.len() == kdf::SALT_LEN)
+        .context("the share file's salt is damaged")?;
     let key = passphrase_key(passphrase, &salt)?;
-    let plain = envelope::decrypt(&key, &file.envelope).map_err(|_| anyhow::anyhow!("wrong passphrase, or the share file is damaged"))?;
-    let payload: SharePayload = bincode::deserialize(&plain).map_err(|_| anyhow::anyhow!("wrong passphrase, or the share file is damaged"))?;
+    let plain = envelope::decrypt(&key, &file.envelope)
+        .map_err(|_| anyhow::anyhow!("wrong passphrase, or the share file is damaged"))?;
+    let payload: SharePayload = bincode::deserialize(&plain)
+        .map_err(|_| anyhow::anyhow!("wrong passphrase, or the share file is damaged"))?;
     Ok((payload.holder, payload.share))
 }
 
@@ -115,7 +137,11 @@ pub fn open_share(file_json: &str, passphrase: &str) -> anyhow::Result<(String, 
 // ---------------------------------------------------------------------------
 
 fn valid_holder(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -132,13 +158,21 @@ fn write_private(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 ///
 /// `passphrases` maps holder name to passphrase and is required (for every
 /// holder) when the format is `Passphrase`.
-pub fn provision(params: &InitParams, passphrases: &HashMap<String, String>) -> anyhow::Result<InitReport> {
+pub fn provision(
+    params: &InitParams,
+    passphrases: &HashMap<String, String>,
+) -> anyhow::Result<InitReport> {
     let n = params.holders.len();
     if params.threshold < 2 {
-        bail!("the threshold must be at least 2: a threshold of 1 means any single share is the whole key");
+        bail!(
+            "the threshold must be at least 2: a threshold of 1 means any single share is the whole key"
+        );
     }
     if n < params.threshold as usize {
-        bail!("{n} holders cannot satisfy a threshold of {}", params.threshold);
+        bail!(
+            "{n} holders cannot satisfy a threshold of {}",
+            params.threshold
+        );
     }
     if n > 255 {
         bail!("at most 255 holders are supported");
@@ -152,14 +186,21 @@ pub fn provision(params: &InitParams, passphrases: &HashMap<String, String>) -> 
     }
     if params.format == ShareFormat::Passphrase {
         for h in &params.holders {
-            let p = passphrases.get(h).with_context(|| format!("no passphrase supplied for {h}"))?;
+            let p = passphrases
+                .get(h)
+                .with_context(|| format!("no passphrase supplied for {h}"))?;
             if p.chars().count() < MIN_PASSPHRASE_LEN {
-                bail!("passphrase for {h} is too short: use at least {MIN_PASSPHRASE_LEN} characters");
+                bail!(
+                    "passphrase for {h} is too short: use at least {MIN_PASSPHRASE_LEN} characters"
+                );
             }
         }
     }
     if params.out.exists() && std::fs::read_dir(&params.out)?.next().is_some() {
-        bail!("{} already exists and is not empty; refusing to overwrite key material", params.out.display());
+        bail!(
+            "{} already exists and is not empty; refusing to overwrite key material",
+            params.out.display()
+        );
     }
     std::fs::create_dir_all(&params.out)?;
 
@@ -173,15 +214,25 @@ pub fn provision(params: &InitParams, passphrases: &HashMap<String, String>) -> 
     }
 }
 
-fn write_all(params: &InitParams, passphrases: &HashMap<String, String>) -> anyhow::Result<InitReport> {
+fn write_all(
+    params: &InitParams,
+    passphrases: &HashMap<String, String>,
+) -> anyhow::Result<InitReport> {
     let mut key_bytes = vec![0u8; KEY_LEN];
     OsRng.fill_bytes(&mut key_bytes);
     let kek = SecretBytes::new(key_bytes);
 
-    let shares = shamir::split_secret(kek.expose(), params.threshold, params.holders.len() as u8, &mut OsRng)
-        .map_err(|e| anyhow::anyhow!("splitting the key failed: {e}"))?;
+    let shares = shamir::split_secret(
+        kek.expose(),
+        params.threshold,
+        params.holders.len() as u8,
+        &mut OsRng,
+    )
+    .map_err(|e| anyhow::anyhow!("splitting the key failed: {e}"))?;
 
-    let canary_blob = bincode::serialize(&canary::create(&kek).map_err(|_| anyhow::anyhow!("creating the canary failed"))?)?;
+    let canary_blob = bincode::serialize(
+        &canary::create(&kek).map_err(|_| anyhow::anyhow!("creating the canary failed"))?,
+    )?;
     let canary_file = params.out.join("canary.bin");
     std::fs::write(&canary_file, &canary_blob)?;
 
@@ -190,8 +241,14 @@ fn write_all(params: &InitParams, passphrases: &HashMap<String, String>) -> anyh
     for (holder, share) in params.holders.iter().zip(shares.iter()) {
         let share_bytes = bincode::serialize(share)?;
         let (name, content): (String, Vec<u8>) = match params.format {
-            ShareFormat::Plain => (format!("share-{holder}.hex"), to_hex(&share_bytes).into_bytes()),
-            ShareFormat::Passphrase => (format!("share-{holder}.enc"), seal_share(holder, &share_bytes, &passphrases[holder])?.into_bytes()),
+            ShareFormat::Plain => (
+                format!("share-{holder}.hex"),
+                to_hex(&share_bytes).into_bytes(),
+            ),
+            ShareFormat::Passphrase => (
+                format!("share-{holder}.enc"),
+                seal_share(holder, &share_bytes, &passphrases[holder])?.into_bytes(),
+            ),
         };
         let path = params.out.join(name);
         write_private(&path, &content)?;
@@ -206,7 +263,9 @@ fn write_all(params: &InitParams, passphrases: &HashMap<String, String>) -> anyh
     for (holder, path) in share_files.iter().take(params.threshold as usize) {
         let raw = std::fs::read_to_string(path)?;
         let share_bytes = match params.format {
-            ShareFormat::Plain => from_hex(raw.trim()).context("self-test: share file is not hex")?,
+            ShareFormat::Plain => {
+                from_hex(raw.trim()).context("self-test: share file is not hex")?
+            }
             ShareFormat::Passphrase => {
                 let (who, bytes) = open_share(&raw, &passphrases[holder])?;
                 if &who != holder {
@@ -217,10 +276,13 @@ fn write_all(params: &InitParams, passphrases: &HashMap<String, String>) -> anyh
         };
         recovered.push(bincode::deserialize(&share_bytes)?);
     }
-    let rebuilt = shamir::combine_shares(&recovered).map_err(|e| anyhow::anyhow!("self-test: recombining failed: {e}"))?;
+    let rebuilt = shamir::combine_shares(&recovered)
+        .map_err(|e| anyhow::anyhow!("self-test: recombining failed: {e}"))?;
     let canary_parsed: EnvelopeCiphertext = bincode::deserialize(&canary_blob)?;
     if !canary::verify(&SecretBytes::new(rebuilt), &canary_parsed) {
-        bail!("self-test failed: the shares written to disk do not rebuild the key. Nothing was kept");
+        bail!(
+            "self-test failed: the shares written to disk do not rebuild the key. Nothing was kept"
+        );
     }
     drop(written_shares);
 
@@ -271,7 +333,11 @@ The root key was never written to disk.
         .replace("@UNSEAL_CMD@", unseal_cmd);
     std::fs::write(&instructions, text)?;
 
-    Ok(InitReport { canary_file, share_files, instructions })
+    Ok(InitReport {
+        canary_file,
+        share_files,
+        instructions,
+    })
 }
 
 #[cfg(test)]
@@ -279,31 +345,53 @@ mod tests {
     use super::*;
 
     fn pass(holders: &[&str]) -> HashMap<String, String> {
-        holders.iter().map(|h| (h.to_string(), format!("correct horse battery {h}"))).collect()
+        holders
+            .iter()
+            .map(|h| (h.to_string(), format!("correct horse battery {h}")))
+            .collect()
     }
 
     fn params(dir: &Path, holders: &[&str], threshold: u8, format: ShareFormat) -> InitParams {
-        InitParams { holders: holders.iter().map(|s| s.to_string()).collect(), threshold, out: dir.join("vault"), format }
+        InitParams {
+            holders: holders.iter().map(|s| s.to_string()).collect(),
+            threshold,
+            out: dir.join("vault"),
+            format,
+        }
     }
 
     #[test]
     fn a_passphrase_share_round_trips_and_binds_the_holder() {
         let json = seal_share("alice", b"share-bytes", "a long passphrase!").unwrap();
         let (who, bytes) = open_share(&json, "a long passphrase!").unwrap();
-        assert_eq!((who.as_str(), bytes.as_slice()), ("alice", &b"share-bytes"[..]));
-        assert!(!json.contains("share-bytes"), "the share must not appear in the clear");
+        assert_eq!(
+            (who.as_str(), bytes.as_slice()),
+            ("alice", &b"share-bytes"[..])
+        );
+        assert!(
+            !json.contains("share-bytes"),
+            "the share must not appear in the clear"
+        );
     }
 
     #[test]
     fn a_wrong_passphrase_or_damaged_file_fails_with_one_indistinguishable_error() {
         let json = seal_share("alice", b"x", "a long passphrase!").unwrap();
-        let wrong = open_share(&json, "another passphrase!").unwrap_err().to_string();
+        let wrong = open_share(&json, "another passphrase!")
+            .unwrap_err()
+            .to_string();
         assert!(wrong.contains("wrong passphrase"));
 
         let mut file: serde_json::Value = serde_json::from_str(&json).unwrap();
-        file["envelope"]["ciphertext"][0] = serde_json::json!(255 - file["envelope"]["ciphertext"][0].as_u64().unwrap());
-        let damaged = open_share(&file.to_string(), "a long passphrase!").unwrap_err().to_string();
-        assert_eq!(wrong, damaged, "an attacker must learn nothing from which error they get");
+        file["envelope"]["ciphertext"][0] =
+            serde_json::json!(255 - file["envelope"]["ciphertext"][0].as_u64().unwrap());
+        let damaged = open_share(&file.to_string(), "a long passphrase!")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            wrong, damaged,
+            "an attacker must learn nothing from which error they get"
+        );
 
         assert!(open_share("not json", "x").is_err());
     }
@@ -323,34 +411,66 @@ mod tests {
     #[test]
     fn provisioning_produces_a_canary_and_one_protected_share_per_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let p = params(dir.path(), &["alice", "bob", "carol"], 2, ShareFormat::Passphrase);
+        let p = params(
+            dir.path(),
+            &["alice", "bob", "carol"],
+            2,
+            ShareFormat::Passphrase,
+        );
         let report = provision(&p, &pass(&["alice", "bob", "carol"])).unwrap();
 
         assert!(report.canary_file.exists() && report.instructions.exists());
         assert_eq!(report.share_files.len(), 3);
-        let listing: Vec<String> = std::fs::read_dir(&p.out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
-        assert!(listing.iter().all(|f| f == "canary.bin" || f == "PROVISIONING.txt" || f.starts_with("share-")), "{listing:?}");
+        let listing: Vec<String> = std::fs::read_dir(&p.out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            listing
+                .iter()
+                .all(|f| f == "canary.bin" || f == "PROVISIONING.txt" || f.starts_with("share-")),
+            "{listing:?}"
+        );
     }
 
     #[test]
     fn any_threshold_of_holders_rebuilds_a_key_that_opens_the_canary_and_fewer_cannot() {
         let dir = tempfile::tempdir().unwrap();
-        let p = params(dir.path(), &["alice", "bob", "carol"], 2, ShareFormat::Passphrase);
+        let p = params(
+            dir.path(),
+            &["alice", "bob", "carol"],
+            2,
+            ShareFormat::Passphrase,
+        );
         let phrases = pass(&["alice", "bob", "carol"]);
         let report = provision(&p, &phrases).unwrap();
-        let canary_blob: EnvelopeCiphertext = bincode::deserialize(&std::fs::read(&report.canary_file).unwrap()).unwrap();
+        let canary_blob: EnvelopeCiphertext =
+            bincode::deserialize(&std::fs::read(&report.canary_file).unwrap()).unwrap();
 
         let load = |holder: &str| -> ShamirShare {
-            let path = &report.share_files.iter().find(|(h, _)| h == holder).unwrap().1;
-            let (_, bytes) = open_share(&std::fs::read_to_string(path).unwrap(), &phrases[holder]).unwrap();
+            let path = &report
+                .share_files
+                .iter()
+                .find(|(h, _)| h == holder)
+                .unwrap()
+                .1;
+            let (_, bytes) =
+                open_share(&std::fs::read_to_string(path).unwrap(), &phrases[holder]).unwrap();
             bincode::deserialize(&bytes).unwrap()
         };
         for pair in [["alice", "bob"], ["bob", "carol"], ["alice", "carol"]] {
             let key = shamir::combine_shares(&[load(pair[0]), load(pair[1])]).unwrap();
-            assert!(canary::verify(&SecretBytes::new(key), &canary_blob), "{pair:?}");
+            assert!(
+                canary::verify(&SecretBytes::new(key), &canary_blob),
+                "{pair:?}"
+            );
         }
         let one = shamir::combine_shares(&[load("alice")]);
-        assert!(one.map(|k| !canary::verify(&SecretBytes::new(k), &canary_blob)).unwrap_or(true), "a single share must not open the canary");
+        assert!(
+            one.map(|k| !canary::verify(&SecretBytes::new(k), &canary_blob))
+                .unwrap_or(true),
+            "a single share must not open the canary"
+        );
     }
 
     #[test]
@@ -362,23 +482,45 @@ mod tests {
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()) && !hex.is_empty());
         let share: ShamirShare = bincode::deserialize(&from_hex(&hex).unwrap()).unwrap();
         assert!(share.x >= 1 && share.y.len() == KEY_LEN);
-        assert!(std::fs::read_to_string(&report.instructions).unwrap().contains("PLAIN HEX"), "the file must say it is unprotected");
+        assert!(
+            std::fs::read_to_string(&report.instructions)
+                .unwrap()
+                .contains("PLAIN HEX"),
+            "the file must say it is unprotected"
+        );
     }
 
     #[test]
     fn the_instructions_file_keeps_its_indentation_and_fills_in_every_placeholder() {
         let dir = tempfile::tempdir().unwrap();
-        let p = params(dir.path(), &["alice", "bob", "carol"], 2, ShareFormat::Passphrase);
+        let p = params(
+            dir.path(),
+            &["alice", "bob", "carol"],
+            2,
+            ShareFormat::Passphrase,
+        );
         let report = provision(&p, &pass(&["alice", "bob", "carol"])).unwrap();
         let text = std::fs::read_to_string(&report.instructions).unwrap();
 
-        assert!(!text.contains('@'), "an unfilled placeholder is left in:\n{text}");
+        assert!(
+            !text.contains('@'),
+            "an unfilled placeholder is left in:\n{text}"
+        );
         assert!(text.contains("Holders (3): alice, bob, carol"), "{text}");
         assert!(text.contains("Threshold: 2 of 3 holders"), "{text}");
-        assert!(text.contains("\n     canary_file      = \"/path/to/canary.bin\"\n"), "config lines must stay indented:\n{text}");
+        assert!(
+            text.contains("\n     canary_file      = \"/path/to/canary.bin\"\n"),
+            "config lines must stay indented:\n{text}"
+        );
         assert!(text.contains("\n     unseal_threshold = 2\n"), "{text}");
-        assert!(text.contains("\n     sentinel-cli unseal-file "), "the command must stay indented:\n{text}");
-        assert!(text.contains("A lost\n   passphrase means that share is lost."), "{text}");
+        assert!(
+            text.contains("\n     sentinel-cli unseal-file "),
+            "the command must stay indented:\n{text}"
+        );
+        assert!(
+            text.contains("A lost\n   passphrase means that share is lost."),
+            "{text}"
+        );
     }
 
     #[test]
@@ -386,23 +528,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let phrases = pass(&["alice", "bob", "carol"]);
         let cases: Vec<(Vec<&str>, u8)> = vec![
-            (vec!["alice", "bob"], 1),            // threshold below 2
-            (vec!["alice", "bob"], 3),            // threshold above holders
-            (vec!["alice", "alice", "bob"], 2),   // duplicate holder
-            (vec!["al ice", "bob"], 2),           // invalid name
-            (vec!["../evil", "bob"], 2),          // path-ish name
+            (vec!["alice", "bob"], 1),          // threshold below 2
+            (vec!["alice", "bob"], 3),          // threshold above holders
+            (vec!["alice", "alice", "bob"], 2), // duplicate holder
+            (vec!["al ice", "bob"], 2),         // invalid name
+            (vec!["../evil", "bob"], 2),        // path-ish name
         ];
         for (holders, threshold) in cases {
             let p = params(dir.path(), &holders, threshold, ShareFormat::Passphrase);
             assert!(provision(&p, &phrases).is_err(), "{holders:?}/{threshold}");
-            assert!(!p.out.exists(), "a refused run must not create the output directory");
+            assert!(
+                !p.out.exists(),
+                "a refused run must not create the output directory"
+            );
         }
         let mut short = pass(&["alice", "bob"]);
         short.insert("bob".into(), "short".into());
-        assert!(provision(&params(dir.path(), &["alice", "bob"], 2, ShareFormat::Passphrase), &short).is_err());
+        assert!(
+            provision(
+                &params(dir.path(), &["alice", "bob"], 2, ShareFormat::Passphrase),
+                &short
+            )
+            .is_err()
+        );
         let mut missing = pass(&["alice"]);
         missing.remove("alice");
-        assert!(provision(&params(dir.path(), &["alice", "bob"], 2, ShareFormat::Passphrase), &missing).is_err());
+        assert!(
+            provision(
+                &params(dir.path(), &["alice", "bob"], 2, ShareFormat::Passphrase),
+                &missing
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -411,7 +568,10 @@ mod tests {
         let p = params(dir.path(), &["alice", "bob"], 2, ShareFormat::Plain);
         provision(&p, &HashMap::new()).unwrap();
         let before = std::fs::read(p.out.join("canary.bin")).unwrap();
-        assert!(provision(&p, &HashMap::new()).is_err(), "a second run into the same directory must be refused");
+        assert!(
+            provision(&p, &HashMap::new()).is_err(),
+            "a second run into the same directory must be refused"
+        );
         assert_eq!(std::fs::read(p.out.join("canary.bin")).unwrap(), before);
     }
 
@@ -424,6 +584,9 @@ mod tests {
         p2.out = dir.path().join("two");
         let r1 = provision(&p1, &HashMap::new()).unwrap();
         let r2 = provision(&p2, &HashMap::new()).unwrap();
-        assert_ne!(std::fs::read(r1.canary_file).unwrap(), std::fs::read(r2.canary_file).unwrap());
+        assert_ne!(
+            std::fs::read(r1.canary_file).unwrap(),
+            std::fs::read(r2.canary_file).unwrap()
+        );
     }
 }

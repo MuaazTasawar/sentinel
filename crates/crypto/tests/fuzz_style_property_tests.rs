@@ -10,7 +10,7 @@
 use proptest::prelude::*;
 use sentinel_crypto::envelope::{self, EnvelopeCiphertext, KEY_LEN, NONCE_LEN};
 use sentinel_crypto::shamir::{self, ShamirShare};
-use sentinel_crypto::{kdf, SecretBytes};
+use sentinel_crypto::{SecretBytes, kdf};
 
 fn arb_nonce() -> impl Strategy<Value = [u8; NONCE_LEN]> {
     proptest::array::uniform12(any::<u8>())

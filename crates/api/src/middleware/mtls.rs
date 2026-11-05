@@ -6,7 +6,10 @@ use rustls::pki_types::CertificateDer;
 #[derive(thiserror::Error, Debug)]
 pub enum MtlsError {
     #[error("failed to read {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("no private key found in {0}")]
     NoPrivateKey(String),
     #[error("TLS config error: {0}")]
@@ -44,20 +47,30 @@ pub fn ensure_crypto_provider_installed() {
 }
 
 fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, MtlsError> {
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| MtlsError::Io { path: path.display().to_string(), source: e })?,
-    );
+    let mut reader =
+        std::io::BufReader::new(std::fs::File::open(path).map_err(|e| MtlsError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?);
     rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| MtlsError::Io { path: path.display().to_string(), source: e })
+        .map_err(|e| MtlsError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })
 }
 
 fn load_private_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, MtlsError> {
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| MtlsError::Io { path: path.display().to_string(), source: e })?,
-    );
+    let mut reader =
+        std::io::BufReader::new(std::fs::File::open(path).map_err(|e| MtlsError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?);
     rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| MtlsError::Io { path: path.display().to_string(), source: e })?
+        .map_err(|e| MtlsError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?
         .ok_or_else(|| MtlsError::NoPrivateKey(path.display().to_string()))
 }
 
@@ -89,7 +102,10 @@ pub fn build_server_config(
     }
     let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
-        .map_err(|e| MtlsError::Io { path: ca_cert_path.display().to_string(), source: std::io::Error::other(e) })?;
+        .map_err(|e| MtlsError::Io {
+            path: ca_cert_path.display().to_string(),
+            source: std::io::Error::other(e),
+        })?;
 
     let config = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
@@ -106,8 +122,12 @@ pub fn build_server_config(
 /// CA-signed certificate to exist.
 pub fn extract_cn(cert_der: &CertificateDer<'_>) -> Option<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(cert_der.as_ref()).ok()?;
-    
-    cert.subject().iter_common_name().next().and_then(|attr| attr.as_str().ok()).map(|s| s.to_string())
+
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// The certificate's serial number as canonical lowercase hex (no leading
@@ -146,12 +166,18 @@ mod tests {
         params.distinguished_name = dn;
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
-        TestCert { cert_der: cert.der().clone(), key_der: key.serialize_der() }
+        TestCert {
+            cert_der: cert.der().clone(),
+            key_der: key.serialize_der(),
+        }
     }
 
     fn write_pem(path: &Path, der: &[u8], label: &str) {
         let pem = pem::Pem::new(label.to_string(), der.to_vec());
-        std::fs::File::create(path).unwrap().write_all(pem.to_string().as_bytes()).unwrap();
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(pem.to_string().as_bytes())
+            .unwrap();
     }
 
     #[test]
@@ -169,9 +195,20 @@ mod tests {
         let b = make_leaf(&ca_cert, &ca_key, "b");
         let sa = cert_serial_hex(&a.cert_der).expect("serial");
         assert_eq!(sa, cert_serial_hex(&a.cert_der).unwrap());
-        assert_ne!(sa, cert_serial_hex(&b.cert_der).unwrap(), "two certificates must not share a serial");
-        assert!(sa.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        assert_eq!(crate::middleware::authz::normalize_serial(&sa).as_deref(), Some(sa.as_str()), "already canonical");
+        assert_ne!(
+            sa,
+            cert_serial_hex(&b.cert_der).unwrap(),
+            "two certificates must not share a serial"
+        );
+        assert!(
+            sa.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_eq!(
+            crate::middleware::authz::normalize_serial(&sa).as_deref(),
+            Some(sa.as_str()),
+            "already canonical"
+        );
     }
 
     #[test]
@@ -188,7 +225,11 @@ mod tests {
         write_pem(&ca_path, ca_cert.der().as_ref(), "CERTIFICATE");
 
         let config = build_server_config(&cert_path, &key_path, &ca_path);
-        assert!(config.is_ok(), "should build a valid ServerConfig from real PEM files: {:?}", config.err());
+        assert!(
+            config.is_ok(),
+            "should build a valid ServerConfig from real PEM files: {:?}",
+            config.err()
+        );
     }
 
     #[test]

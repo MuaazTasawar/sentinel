@@ -40,7 +40,10 @@ pub struct QuorumUnseal {
 
 impl QuorumUnseal {
     pub fn new(threshold: u8) -> Self {
-        Self { threshold, fragments: Vec::new() }
+        Self {
+            threshold,
+            fragments: Vec::new(),
+        }
     }
 
     /// Records one holder's fragment. Rejects a second contribution from
@@ -48,7 +51,11 @@ impl QuorumUnseal {
     /// confused single key holder touching twice must not be able to
     /// satisfy a quorum meant to require independent physical keys.
     pub fn contribute(&mut self, fragment: UnsealFragment) -> Result<(), HardwareError> {
-        if self.fragments.iter().any(|f| f.holder_id == fragment.holder_id) {
+        if self
+            .fragments
+            .iter()
+            .any(|f| f.holder_id == fragment.holder_id)
+        {
             return Err(HardwareError::DuplicateHolder(fragment.holder_id));
         }
         self.fragments.push(fragment);
@@ -70,9 +77,9 @@ impl QuorumUnseal {
     /// no integrity signal on a wrong or insufficient set.
     pub fn try_reconstruct(&self) -> Result<Vec<u8>, HardwareError> {
         if !self.is_satisfied() {
-            return Err(HardwareError::ShamirError(shamir::ShamirError::InsufficientSharesToCombine(
-                self.fragments.len(),
-            )));
+            return Err(HardwareError::ShamirError(
+                shamir::ShamirError::InsufficientSharesToCombine(self.fragments.len()),
+            ));
         }
         let shares: Vec<ShamirShare> = self.fragments.iter().map(|f| f.share.clone()).collect();
         Ok(shamir::combine_shares(&shares)?)
@@ -97,13 +104,19 @@ mod tests {
         assert!(!quorum.is_satisfied());
 
         quorum
-            .contribute(UnsealFragment { holder_id: "alice".into(), share: shares[0].clone() })
+            .contribute(UnsealFragment {
+                holder_id: "alice".into(),
+                share: shares[0].clone(),
+            })
             .unwrap();
         assert!(!quorum.is_satisfied());
         assert!(quorum.try_reconstruct().is_err());
 
         quorum
-            .contribute(UnsealFragment { holder_id: "bob".into(), share: shares[1].clone() })
+            .contribute(UnsealFragment {
+                holder_id: "bob".into(),
+                share: shares[1].clone(),
+            })
             .unwrap();
         assert!(quorum.is_satisfied());
         assert_eq!(quorum.try_reconstruct().unwrap(), secret);
@@ -115,9 +128,24 @@ mod tests {
         let shares = make_shares(secret, 3, 5);
 
         let mut quorum = QuorumUnseal::new(3);
-        quorum.contribute(UnsealFragment { holder_id: "carol".into(), share: shares[2].clone() }).unwrap();
-        quorum.contribute(UnsealFragment { holder_id: "eve".into(), share: shares[4].clone() }).unwrap();
-        quorum.contribute(UnsealFragment { holder_id: "alice".into(), share: shares[0].clone() }).unwrap();
+        quorum
+            .contribute(UnsealFragment {
+                holder_id: "carol".into(),
+                share: shares[2].clone(),
+            })
+            .unwrap();
+        quorum
+            .contribute(UnsealFragment {
+                holder_id: "eve".into(),
+                share: shares[4].clone(),
+            })
+            .unwrap();
+        quorum
+            .contribute(UnsealFragment {
+                holder_id: "alice".into(),
+                share: shares[0].clone(),
+            })
+            .unwrap();
 
         assert_eq!(quorum.try_reconstruct().unwrap(), secret);
     }
@@ -129,10 +157,16 @@ mod tests {
 
         let mut quorum = QuorumUnseal::new(2);
         quorum
-            .contribute(UnsealFragment { holder_id: "alice".into(), share: shares[0].clone() })
+            .contribute(UnsealFragment {
+                holder_id: "alice".into(),
+                share: shares[0].clone(),
+            })
             .unwrap();
         let err = quorum
-            .contribute(UnsealFragment { holder_id: "alice".into(), share: shares[1].clone() })
+            .contribute(UnsealFragment {
+                holder_id: "alice".into(),
+                share: shares[1].clone(),
+            })
             .unwrap_err();
         assert!(matches!(err, HardwareError::DuplicateHolder(h) if h == "alice"));
         assert!(!quorum.is_satisfied());
@@ -144,7 +178,10 @@ mod tests {
         let shares = make_shares(secret, 2, 3);
         let mut quorum = QuorumUnseal::new(2);
         quorum
-            .contribute(UnsealFragment { holder_id: "alice".into(), share: shares[0].clone() })
+            .contribute(UnsealFragment {
+                holder_id: "alice".into(),
+                share: shares[0].clone(),
+            })
             .unwrap();
         assert!(!quorum.is_satisfied());
         assert!(quorum.try_reconstruct().is_err());
@@ -157,7 +194,10 @@ mod tests {
         let mut quorum = QuorumUnseal::new(2);
         assert_eq!(quorum.contributed_so_far(), 0);
         quorum
-            .contribute(UnsealFragment { holder_id: "alice".into(), share: shares[0].clone() })
+            .contribute(UnsealFragment {
+                holder_id: "alice".into(),
+                share: shares[0].clone(),
+            })
             .unwrap();
         assert_eq!(quorum.contributed_so_far(), 1);
     }

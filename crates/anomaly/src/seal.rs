@@ -57,7 +57,12 @@ mod tests {
     use crate::detector::AnomalyReport;
 
     fn sample_report() -> AnomalyReport {
-        AnomalyReport { current_count: 40, baseline_mean: 2.0, baseline_stddev: 0.5, z_score: 76.0 }
+        AnomalyReport {
+            current_count: 40,
+            baseline_mean: 2.0,
+            baseline_stddev: 0.5,
+            z_score: 76.0,
+        }
     }
 
     #[test]

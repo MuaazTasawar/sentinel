@@ -37,7 +37,11 @@ fn world(seed: u64) -> SimWorld {
 
 fn assert_everyone_applied(world: &SimWorld, expected: &[Vec<u8>]) {
     for &n in &NODES {
-        assert_eq!(world.applied_commands(n), expected, "node {n} must have applied exactly the committed commands, in order");
+        assert_eq!(
+            world.applied_commands(n),
+            expected,
+            "node {n} must have applied exactly the committed commands, in order"
+        );
     }
 }
 
@@ -71,7 +75,11 @@ fn a_deposed_leaders_uncommitted_write_is_discarded_everywhere() {
     advance(&mut w, 3_000);
 
     // The majority elects a new leader and carries on.
-    let new_leader = *w.current_leaders().iter().find(|&&l| l != old_leader).expect("majority side should elect a leader");
+    let new_leader = *w
+        .current_leaders()
+        .iter()
+        .find(|&&l| l != old_leader)
+        .expect("majority side should elect a leader");
     w.propose(new_leader, cmd("after-1")).unwrap();
     advance(&mut w, 300);
     w.propose(new_leader, cmd("after-2")).unwrap();
@@ -82,25 +90,43 @@ fn a_deposed_leaders_uncommitted_write_is_discarded_everywhere() {
 
     w.check_all().unwrap();
     let expected = cmds(&["committed-before", "after-1", "after-2"]);
-    assert_eq!(w.committed_commands(), expected, "the orphaned write must never commit");
+    assert_eq!(
+        w.committed_commands(),
+        expected,
+        "the orphaned write must never commit"
+    );
     assert_everyone_applied(&w, &expected);
-    assert!(!w.state_of(old_leader).log.entries_from(0).iter().any(|e| e.command == cmd("orphan")), "and it must be gone from the old leader's log too");
+    assert!(
+        !w.state_of(old_leader)
+            .log
+            .entries_from(0)
+            .iter()
+            .any(|e| e.command == cmd("orphan")),
+        "and it must be gone from the old leader's log too"
+    );
 }
 
 #[test]
 fn a_node_that_misses_a_lot_catches_up_after_healing() {
     let mut w = world(3);
     advance(&mut w, 600);
-    let straggler = *NODES.iter().find(|n| !w.current_leaders().contains(n)).unwrap();
+    let straggler = *NODES
+        .iter()
+        .find(|n| !w.current_leaders().contains(n))
+        .unwrap();
     for &n in NODES.iter().filter(|&&n| n != straggler) {
         w.network.partition(straggler, n);
     }
     for i in 0..30 {
-        w.propose_to_leader(cmd(&format!("c{i}"))).expect("the majority side still has a leader");
+        w.propose_to_leader(cmd(&format!("c{i}")))
+            .expect("the majority side still has a leader");
         advance(&mut w, 40);
     }
     settle(&mut w);
-    assert!(w.applied_commands(straggler).is_empty(), "the isolated node must not have applied anything");
+    assert!(
+        w.applied_commands(straggler).is_empty(),
+        "the isolated node must not have applied anything"
+    );
 
     w.network.heal_all();
     settle(&mut w);
@@ -125,7 +151,10 @@ fn heavy_message_loss_duplication_and_reordering_never_breaks_safety_and_still_m
     w.network.duplicate_percent = 0;
     settle(&mut w);
     w.check_all().unwrap();
-    assert!(!w.committed_commands().is_empty(), "even at 30% loss some commands must have committed");
+    assert!(
+        !w.committed_commands().is_empty(),
+        "even at 30% loss some commands must have committed"
+    );
     assert_everyone_applied(&w, &w.committed_commands());
 }
 
@@ -151,11 +180,16 @@ fn restarting_every_node_at_once_loses_no_committed_command() {
     settle(&mut w);
 
     w.check_all().unwrap();
-    assert_eq!(w.committed_commands(), cmds(&["one", "two", "three"]), "nothing committed may be lost or reordered");
+    assert_eq!(
+        w.committed_commands(),
+        cmds(&["one", "two", "three"]),
+        "nothing committed may be lost or reordered"
+    );
     assert_everyone_applied(&w, &cmds(&["one", "two", "three"]));
 
     // And the cluster keeps working afterwards.
-    w.propose_to_leader(cmd("four")).expect("a leader after the restart");
+    w.propose_to_leader(cmd("four"))
+        .expect("a leader after the restart");
     settle(&mut w);
     assert_everyone_applied(&w, &cmds(&["one", "two", "three", "four"]));
 }
@@ -177,15 +211,23 @@ fn crashing_the_leader_repeatedly_never_loses_acknowledged_commits() {
         advance(&mut w, 700);
         w.restart(leader);
         advance(&mut w, 300);
-        w.check_all().unwrap_or_else(|e| panic!("round {round}: {e}"));
+        w.check_all()
+            .unwrap_or_else(|e| panic!("round {round}: {e}"));
     }
     settle(&mut w);
     w.check_all().unwrap();
-    assert!(expected.len() >= 4, "most rounds should have committed before the crash, got {expected:?}");
+    assert!(
+        expected.len() >= 4,
+        "most rounds should have committed before the crash, got {expected:?}"
+    );
     let committed = w.committed_commands();
     let mut cursor = 0;
     for c in &expected {
-        cursor += committed[cursor..].iter().position(|x| x == c).expect("an acknowledged commit disappeared") + 1;
+        cursor += committed[cursor..]
+            .iter()
+            .position(|x| x == c)
+            .expect("an acknowledged commit disappeared")
+            + 1;
     }
     assert_everyone_applied(&w, &committed);
 }
@@ -225,7 +267,8 @@ fn random_run(seed: u64) -> SimWorld {
             _ => {}
         }
         advance(&mut w, rng.gen_range(10..140));
-        w.check_all().unwrap_or_else(|e| panic!("seed {seed}, step {step}: {e}"));
+        w.check_all()
+            .unwrap_or_else(|e| panic!("seed {seed}, step {step}: {e}"));
     }
 
     // Faults stop: heal everything, boot everyone, no loss.
@@ -236,17 +279,27 @@ fn random_run(seed: u64) -> SimWorld {
         w.restart(n);
     }
     settle(&mut w);
-    w.check_all().unwrap_or_else(|e| panic!("seed {seed}, after recovery: {e}"));
+    w.check_all()
+        .unwrap_or_else(|e| panic!("seed {seed}, after recovery: {e}"));
 
     // Liveness: a healthy cluster commits a fresh command and converges.
     let probe = cmd(&format!("probe-{seed}"));
-    w.propose_to_leader(probe.clone()).unwrap_or_else(|| panic!("seed {seed}: no leader after recovery"));
+    w.propose_to_leader(probe.clone())
+        .unwrap_or_else(|| panic!("seed {seed}: no leader after recovery"));
     settle(&mut w);
-    w.check_all().unwrap_or_else(|e| panic!("seed {seed}, after probe: {e}"));
-    assert!(w.committed_commands().contains(&probe), "seed {seed}: a healthy cluster must commit a new command");
+    w.check_all()
+        .unwrap_or_else(|e| panic!("seed {seed}, after probe: {e}"));
+    assert!(
+        w.committed_commands().contains(&probe),
+        "seed {seed}: a healthy cluster must commit a new command"
+    );
     let committed = w.committed_commands();
     for &n in &NODES {
-        assert_eq!(w.applied_commands(n), committed, "seed {seed}: node {n} did not converge on the committed history");
+        assert_eq!(
+            w.applied_commands(n),
+            committed,
+            "seed {seed}: node {n} did not converge on the committed history"
+        );
     }
     w
 }
@@ -265,5 +318,8 @@ fn the_same_seed_produces_the_identical_history_including_faults() {
     assert_eq!(a.leadership_log, b.leadership_log);
     assert_eq!(a.events_processed, b.events_processed);
     let c = random_run(78);
-    assert_ne!(a.events_processed, c.events_processed, "different seeds should explore different schedules");
+    assert_ne!(
+        a.events_processed, c.events_processed,
+        "different seeds should explore different schedules"
+    );
 }

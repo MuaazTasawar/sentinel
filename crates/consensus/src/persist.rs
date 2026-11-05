@@ -60,7 +60,11 @@ fn apply_op_to_vec(entries: &mut Vec<LogEntry>, op: &LogOp) -> Result<(), Persis
         LogOp::Append(e) => {
             let expected = entries.len() as u64 + 1;
             if e.index != expected {
-                return Err(PersistError::Corrupt(format!("append of index {} but log ends at {}", e.index, expected - 1)));
+                return Err(PersistError::Corrupt(format!(
+                    "append of index {} but log ends at {}",
+                    e.index,
+                    expected - 1
+                )));
             }
             entries.push(e.clone());
         }
@@ -160,7 +164,10 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 }
 
 fn codec() -> impl bincode::Options {
-    bincode::DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes().with_limit(MAX_RECORD_BYTES as u64)
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .with_limit(MAX_RECORD_BYTES as u64)
 }
 
 pub struct FileStore {
@@ -172,7 +179,10 @@ impl FileStore {
     /// Opens (creating if needed) a store rooted at `dir`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PersistError> {
         fs::create_dir_all(dir.as_ref())?;
-        Ok(Self { dir: dir.as_ref().to_path_buf(), wal: None })
+        Ok(Self {
+            dir: dir.as_ref().to_path_buf(),
+            wal: None,
+        })
     }
 
     fn read_hard_state(&self) -> Result<(u64, Option<u64>), PersistError> {
@@ -189,11 +199,15 @@ impl FileStore {
         if u32::from_le_bytes(crc_bytes.try_into().unwrap()) != crc32(payload) {
             return Err(PersistError::Corrupt("hard_state checksum mismatch".into()));
         }
-        codec().deserialize(payload).map_err(|e| PersistError::Corrupt(format!("hard_state: {e}")))
+        codec()
+            .deserialize(payload)
+            .map_err(|e| PersistError::Corrupt(format!("hard_state: {e}")))
     }
 
     fn wal(&mut self) -> Result<&mut File, PersistError> {
-        self.wal.as_mut().ok_or_else(|| PersistError::Corrupt("FileStore::load must be called before writing".into()))
+        self.wal.as_mut().ok_or_else(|| {
+            PersistError::Corrupt("FileStore::load must be called before writing".into())
+        })
     }
 }
 
@@ -201,7 +215,12 @@ impl RaftStore for FileStore {
     fn load(&mut self) -> Result<PersistedState, PersistError> {
         let (term, voted_for) = self.read_hard_state()?;
 
-        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(self.dir.join(WAL_FILE))?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.dir.join(WAL_FILE))?;
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)?;
 
@@ -233,18 +252,27 @@ impl RaftStore for FileStore {
         }
 
         if pos < raw.len() {
-            tracing::warn!(discarded_bytes = raw.len() - pos, "raft WAL had a torn or corrupt tail; truncating it");
+            tracing::warn!(
+                discarded_bytes = raw.len() - pos,
+                "raft WAL had a torn or corrupt tail; truncating it"
+            );
             file.set_len(pos as u64)?;
             file.sync_all()?;
         }
         file.seek(SeekFrom::End(0))?;
         self.wal = Some(file);
 
-        Ok(PersistedState { term, voted_for, entries })
+        Ok(PersistedState {
+            term,
+            voted_for,
+            entries,
+        })
     }
 
     fn save_hard_state(&mut self, term: u64, voted_for: Option<u64>) -> Result<(), PersistError> {
-        let payload = codec().serialize(&(term, voted_for)).map_err(|e| PersistError::Corrupt(e.to_string()))?;
+        let payload = codec()
+            .serialize(&(term, voted_for))
+            .map_err(|e| PersistError::Corrupt(e.to_string()))?;
         let mut bytes = crc32(&payload).to_le_bytes().to_vec();
         bytes.extend_from_slice(&payload);
 
@@ -266,7 +294,9 @@ impl RaftStore for FileStore {
         }
         let mut buf = Vec::new();
         for op in ops {
-            let payload = codec().serialize(op).map_err(|e| PersistError::Corrupt(e.to_string()))?;
+            let payload = codec()
+                .serialize(op)
+                .map_err(|e| PersistError::Corrupt(e.to_string()))?;
             buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             buf.extend_from_slice(&crc32(&payload).to_le_bytes());
             buf.extend_from_slice(&payload);
@@ -283,7 +313,11 @@ mod tests {
     use super::*;
 
     fn entry(term: u64, index: u64) -> LogEntry {
-        LogEntry { term, index, command: vec![index as u8; 3] }
+        LogEntry {
+            term,
+            index,
+            command: vec![index as u8; 3],
+        }
     }
 
     #[test]
@@ -306,7 +340,13 @@ mod tests {
             let mut store = FileStore::open(dir.path()).unwrap();
             store.load().unwrap();
             store.save_hard_state(7, Some(3)).unwrap();
-            store.apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 2)), LogOp::Append(entry(2, 3))]).unwrap();
+            store
+                .apply_log_ops(&[
+                    LogOp::Append(entry(1, 1)),
+                    LogOp::Append(entry(1, 2)),
+                    LogOp::Append(entry(2, 3)),
+                ])
+                .unwrap();
         }
         let mut reopened = FileStore::open(dir.path()).unwrap();
         let loaded = reopened.load().unwrap();
@@ -321,8 +361,16 @@ mod tests {
         {
             let mut store = FileStore::open(dir.path()).unwrap();
             store.load().unwrap();
-            store.apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 2)), LogOp::Append(entry(1, 3))]).unwrap();
-            store.apply_log_ops(&[LogOp::TruncateFrom(2), LogOp::Append(entry(2, 2))]).unwrap();
+            store
+                .apply_log_ops(&[
+                    LogOp::Append(entry(1, 1)),
+                    LogOp::Append(entry(1, 2)),
+                    LogOp::Append(entry(1, 3)),
+                ])
+                .unwrap();
+            store
+                .apply_log_ops(&[LogOp::TruncateFrom(2), LogOp::Append(entry(2, 2))])
+                .unwrap();
         }
         let loaded = FileStore::open(dir.path()).unwrap().load().unwrap();
         assert_eq!(loaded.entries, vec![entry(1, 1), entry(2, 2)]);
@@ -346,7 +394,9 @@ mod tests {
         {
             let mut store = FileStore::open(dir.path()).unwrap();
             store.load().unwrap();
-            store.apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 2))]).unwrap();
+            store
+                .apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 2))])
+                .unwrap();
         }
         // Simulate a crash mid-write: a record header promising 100 bytes, with only 10 present.
         let wal = dir.path().join(WAL_FILE);
@@ -360,7 +410,11 @@ mod tests {
         let mut store = FileStore::open(dir.path()).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.entries, vec![entry(1, 1), entry(1, 2)]);
-        assert_eq!(fs::metadata(&wal).unwrap().len(), good_len, "the torn tail must be cut off");
+        assert_eq!(
+            fs::metadata(&wal).unwrap().len(),
+            good_len,
+            "the torn tail must be cut off"
+        );
 
         // And the log is still writable afterwards, with the new record landing right after the prefix.
         store.apply_log_ops(&[LogOp::Append(entry(1, 3))]).unwrap();
@@ -387,7 +441,11 @@ mod tests {
         fs::write(&wal, &bytes).unwrap();
 
         let loaded = FileStore::open(dir.path()).unwrap().load().unwrap();
-        assert_eq!(loaded.entries, vec![entry(1, 1)], "the corrupt record and anything after it is dropped");
+        assert_eq!(
+            loaded.entries,
+            vec![entry(1, 1)],
+            "the corrupt record and anything after it is dropped"
+        );
         assert_eq!(fs::metadata(&wal).unwrap().len(), first_len);
     }
 
@@ -405,7 +463,10 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
         fs::write(&path, &bytes).unwrap();
-        assert!(matches!(FileStore::open(dir.path()).unwrap().load(), Err(PersistError::Corrupt(_))));
+        assert!(matches!(
+            FileStore::open(dir.path()).unwrap().load(),
+            Err(PersistError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -421,9 +482,14 @@ mod tests {
         {
             let mut store = FileStore::open(dir.path()).unwrap();
             store.load().unwrap();
-            store.apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 3))]).unwrap();
+            store
+                .apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 3))])
+                .unwrap();
         }
-        assert!(matches!(FileStore::open(dir.path()).unwrap().load(), Err(PersistError::Corrupt(_))));
+        assert!(matches!(
+            FileStore::open(dir.path()).unwrap().load(),
+            Err(PersistError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -431,13 +497,32 @@ mod tests {
         let mut store = MemoryStore::new();
         store.load().unwrap();
         store.save_hard_state(4, Some(1)).unwrap();
-        store.apply_log_ops(&[LogOp::Append(entry(1, 1)), LogOp::Append(entry(1, 2)), LogOp::TruncateFrom(2)]).unwrap();
+        store
+            .apply_log_ops(&[
+                LogOp::Append(entry(1, 1)),
+                LogOp::Append(entry(1, 2)),
+                LogOp::TruncateFrom(2),
+            ])
+            .unwrap();
         let snap = store.snapshot();
-        assert_eq!((snap.term, snap.voted_for, snap.entries.len()), (4, Some(1), 1));
+        assert_eq!(
+            (snap.term, snap.voted_for, snap.entries.len()),
+            (4, Some(1), 1)
+        );
 
         store.set_fail_writes(true);
-        assert!(matches!(store.save_hard_state(5, None), Err(PersistError::Injected)));
-        assert!(matches!(store.apply_log_ops(&[LogOp::Append(entry(1, 2))]), Err(PersistError::Injected)));
-        assert_eq!(store.snapshot().term, 4, "a failed write must change nothing");
+        assert!(matches!(
+            store.save_hard_state(5, None),
+            Err(PersistError::Injected)
+        ));
+        assert!(matches!(
+            store.apply_log_ops(&[LogOp::Append(entry(1, 2))]),
+            Err(PersistError::Injected)
+        ));
+        assert_eq!(
+            store.snapshot().term,
+            4,
+            "a failed write must change nothing"
+        );
     }
 }

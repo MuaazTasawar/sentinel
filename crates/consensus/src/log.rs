@@ -49,7 +49,10 @@ pub struct ReplicatedLog {
 
 impl ReplicatedLog {
     pub fn new() -> Self {
-        Self { entries: Vec::new(), journal: Vec::new() }
+        Self {
+            entries: Vec::new(),
+            journal: Vec::new(),
+        }
     }
 
     /// Rebuilds a log from entries loaded off disk. They must be contiguous
@@ -59,10 +62,16 @@ impl ReplicatedLog {
         for (i, e) in entries.iter().enumerate() {
             let expected = i as u64 + 1;
             if e.index != expected {
-                return Err(LogError::NonContiguous { expected, found: e.index });
+                return Err(LogError::NonContiguous {
+                    expected,
+                    found: e.index,
+                });
             }
         }
-        Ok(Self { entries, journal: Vec::new() })
+        Ok(Self {
+            entries,
+            journal: Vec::new(),
+        })
     }
 
     /// Takes the recorded mutations (oldest first), leaving the journal empty.
@@ -96,7 +105,11 @@ impl ReplicatedLog {
     /// the index it was assigned.
     pub fn append_new(&mut self, term: u64, command: Vec<u8>) -> u64 {
         let index = self.last_index() + 1;
-        let entry = LogEntry { term, index, command };
+        let entry = LogEntry {
+            term,
+            index,
+            command,
+        };
         self.journal.push(LogOp::Append(entry.clone()));
         self.entries.push(entry);
         index
@@ -108,7 +121,11 @@ impl ReplicatedLog {
         if index == 0 {
             return self.entries.clone();
         }
-        self.entries.iter().filter(|e| e.index >= index).cloned().collect()
+        self.entries
+            .iter()
+            .filter(|e| e.index >= index)
+            .cloned()
+            .collect()
     }
 
     /// At most `max` entries starting at `index`, in order. Used to bound
@@ -170,7 +187,11 @@ mod tests {
     use super::*;
 
     fn entry(term: u64, index: u64) -> LogEntry {
-        LogEntry { term, index, command: vec![index as u8] }
+        LogEntry {
+            term,
+            index,
+            command: vec![index as u8],
+        }
     }
 
     #[test]
@@ -210,14 +231,23 @@ mod tests {
         let mut log = ReplicatedLog::new();
         log.append_entries(0, 0, &[entry(1, 1)]).unwrap();
         let err = log.append_entries(1, 2, &[entry(2, 2)]).unwrap_err();
-        assert!(matches!(err, LogError::PrevTermMismatch { index: 1, local: 1, leader: 2 }));
+        assert!(matches!(
+            err,
+            LogError::PrevTermMismatch {
+                index: 1,
+                local: 1,
+                leader: 2
+            }
+        ));
     }
 
     #[test]
     fn append_entries_is_idempotent_for_identical_resend() {
         let mut log = ReplicatedLog::new();
-        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)]).unwrap();
-        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)]).unwrap();
+        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)])
+            .unwrap();
+        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)])
+            .unwrap();
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.get(1).unwrap().command, vec![1]);
     }
@@ -225,7 +255,8 @@ mod tests {
     #[test]
     fn append_entries_truncates_conflicting_suffix() {
         let mut log = ReplicatedLog::new();
-        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2), entry(1, 3)]).unwrap();
+        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .unwrap();
         log.append_entries(1, 1, &[entry(2, 2)]).unwrap();
         assert_eq!(log.last_index(), 2);
         assert_eq!(log.term_at(2), 2);
@@ -254,20 +285,39 @@ mod tests {
         assert_eq!(r.iter().map(|e| e.index).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(log.entries_range(4, 10).len(), 2);
         assert!(log.entries_range(6, 10).is_empty());
-        assert_eq!(log.entries_range(0, 1)[0].index, 1, "index 0 is treated as 'from the start'");
+        assert_eq!(
+            log.entries_range(0, 1)[0].index,
+            1,
+            "index 0 is treated as 'from the start'"
+        );
     }
 
     #[test]
     fn a_log_entry_with_no_command_is_a_noop() {
-        assert!(LogEntry { term: 1, index: 1, command: vec![] }.is_noop());
-        assert!(!LogEntry { term: 1, index: 1, command: vec![0] }.is_noop());
+        assert!(
+            LogEntry {
+                term: 1,
+                index: 1,
+                command: vec![]
+            }
+            .is_noop()
+        );
+        assert!(
+            !LogEntry {
+                term: 1,
+                index: 1,
+                command: vec![0]
+            }
+            .is_noop()
+        );
     }
 
     #[test]
     fn every_mutation_is_journaled_in_order_and_draining_empties_it() {
         let mut log = ReplicatedLog::new();
         log.append_new(1, vec![1]);
-        log.append_entries(1, 1, &[entry(1, 2), entry(1, 3)]).unwrap();
+        log.append_entries(1, 1, &[entry(1, 2), entry(1, 3)])
+            .unwrap();
         // A conflicting entry at index 2 truncates 2.. and appends the replacement.
         log.append_entries(1, 1, &[entry(2, 2)]).unwrap();
 
@@ -275,7 +325,11 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                LogOp::Append(LogEntry { term: 1, index: 1, command: vec![1] }),
+                LogOp::Append(LogEntry {
+                    term: 1,
+                    index: 1,
+                    command: vec![1]
+                }),
                 LogOp::Append(entry(1, 2)),
                 LogOp::Append(entry(1, 3)),
                 LogOp::TruncateFrom(2),
@@ -288,17 +342,24 @@ mod tests {
     #[test]
     fn an_identical_resend_journals_nothing() {
         let mut log = ReplicatedLog::new();
-        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)]).unwrap();
+        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)])
+            .unwrap();
         log.drain_journal();
-        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)]).unwrap();
-        assert!(log.drain_journal().is_empty(), "nothing changed, so nothing to persist");
+        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2)])
+            .unwrap();
+        assert!(
+            log.drain_journal().is_empty(),
+            "nothing changed, so nothing to persist"
+        );
     }
 
     #[test]
     fn replaying_the_journal_reproduces_the_log() {
         let mut log = ReplicatedLog::new();
-        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2), entry(1, 3)]).unwrap();
-        log.append_entries(1, 1, &[entry(2, 2), entry(2, 3), entry(2, 4)]).unwrap();
+        log.append_entries(0, 0, &[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .unwrap();
+        log.append_entries(1, 1, &[entry(2, 2), entry(2, 3), entry(2, 4)])
+            .unwrap();
 
         let mut rebuilt: Vec<LogEntry> = Vec::new();
         for op in log.drain_journal() {
@@ -314,11 +375,23 @@ mod tests {
     fn from_entries_accepts_a_contiguous_log_and_rejects_gaps() {
         let ok = ReplicatedLog::from_entries(vec![entry(1, 1), entry(1, 2)]).unwrap();
         assert_eq!(ok.last_index(), 2);
-        assert!(ok.clone().drain_journal().is_empty(), "loading is not a mutation");
+        assert!(
+            ok.clone().drain_journal().is_empty(),
+            "loading is not a mutation"
+        );
 
         let gap = ReplicatedLog::from_entries(vec![entry(1, 1), entry(1, 3)]).unwrap_err();
-        assert!(matches!(gap, LogError::NonContiguous { expected: 2, found: 3 }));
-        assert!(ReplicatedLog::from_entries(vec![entry(1, 2)]).is_err(), "must start at 1");
+        assert!(matches!(
+            gap,
+            LogError::NonContiguous {
+                expected: 2,
+                found: 3
+            }
+        ));
+        assert!(
+            ReplicatedLog::from_entries(vec![entry(1, 2)]).is_err(),
+            "must start at 1"
+        );
     }
 
     #[test]

@@ -62,7 +62,12 @@ fn gf_inv(a: u8) -> u8 {
     r
 }
 
-fn split_byte(secret_byte: u8, threshold: u8, total_shares: u8, rng: &mut impl RngCore) -> Vec<(u8, u8)> {
+fn split_byte(
+    secret_byte: u8,
+    threshold: u8,
+    total_shares: u8,
+    rng: &mut impl RngCore,
+) -> Vec<(u8, u8)> {
     let mut coeffs = Vec::with_capacity(threshold as usize);
     coeffs.push(secret_byte);
     let mut rand_byte = [0u8; 1];
@@ -111,13 +116,18 @@ pub fn split_secret(
         return Err(ShamirError::ThresholdTooLow(threshold));
     }
     if total_shares < threshold {
-        return Err(ShamirError::NotEnoughShares { total: total_shares, threshold });
+        return Err(ShamirError::NotEnoughShares {
+            total: total_shares,
+            threshold,
+        });
     }
     if total_shares == 0 {
         return Err(ShamirError::TooManyShares(0));
     }
 
-    let mut per_share_bytes: Vec<Vec<u8>> = (0..total_shares).map(|_| Vec::with_capacity(secret.len())).collect();
+    let mut per_share_bytes: Vec<Vec<u8>> = (0..total_shares)
+        .map(|_| Vec::with_capacity(secret.len()))
+        .collect();
     for &byte in secret {
         let points = split_byte(byte, threshold, total_shares, rng);
         for (idx, (_x, y)) in points.into_iter().enumerate() {
@@ -208,7 +218,10 @@ mod tests {
     fn rejects_total_less_than_threshold() {
         assert!(matches!(
             split_secret(b"x", 3, 2, &mut OsRng),
-            Err(ShamirError::NotEnoughShares { total: 2, threshold: 3 })
+            Err(ShamirError::NotEnoughShares {
+                total: 2,
+                threshold: 3
+            })
         ));
     }
 
@@ -216,14 +229,20 @@ mod tests {
     fn rejects_mismatched_share_lengths() {
         let mut shares = split_secret(b"abcd", 2, 3, &mut OsRng).unwrap();
         shares[0].y.pop();
-        assert!(matches!(combine_shares(&shares[..2]), Err(ShamirError::MismatchedShareLengths)));
+        assert!(matches!(
+            combine_shares(&shares[..2]),
+            Err(ShamirError::MismatchedShareLengths)
+        ));
     }
 
     #[test]
     fn rejects_duplicate_shares() {
         let shares = split_secret(b"abcd", 2, 3, &mut OsRng).unwrap();
         let dup = vec![shares[0].clone(), shares[0].clone()];
-        assert!(matches!(combine_shares(&dup), Err(ShamirError::DuplicateShare(_))));
+        assert!(matches!(
+            combine_shares(&dup),
+            Err(ShamirError::DuplicateShare(_))
+        ));
     }
 
     #[test]

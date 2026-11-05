@@ -39,7 +39,8 @@ impl Storage for SledStorage {
         tokio::task::spawn_blocking(move || {
             db.insert(key.as_bytes(), value)
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
-            db.flush().map_err(|e| StorageError::Backend(e.to_string()))?;
+            db.flush()
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
             Ok(())
         })
         .await
@@ -52,7 +53,8 @@ impl Storage for SledStorage {
         tokio::task::spawn_blocking(move || {
             db.remove(key.as_bytes())
                 .map_err(|e| StorageError::Backend(e.to_string()))?;
-            db.flush().map_err(|e| StorageError::Backend(e.to_string()))?;
+            db.flush()
+                .map_err(|e| StorageError::Backend(e.to_string()))?;
             Ok(())
         })
         .await
@@ -66,9 +68,8 @@ impl Storage for SledStorage {
             db.scan_prefix(prefix.as_bytes())
                 .keys()
                 .map(|res| {
-                    res.map_err(|e| StorageError::Backend(e.to_string())).map(|ivec| {
-                        String::from_utf8_lossy(&ivec).into_owned()
-                    })
+                    res.map_err(|e| StorageError::Backend(e.to_string()))
+                        .map(|ivec| String::from_utf8_lossy(&ivec).into_owned())
                 })
                 .collect::<Result<Vec<String>, StorageError>>()
         })
@@ -90,7 +91,10 @@ mod tests {
     #[tokio::test]
     async fn put_then_get_round_trips() {
         let (storage, _dir) = temp_storage().await;
-        storage.put("secrets/db-password", b"hunter2".to_vec()).await.unwrap();
+        storage
+            .put("secrets/db-password", b"hunter2".to_vec())
+            .await
+            .unwrap();
         let value = storage.get("secrets/db-password").await.unwrap();
         assert_eq!(value, b"hunter2");
     }
@@ -107,7 +111,10 @@ mod tests {
         let (storage, _dir) = temp_storage().await;
         storage.put("k", vec![1, 2, 3]).await.unwrap();
         storage.delete("k").await.unwrap();
-        assert!(matches!(storage.get("k").await, Err(StorageError::NotFound(_))));
+        assert!(matches!(
+            storage.get("k").await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
