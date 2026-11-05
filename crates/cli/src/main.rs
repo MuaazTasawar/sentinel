@@ -1,3 +1,5 @@
+#[macro_use]
+mod out;
 mod init;
 mod pki;
 mod unseal;
@@ -140,10 +142,19 @@ enum PkiCommand {
 
 fn passphrase_for(holder: &str, prefix: &Option<String>) -> anyhow::Result<String> {
     if let Some(prefix) = prefix {
-        let var = format!("{prefix}_{}", holder.to_ascii_uppercase().replace(|c: char| !c.is_ascii_alphanumeric(), "_"));
-        return std::env::var(&var).map_err(|_| anyhow::anyhow!("environment variable {var} is not set"));
+        let var = format!(
+            "{prefix}_{}",
+            holder
+                .to_ascii_uppercase()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+        );
+        return std::env::var(&var)
+            .map_err(|_| anyhow::anyhow!("environment variable {var} is not set"));
     }
-    let first = rpassword::prompt_password(format!("Passphrase for {holder} (min {} characters): ", init::MIN_PASSPHRASE_LEN))?;
+    let first = rpassword::prompt_password(format!(
+        "Passphrase for {holder} (min {} characters): ",
+        init::MIN_PASSPHRASE_LEN
+    ))?;
     let second = rpassword::prompt_password(format!("Repeat passphrase for {holder}: "))?;
     if first != second {
         anyhow::bail!("the two passphrases for {holder} did not match");
@@ -162,8 +173,9 @@ fn main() -> anyhow::Result<()> {
             let encrypted_shares: Vec<(String, Vec<u8>)> = manifest_entries
                 .into_iter()
                 .map(|(holder, path)| -> anyhow::Result<(String, Vec<u8>)> {
-                    let bytes = std::fs::read(&path)
-                        .map_err(|e| anyhow::anyhow!("failed to read share for {holder} at {path}: {e}"))?;
+                    let bytes = std::fs::read(&path).map_err(|e| {
+                        anyhow::anyhow!("failed to read share for {holder} at {path}: {e}")
+                    })?;
                     Ok((holder, bytes))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -176,25 +188,44 @@ fn main() -> anyhow::Result<()> {
             std::io::stdin().read_to_string(&mut input)?;
             let client = NodeClient::connect(&node)?;
             match client.submit_share(&holder, input.trim())? {
-                SubmitOutcome::Unsealed => println!("unsealed"),
-                SubmitOutcome::Pending { contributed, threshold } => println!("pending {contributed}/{threshold}"),
+                SubmitOutcome::Unsealed => outln!("unsealed"),
+                SubmitOutcome::Pending {
+                    contributed,
+                    threshold,
+                } => outln!("pending {contributed}/{threshold}"),
             }
             Ok(())
         }
         Commands::Seal { node } => {
             NodeClient::connect(&node)?.seal()?;
-            println!("sealed");
+            outln!("sealed");
             Ok(())
         }
         Commands::ResetUnseal { node } => {
             NodeClient::connect(&node)?.reset_session()?;
-            println!("unseal session reset");
+            outln!("unseal session reset");
             Ok(())
         }
-        Commands::Verify { path, expect_tip, expect_entries, allow_torn_tail } => {
-            verify::run(path, &verify::VerifyOptions { expect_tip, expect_entries, allow_torn_tail })
-        }
-        Commands::Init { holders, threshold, out, format, passphrase_env_prefix } => {
+        Commands::Verify {
+            path,
+            expect_tip,
+            expect_entries,
+            allow_torn_tail,
+        } => verify::run(
+            path,
+            &verify::VerifyOptions {
+                expect_tip,
+                expect_entries,
+                allow_torn_tail,
+            },
+        ),
+        Commands::Init {
+            holders,
+            threshold,
+            out,
+            format,
+            passphrase_env_prefix,
+        } => {
             let format = match format.as_str() {
                 "passphrase" => init::ShareFormat::Passphrase,
                 "plain" => init::ShareFormat::Plain,
@@ -206,43 +237,77 @@ fn main() -> anyhow::Result<()> {
                     passphrases.insert(h.clone(), passphrase_for(h, &passphrase_env_prefix)?);
                 }
             }
-            let report = init::provision(&init::InitParams { holders, threshold, out, format }, &passphrases)?;
-            println!("Vault provisioned.");
-            println!("  canary:        {}", report.canary_file.display());
+            let report = init::provision(
+                &init::InitParams {
+                    holders,
+                    threshold,
+                    out,
+                    format,
+                },
+                &passphrases,
+            )?;
+            outln!("Vault provisioned.");
+            outln!("  canary:        {}", report.canary_file.display());
             for (holder, path) in &report.share_files {
-                println!("  share ({holder}): {}", path.display());
+                outln!("  share ({holder}): {}", path.display());
             }
-            println!("  instructions:  {}", report.instructions.display());
-            println!("The root key was never written to disk. Read the instructions file next.");
+            outln!("  instructions:  {}", report.instructions.display());
+            outln!("The root key was never written to disk. Read the instructions file next.");
             Ok(())
         }
-        Commands::UnsealFile { node, file, passphrase_env } => {
-            let text = std::fs::read_to_string(&file).map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
+        Commands::UnsealFile {
+            node,
+            file,
+            passphrase_env,
+        } => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
             let passphrase = match passphrase_env {
-                Some(var) => std::env::var(&var).map_err(|_| anyhow::anyhow!("environment variable {var} is not set"))?,
+                Some(var) => std::env::var(&var)
+                    .map_err(|_| anyhow::anyhow!("environment variable {var} is not set"))?,
                 None => rpassword::prompt_password("Passphrase: ")?,
             };
             let (holder, share_bytes) = init::open_share(&text, &passphrase)?;
             let client = NodeClient::connect(&node)?;
             match client.submit_share(&holder, &init::to_hex(&share_bytes))? {
-                SubmitOutcome::Unsealed => println!("{holder}: share accepted. Quorum reached: the node is unsealed."),
-                SubmitOutcome::Pending { contributed, threshold } => println!("{holder}: share accepted ({contributed}/{threshold} so far)"),
+                SubmitOutcome::Unsealed => {
+                    outln!("{holder}: share accepted. Quorum reached: the node is unsealed.")
+                }
+                SubmitOutcome::Pending {
+                    contributed,
+                    threshold,
+                } => outln!("{holder}: share accepted ({contributed}/{threshold} so far)"),
             }
             Ok(())
         }
         Commands::Pki(PkiCommand::Ca { out, cn, days }) => {
             let (crt, key) = pki::create_ca(&out, &cn, days)?;
-            println!("CA created:\n  certificate: {}\n  private key: {} (keep this offline and safe)", crt.display(), key.display());
+            outln!(
+                "CA created:\n  certificate: {}\n  private key: {} (keep this offline and safe)",
+                crt.display(),
+                key.display()
+            );
             Ok(())
         }
-        Commands::Pki(PkiCommand::Issue { ca, out, cn, kind, sans, days }) => {
+        Commands::Pki(PkiCommand::Issue {
+            ca,
+            out,
+            cn,
+            kind,
+            sans,
+            days,
+        }) => {
             let kind = match kind.as_str() {
                 "node" => pki::CertKind::Node,
                 "client" => pki::CertKind::Client,
                 other => anyhow::bail!("unknown --kind {other:?}: use `node` or `client`"),
             };
             let (crt, key) = pki::issue(&ca, &out, &cn, kind, &sans, days)?;
-            println!("issued {cn}:\n  certificate: {}\n  private key: {}", crt.display(), key.display());
+            outln!(
+                "issued {cn}:\n  certificate: {}\n  private key: {}",
+                crt.display(),
+                key.display()
+            );
             Ok(())
         }
     }

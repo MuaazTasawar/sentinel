@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Context};
-use sentinel_audit::{parse_log, AuditChain};
+use anyhow::{Context, bail};
+use sentinel_audit::{AuditChain, parse_log};
 
 /// What to check beyond the chain being internally consistent.
 #[derive(Debug, Default, Clone)]
@@ -22,39 +22,55 @@ pub struct VerifyOptions {
 /// failure, and returns an error so it is safe in scripts and CI
 /// (`sentinel-cli verify audit.jsonl && deploy.sh`).
 pub fn run(path: PathBuf, opts: &VerifyOptions) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let parsed = parse_log(&raw).map_err(|e| anyhow::anyhow!("failed to parse {} as an audit log: {e}", path.display()))?;
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed = parse_log(&raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse {} as an audit log: {e}", path.display()))?;
 
     if parsed.torn_tail {
         if opts.allow_torn_tail {
-            println!("note: the final record is incomplete and was ignored (expected only after a crash)");
+            outln!(
+                "note: the final record is incomplete and was ignored (expected only after a crash)"
+            );
         } else {
-            println!("audit log has an INCOMPLETE FINAL RECORD");
-            bail!("the final record in {} is incomplete; rerun with --allow-torn-tail if this log was copied while the node was writing or after a crash", path.display());
+            outln!("audit log has an INCOMPLETE FINAL RECORD");
+            bail!(
+                "the final record in {} is incomplete; rerun with --allow-torn-tail if this log was copied while the node was writing or after a crash",
+                path.display()
+            );
         }
     }
 
     let chain = AuditChain::from_entries(parsed.entries);
     if let Err(e) = chain.verify() {
-        println!("chain INTEGRITY VIOLATION: {e}");
+        outln!("chain INTEGRITY VIOLATION: {e}");
         bail!("audit chain verification failed: {e}");
     }
     let tip = hex_encode(&chain.tip_hash());
-    println!("chain OK - {} entries, tip hash {tip}", chain.entries().len());
+    outln!(
+        "chain OK - {} entries, tip hash {tip}",
+        chain.entries().len()
+    );
 
     if let Some(expected) = &opts.expect_tip {
         let expected = expected.trim().to_ascii_lowercase();
         if expected != tip {
-            println!("TIP MISMATCH: expected {expected}");
-            bail!("the log's tip hash does not match the expected one: entries may have been removed from the end, or the log was replaced");
+            outln!("TIP MISMATCH: expected {expected}");
+            bail!(
+                "the log's tip hash does not match the expected one: entries may have been removed from the end, or the log was replaced"
+            );
         }
-        println!("tip hash matches the expected value");
+        outln!("tip hash matches the expected value");
     }
     if let Some(min) = opts.expect_entries
-        && chain.entries().len() < min {
-            println!("TOO FEW ENTRIES: expected at least {min}");
-            bail!("the log has {} entries but at least {min} were expected: entries may have been removed", chain.entries().len());
-        }
+        && chain.entries().len() < min
+    {
+        outln!("TOO FEW ENTRIES: expected at least {min}");
+        bail!(
+            "the log has {} entries but at least {min} were expected: entries may have been removed",
+            chain.entries().len()
+        );
+    }
     Ok(())
 }
 
@@ -65,7 +81,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_audit::{open_persistent, AuditChain as Chain};
+    use sentinel_audit::{AuditChain as Chain, open_persistent};
 
     fn write_chain(path: &std::path::Path, chain: &Chain) {
         let json = serde_json::to_string_pretty(chain.entries()).unwrap();
@@ -127,7 +143,9 @@ mod tests {
     fn a_tampered_node_log_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let (path, _) = node_written_log(dir.path(), 4);
-        let text = std::fs::read_to_string(&path).unwrap().replace("event 2", "event X");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("event 2", "event X");
         std::fs::write(&path, text).unwrap();
         assert!(run(path, &opts()).is_err());
     }
@@ -138,17 +156,35 @@ mod tests {
         let (path, recorded_tip) = node_written_log(dir.path(), 6);
 
         // Untouched: passes with the recorded tip.
-        let with_tip = VerifyOptions { expect_tip: Some(recorded_tip.to_uppercase()), ..opts() };
-        assert!(run(path.clone(), &with_tip).is_ok(), "tip comparison is case-insensitive");
+        let with_tip = VerifyOptions {
+            expect_tip: Some(recorded_tip.to_uppercase()),
+            ..opts()
+        };
+        assert!(
+            run(path.clone(), &with_tip).is_ok(),
+            "tip comparison is case-insensitive"
+        );
 
         // An attacker deletes the newest two entries. The chain still verifies...
         let text = std::fs::read_to_string(&path).unwrap();
         let kept: String = text.lines().take(4).map(|l| format!("{l}\n")).collect();
         std::fs::write(&path, kept).unwrap();
-        assert!(run(path.clone(), &opts()).is_ok(), "the truncated chain is internally consistent");
+        assert!(
+            run(path.clone(), &opts()).is_ok(),
+            "the truncated chain is internally consistent"
+        );
         // ...but the externally recorded tip, or entry count, exposes it.
         assert!(run(path.clone(), &with_tip).is_err());
-        assert!(run(path, &VerifyOptions { expect_entries: Some(6), ..opts() }).is_err());
+        assert!(
+            run(
+                path,
+                &VerifyOptions {
+                    expect_entries: Some(6),
+                    ..opts()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -159,8 +195,20 @@ mod tests {
         text.push_str("{\"index\":3,\"timestamp\":\"2026-01-01");
         std::fs::write(&path, text).unwrap();
 
-        assert!(run(path.clone(), &opts()).is_err(), "must not silently accept an incomplete record");
-        assert!(run(path, &VerifyOptions { allow_torn_tail: true, ..opts() }).is_ok());
+        assert!(
+            run(path.clone(), &opts()).is_err(),
+            "must not silently accept an incomplete record"
+        );
+        assert!(
+            run(
+                path,
+                &VerifyOptions {
+                    allow_torn_tail: true,
+                    ..opts()
+                }
+            )
+            .is_ok()
+        );
     }
 
     #[test]

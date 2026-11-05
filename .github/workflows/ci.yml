@@ -60,6 +60,50 @@ jobs:
             echo "sentinel-node must not depend on the smart-card stack"; exit 1
           fi
 
+  # A gate: the tree is formatted with rustfmt, so a diff never mixes real
+  # changes with whitespace churn. Fix a failure locally with `cargo fmt --all`.
+  fmt:
+    name: rustfmt (must be formatted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # NOT a gate yet (continue-on-error). macOS has never been built or tested by
+  # the author, so a failure here is information, not a verdict. Once it has
+  # been green for a while, delete `continue-on-error` to make it a gate.
+  macos:
+    name: build and test (macos-latest, non-blocking)
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace --no-fail-fast
+
+  # NOT a gate yet. Cargo.toml declares rust-version = 1.87; this checks that a
+  # 1.87 toolchain can really build the workspace (a dependency may need newer).
+  # If it fails, either raise `rust-version` or pin the dependency.
+  msrv:
+    name: minimum Rust version 1.87 (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PC/SC development files (Linux)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
+      - run: cargo check --workspace --all-targets --locked
+
   clippy:
     name: clippy (warnings are errors)
     runs-on: ubuntu-latest

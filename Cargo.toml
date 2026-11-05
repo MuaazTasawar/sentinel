@@ -19,7 +19,7 @@ edition = "2024"
 version = "0.1.0"
 license = "MIT"
 authors = ["MuaazTasawar"]
-rust-version = "1.85"
+rust-version = "1.87"
 
 [profile.release]
 lto = true

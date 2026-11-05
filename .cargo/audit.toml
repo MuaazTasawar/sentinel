@@ -1,0 +1,21 @@
+# Advisories that `cargo audit` is told to accept, and why. Every entry must say
+# why it does not apply, and what would remove it. Review this file whenever a
+# dependency is updated.
+
+[advisories]
+ignore = [
+    # `rsa` 0.9: Marvin Attack (timing side channel in RSA decryption).
+    # No patched version exists. It is reached ONLY through the `yubikey` crate,
+    # i.e. the sentinel-cli hardware-key feature, which is unverified and not
+    # used by `init` (passphrase-protected shares). The server does not depend
+    # on it: CI fails if `cargo tree -p sentinel-node` mentions yubikey.
+    # Remove when: the hardware path is redesigned, or `rsa` ships a fix.
+    "RUSTSEC-2023-0071",
+
+    # `crypto-bigint` 0.5: timing variability in operations meant to be
+    # constant-time. Reached ONLY through `yubikey` -> `p256`/`p384` ->
+    # `elliptic-curve`; the fix is crypto-bigint >= 0.7, which needs a new
+    # `yubikey` release. Same reachability argument as above.
+    # Remove when: `yubikey` updates its elliptic-curve stack.
+    "RUSTSEC-2026-0387",
+]
