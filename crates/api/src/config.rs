@@ -50,6 +50,10 @@ pub struct NodeConfig {
     /// Common Names allowed to read/list secrets and view status.
     #[serde(default)]
     pub reader_cns: Vec<String>,
+    /// Common Names of monitoring systems: they may call only `/healthz`,
+    /// `/readyz` and `/metrics`, and cannot read secrets or the dashboard.
+    #[serde(default)]
+    pub monitor_cns: Vec<String>,
     /// Certificate serial numbers (hex) to refuse after the TLS handshake.
     #[serde(default)]
     pub revoked_serials: Vec<String>,
@@ -103,6 +107,7 @@ impl NodeConfig {
             admin_cns: self.admin_cns.clone(),
             writer_cns: self.writer_cns.clone(),
             reader_cns: self.reader_cns.clone(),
+            monitor_cns: self.monitor_cns.clone(),
             revoked_serials: self.revoked_serials.clone(),
             insecure_allow_any_client: self.insecure_allow_any_client,
         }
@@ -159,6 +164,7 @@ impl NodeConfig {
             .with_list_parse_key("admin_cns")
             .with_list_parse_key("writer_cns")
             .with_list_parse_key("reader_cns")
+            .with_list_parse_key("monitor_cns")
             .with_list_parse_key("revoked_serials")
             .try_parsing(true)
             .source(env_override);

@@ -154,7 +154,10 @@ pub async fn submit_share(
     *session = state.unseal.fresh_session();
     drop(session);
 
-    let bytes = reconstructed.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let bytes = reconstructed.map_err(|e| {
+        crate::metrics::Metrics::bump(&state.metrics.unseal_failures);
+        AppError::BadRequest(e.to_string())
+    })?;
     let kek = SecretBytes::new(bytes);
 
     if let Err(e) = verify_or_initialise_canary(&state, &kek).await {
@@ -162,10 +165,12 @@ pub async fn submit_share(
             "UNSEAL FAILED (quorum submitted by {}): {e}",
             identity.0
         ));
+        crate::metrics::Metrics::bump(&state.metrics.unseal_failures);
         return Err(e);
     }
 
     *state.kek.lock().await = Some(kek);
+    crate::metrics::Metrics::bump(&state.metrics.unseals);
     state.audit.lock().await.append(format!(
         "vault UNSEALED (quorum completed by {})",
         identity.0

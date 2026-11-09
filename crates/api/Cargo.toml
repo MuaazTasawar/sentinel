@@ -14,7 +14,6 @@ config = "0.15.25"
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "server-auto"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = "0.23.43"
-rustls-pemfile = "2.2.0"
 sentinel-anomaly = { version = "0.1.0", path = "../anomaly" }
 sentinel-audit = { version = "0.1.0", path = "../audit" }
 sentinel-consensus = { version = "0.1.0", path = "../consensus" }

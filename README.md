@@ -12,7 +12,7 @@ durable hash-chained audit log · statistical auto-seal · deterministic simulat
 ![Axum](https://img.shields.io/badge/HTTP-Axum%200.8-5b21b6)
 ![TLS](https://img.shields.io/badge/TLS-rustls%20mTLS-2ea043)
 ![Crypto](https://img.shields.io/badge/AEAD-AES--256--GCM-0f766e)
-![Tests](https://img.shields.io/badge/tests-296%20passing-2ea043)
+![Tests](https://img.shields.io/badge/tests-311%20passing-2ea043)
 ![Crates](https://img.shields.io/badge/workspace-9%20crates-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -66,7 +66,7 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (296 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (311 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
@@ -77,7 +77,8 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | **Writes gated on majority commit**; storage changed only by the apply loop | ✅ | A leader without a majority returns 504 and writes nothing (tested) |
 | **Cluster-wide seal** (`Seal` command applied on every node) | ✅ | 3-node test; follower-detected anomalies are forwarded to the leader |
 | mTLS listener with mandatory client certificates | ✅ | Real handshakes; no cert / untrusted CA rejected |
-| **Role-based authorization** (peer / admin / writer / reader, default-deny) | ✅ | 24 policy and router tests; real-cluster run with an intruder certificate |
+| **Role-based authorization** (peer / admin / writer / reader / monitor, default-deny) | ✅ | Policy and router tests; real-cluster run with an intruder certificate |
+| **Health, readiness and metrics** for monitoring (`/healthz`, `/readyz`, `/metrics`) behind their own `monitor` role | ✅ | 15 tests, 8 mutation checks, and a real run with real certificates; **not yet tried with an actual Prometheus** |
 | **Certificate revocation** (serial deny-list) | ✅ | Revoked client cannot connect (real run) |
 | Quorum unseal of a **running node** (`/sys/unseal`, node-side quorum) | ✅ | Handler tests; real 3-node unseal with passphrase-protected shares |
 | **Provisioning**: `sentinel-cli init`, `pki ca`, `pki issue` | ✅ | 14 CLI tests; whole vault provisioned with no `openssl` |
@@ -652,11 +653,11 @@ Why both: the property tests catch regressions on every commit; the fuzzers find
 | `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `RaftHandle::{propose, propose_and_wait, inspect, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 74 |
 | `sentinel-hardware` | `crates/hardware` | Quorum + YubiKey (**hardware path unverified**; the `yubikey` feature, on by default, is off for the server) | `QuorumUnseal`, `UnsealFragment`, `YubiKeyUnsealer` | 5 |
 | `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 18 |
-| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 79 |
+| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 94 |
 | `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld::{propose, crash, restart, check_all, ...}`, `NetworkConditions` | 16 + 8 + 7 |
 | `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 32 + 2 |
 
-**Total: 296 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
+**Total: 311 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
 
 Key dependencies (resolved in `Cargo.lock`): `axum 0.8`, `tokio 1.53`, `rustls 0.23`, `tokio-rustls 0.26`, `hyper-util 0.1`, `reqwest 0.12` (rustls), `x509-parser 0.16`, `rcgen 0.13`, `aes-gcm 0.10`, `argon2 0.5`, `hkdf 0.12`, `sled 0.34`, `yubikey 0.8`, `zeroize 1.9`, `proptest 1.11`, `chrono 0.4`.
 
@@ -673,6 +674,9 @@ All routes are served **only** over mTLS, and every route group requires a role 
 | `GET /` | admin, reader, writer | Dashboard page (polls `/api/status`) |
 | `GET /api/status` | admin, reader, writer | JSON: role, term, commit index, sealed, audit (verified, persistent, healthy, tip hash, recent events), anomaly snapshot |
 | `GET /cluster/status` | admin, reader, writer | `{role, term, commit_index, applied_index}` |
+| `GET /healthz` | monitor, admin | Liveness: `200 {"status":"ok"}`, or `503` if the Raft actor stops answering (the failure class of an earlier deadlock) |
+| `GET /readyz` | monitor, admin | Readiness: `200 {"ready":true,"role":...}`, or `503 {"ready":false,"reasons":[...]}` while the vault is sealed, the audit log cannot be written, or Raft is unresponsive. It does **not** prove a leader exists; a write sent to a follower still gets `421` |
+| `GET /metrics` | monitor, admin | Prometheus text (format 0.0.4): sealed, audit health and size, Raft term/indexes/leadership, and counters for reads, writes, deletes, denials, auto-seals and unseals. Values are numbers only: no identity or secret name appears in it |
 | `GET /secrets` | reader, writer | List secret names (`503` if sealed) |
 | `GET /secrets/{key}` | reader, writer | Decrypt and return. Successful reads feed the anomaly detector |
 | `PUT /secrets/{key}` | writer | Encrypt, replicate, return only after a **majority commit** and local apply. Leader only |
@@ -758,6 +762,7 @@ Settings come from an optional **`.env.toml`** in the working directory and from
 | `peer_cns` | `[]` | Common Names of the other cluster nodes (required whenever `peers` is set) |
 | `admin_cns` | `[]` | Identities allowed to seal/unseal (at least one required) |
 | `writer_cns`, `reader_cns` | `[]` | Identities allowed to write/delete+read, or read only (at least one of the two required) |
+| `monitor_cns` | `[]` | Monitoring identities: `/healthz`, `/readyz` and `/metrics` only. They cannot read secrets or the dashboard (which shows audit events). A node certificate cannot also be a monitor |
 | `revoked_serials` | `[]` | Certificate serial numbers (hex) refused after the handshake |
 | `audit_path` | `<storage_path>.audit.jsonl` | The durable audit log |
 | `canary_file` | none | The `canary.bin` from `init`, installed into storage at startup |
@@ -869,6 +874,40 @@ cd crates/crypto && cargo +nightly fuzz run decrypt
 
 See [§11.3](#113-what-has-not-been-executed): these have not been run by the author.
 
+### 10.9 Health checks and metrics
+
+Give the monitoring system its own client certificate (`pki issue ... --kind client --cn prometheus`) and list it:
+
+```toml
+monitor_cns = ["prometheus"]
+```
+
+It can then call exactly three routes, and nothing else (no secrets, no dashboard):
+
+```bash
+curl --cacert pki/ca.crt --cert pki/prometheus.crt --key pki/prometheus.key https://localhost:8443/healthz   # {"status":"ok"}
+curl ... https://localhost:8443/readyz     # 200 when unsealed and healthy; 503 with "reasons" otherwise
+curl ... https://localhost:8443/metrics    # Prometheus text
+```
+
+A Prometheus scrape job looks like this (**written from the documentation; only `curl` was used to test it**):
+
+```yaml
+scrape_configs:
+  - job_name: sentinel
+    scheme: https
+    metrics_path: /metrics
+    tls_config:
+      ca_file: pki/ca.crt
+      cert_file: pki/prometheus.crt
+      key_file: pki/prometheus.key
+      server_name: localhost        # must be one of the node certificate's SANs
+    static_configs:
+      - targets: ["node1:8443"]
+```
+
+Notes: every request needs a client certificate, so a plain HTTP probe (such as a Kubernetes `httpGet`) cannot call these routes; use a probe that can present a certificate. `/readyz` says whether *this node* should receive traffic (unsealed, audit log writable, Raft responding); it does not prove that the cluster has a leader. Useful alerts: `sentinel_sealed == 1`, `sentinel_audit_healthy == 0`, `sentinel_raft_responsive == 0`, an increase in `sentinel_auto_seals_total` or `sentinel_unseal_failures_total`, and a rapid increase in `sentinel_authz_denials_total`.
+
 ---
 
 ## 11. Testing, Fuzzing & Verification
@@ -928,6 +967,7 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 10. **`sentinel-cli ... | head` panicked**: `println!` panics when the reader of a pipe goes away, so the CLI printed a panic message and exited with status 101. The fix (`outln!`) discards only `BrokenPipe` and keeps running, so exit codes are unchanged: a tampered log still makes `verify` fail even when its report could not be printed. The first version of the integration test passed on broken code about one run in three, because it closed the pipe *after* spawning the child and so raced with the child's first print. It now creates the pipe and drops its reader *before* spawning, which makes the failure deterministic (it fails 5 of 5 runs with the fix removed).
 11. **Eleven known vulnerabilities in dependencies**, found by the first run of `cargo audit` (added in phase 19; nothing had checked before). Four in `rustls` (among them TLS 1.3 handshake messages accepted across encryption levels, and an unauthenticated ServerHello that could downgrade key exchange), one in `rustls-webpki` (certificate verification accepting distrusted intermediates), one in `webpki-roots`, three in `quinn-proto`, plus a `tokio` soundness warning. All of these were fixed by a lockfile-only update of five crates (`cargo update -p rustls -p rustls-webpki -p webpki-roots -p quinn-proto -p tokio`); the tests and clippy were re-run on the result. Two advisories remain and are accepted explicitly: see §13.2 item 13. How exploitable each one was *in this project* was not assessed. `rustls` and `rustls-webpki` are in the server's TLS path; `quinn-proto` was in the lockfile but not in the normal build graph that was inspected. The point is that nothing was checking: the audit now runs whenever dependencies change and daily, not once.
 12. **The anti-deadlock stress test failed on a slow machine**: `repeated_elections_do_not_deadlock_under_tight_simultaneous_timeouts` required exactly one leader within 2 s with 30-60 ms election timeouts. On a machine slowed roughly 20x it failed 8 of 8 runs, with the old and the new `tokio` alike (so it was not caused by the dependency update, which was suspected first): heartbeats later than the election timeout make leadership change continuously, which is not a deadlock. The deadline is now 20 s. A real deadlock never recovers, so it fails at any deadline: with the original bug reintroduced (awaiting vote replies inline) the test fails at exactly 20 s in about 6 of 10 runs, because the deadlock only occurs when two nodes happen to campaign at the same moment. It passes 6 of 6 under the load that failed 8 of 8 before.
+13. **A test that listed permissions by hand silently skipped a new one**: `each_role_gets_exactly_its_permissions` iterated a fixed array of permissions, so adding `Observe` would not have been checked by it at all. It was found while adding the monitor role, before it mattered; the array now includes `Observe`, and a mutation that lets readers observe is caught by three tests. Worth remembering for the next permission.
 
 ---
 
@@ -942,7 +982,7 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 | No single person can unseal | Shamir K-of-N; each holder submits only their own share |
 | A wrong or partial quorum is rejected | The rebuilt key must open the provisioned canary; no trust-on-first-use by default |
 | Every client is authenticated and authorized | Mandatory mTLS, then a default-deny role policy; revoked serials refused |
-| A node certificate cannot read secrets; an admin cannot either | Roles are separate by design |
+| A node certificate cannot read secrets; an admin cannot either; a monitor cannot do anything except observe | Roles are separate by design. `/metrics` carries only numbers: no identity or secret name |
 | An acknowledged write is on a majority and survives restarts | Commit-gated writes; fsync'd Raft state; whole-cluster restart tested |
 | The audit trail is tamper-evident and durable | Hash chain, fsync per entry, verified at startup; a tampered log stops the node |
 | No secret operation without a durable audit record | Fail-closed when the audit log cannot be written |
@@ -1011,7 +1051,7 @@ The original list of problems in this project (functional gaps, security finding
 11. **Unsealing is manual per node.** The key lives only in memory, so every restart needs a new quorum on every node.
 12. **Share distribution is out of band.** `init` produces files; getting each to its holder safely is your responsibility.
 13. **Two dependency advisories are accepted, not fixed** (`.cargo/audit.toml`): `rsa` (Marvin timing attack, RUSTSEC-2023-0071, no patched release exists) and `crypto-bigint` 0.5 (RUSTSEC-2026-0387, needs `crypto-bigint` 0.7, which needs a new `yubikey` release). Both are reached **only** through the `yubikey` crate, i.e. the unverified hardware-key feature of `sentinel-cli`. The server does not depend on them, and CI fails if it ever starts to. They go away with the hardware-key redesign (item 1).
-14. **Unmaintained dependencies** (warnings, not vulnerabilities): `bincode` 1.x (used for the envelope and seal-command encodings, so replacing it is a stored-data format migration), `rustls-pemfile` (replaceable by the PEM parser in `rustls-pki-types`), and `fxhash` and `instant`, which come in through `sled` 0.34, itself unmaintained.
+14. **Unmaintained dependencies** (warnings, not vulnerabilities): `bincode` 1.x (used for the envelope and seal-command encodings, so replacing it is a stored-data format migration), and `fxhash` and `instant`, which come in through `sled` 0.34, itself unmaintained. (`rustls-pemfile`, also unmaintained, was replaced by the PEM parser in `rustls-pki-types`, which was already a dependency.)
 
 ---
 
@@ -1020,14 +1060,14 @@ The original list of problems in this project (functional gaps, security finding
 **Next, in rough priority order:**
 
 - [ ] Resolve the hardware-key design on a real device (see §13.2-1), then re-enable hardware shares in `init`. This also removes the two accepted advisories (§13.2-13).
-- [ ] Replace `rustls-pemfile` with `rustls-pki-types`' PEM parser; plan the `bincode` 1.x format migration and a replacement for the `sled` backend (§13.2-14).
+- [ ] Plan the `bincode` 1.x format migration and a replacement for the `sled` backend (§13.2-14).
 - [ ] Snapshots and log compaction for Raft and the WAL.
 - [ ] Linearizable reads (read-index or lease reads) as an option.
 - [ ] Replicate or merge audit logs; periodic external tip anchoring.
 - [ ] Dynamic membership (joint consensus).
 - [ ] CRL/OCSP or short-lived certificates instead of a restart-time deny-list.
 - [ ] Auto-unseal options (KMS) for restarts, with their own threat model.
-- [ ] Metrics, readiness endpoint, packaged releases.
+- [ ] Packaged releases.
 
 **Done in phases 12-19:** everything in §13.1.
 
@@ -1057,7 +1097,7 @@ sentinel/
     ├── sim/          src/{world,mock_clock,mock_network}.rs   tests/{raft_safety,log_matching}_test.rs
     ├── cli/          src/{main,init,pki,unseal,verify}.rs
     └── api/          src/{main,config,state,statemachine,bootstrap,transport,errors}.rs
-                      src/handlers/{secrets,unseal,raft,cluster,dashboard}.rs
+                      src/handlers/{secrets,unseal,raft,cluster,dashboard,ops}.rs   src/metrics.rs
                       src/middleware/{mtls,authz}.rs   src/routes/mod.rs   dashboard/index.html
 ```
 
