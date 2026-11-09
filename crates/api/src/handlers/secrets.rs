@@ -101,6 +101,7 @@ pub async fn put_secret(
         .lock()
         .await
         .append(format!("secret written: {key} (by {})", identity.0));
+    crate::metrics::Metrics::bump(&state.metrics.secret_writes);
 
     Ok(StatusCode::OK)
 }
@@ -158,6 +159,7 @@ pub async fn get_secret(
             "AUTO-SEAL triggered by {}: access rate anomaly (count={}, baseline_mean={:.1}, z_score={:.1})",
             identity.0, report.current_count, report.baseline_mean, report.z_score
         ));
+        crate::metrics::Metrics::bump(&state.metrics.auto_seals);
         propagate_seal(&state, reason).await;
         return Err(AppError::Sealed);
     }
@@ -167,6 +169,7 @@ pub async fn get_secret(
         .lock()
         .await
         .append(format!("secret read: {key} (by {})", identity.0));
+    crate::metrics::Metrics::bump(&state.metrics.secret_reads);
 
     Ok(Bytes::from(plaintext))
 }
@@ -214,6 +217,7 @@ pub async fn delete_secret(
         .lock()
         .await
         .append(format!("secret deleted: {key} (by {})", identity.0));
+    crate::metrics::Metrics::bump(&state.metrics.secret_deletes);
 
     Ok(StatusCode::NO_CONTENT)
 }

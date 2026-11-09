@@ -12,6 +12,7 @@
 //! | admin  | `/sys/*` (unseal, seal, reset the unseal session)     |
 //! | writer | write/delete secrets, and everything a reader can     |
 //! | reader | read/list secrets, view the dashboard and status      |
+//! | monitor| `/healthz`, `/readyz`, `/metrics`, and nothing else    |
 //!
 //! Roles are deliberately separate. A compromised node certificate cannot read
 //! secrets; an unsealing operator cannot read them either (separation of
@@ -48,6 +49,11 @@ pub enum Permission {
     WriteSecrets,
     /// Dashboard, `/api/status`, `/cluster/status`.
     ViewStatus,
+    /// `/healthz`, `/readyz`, `/metrics`: held by monitors and admins. Not by
+    /// readers or writers (application clients have no business there) and not
+    /// the other way round: a monitor gets no dashboard, because the dashboard
+    /// shows audit events, which name secrets and identities.
+    Observe,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -81,6 +87,7 @@ pub struct PolicyConfig {
     pub admin_cns: Vec<String>,
     pub writer_cns: Vec<String>,
     pub reader_cns: Vec<String>,
+    pub monitor_cns: Vec<String>,
     pub revoked_serials: Vec<String>,
     /// DEVELOPMENT ONLY. Restores the old behaviour: every client with a valid
     /// certificate may do everything, including cluster RPCs.
@@ -98,6 +105,7 @@ pub struct Policy {
     admins: HashSet<String>,
     writers: HashSet<String>,
     readers: HashSet<String>,
+    monitors: HashSet<String>,
     revoked: HashSet<String>,
     allow_any: bool,
     warnings: Vec<String>,
@@ -144,6 +152,7 @@ impl Policy {
         let admins = clean_identities(&cfg.admin_cns)?;
         let writers = clean_identities(&cfg.writer_cns)?;
         let readers = clean_identities(&cfg.reader_cns)?;
+        let monitors = clean_identities(&cfg.monitor_cns)?;
         let mut revoked = HashSet::new();
         for raw in &cfg.revoked_serials {
             revoked
@@ -166,8 +175,19 @@ impl Policy {
                 return Err(PolicyError::NoPeerIdentities);
             }
             for p in &peers {
-                if admins.contains(p) || writers.contains(p) || readers.contains(p) {
+                if admins.contains(p)
+                    || writers.contains(p)
+                    || readers.contains(p)
+                    || monitors.contains(p)
+                {
                     return Err(PolicyError::PeerIsAlsoClient(p.clone()));
+                }
+            }
+            for m in &monitors {
+                if writers.contains(m) || readers.contains(m) {
+                    warnings.push(format!(
+                        "identity {m:?} is both a monitor and a secret reader/writer; a monitoring system should not be able to read secrets"
+                    ));
                 }
             }
             for a in &admins {
@@ -184,6 +204,7 @@ impl Policy {
             admins,
             writers,
             readers,
+            monitors,
             revoked,
             allow_any: cfg.insecure_allow_any_client,
             warnings,
@@ -222,6 +243,7 @@ impl Policy {
             Permission::ViewStatus => {
                 self.admins.contains(cn) || self.readers.contains(cn) || self.writers.contains(cn)
             }
+            Permission::Observe => self.monitors.contains(cn) || self.admins.contains(cn),
         }
     }
 
@@ -272,6 +294,7 @@ async fn enforce(state: AppState, permission: Permission, req: Request, next: Ne
             "ACCESS DENIED: {who} attempted {what} (requires {permission:?})"
         ));
     }
+    crate::metrics::Metrics::bump(&state.metrics.authz_denials);
     (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden: this identity is not permitted to perform this operation" }))).into_response()
 }
 
@@ -290,6 +313,9 @@ pub async fn require_write(State(s): State<AppState>, req: Request, next: Next) 
 pub async fn require_view(State(s): State<AppState>, req: Request, next: Next) -> Response {
     enforce(s, Permission::ViewStatus, req, next).await
 }
+pub async fn require_observe(State(s): State<AppState>, req: Request, next: Next) -> Response {
+    enforce(s, Permission::Observe, req, next).await
+}
 
 #[cfg(test)]
 mod tests {
@@ -305,6 +331,7 @@ mod tests {
             admin_cns: list(&["root"]),
             writer_cns: list(&["app-w"]),
             reader_cns: list(&["app-r"]),
+            monitor_cns: list(&["watcher"]),
             ..Default::default()
         }
     }
@@ -313,7 +340,14 @@ mod tests {
     fn each_role_gets_exactly_its_permissions() {
         let p = Policy::new(&standard(), true).unwrap();
         use Permission::*;
-        let all = [ClusterRpc, Admin, ReadSecrets, WriteSecrets, ViewStatus];
+        let all = [
+            ClusterRpc,
+            Admin,
+            ReadSecrets,
+            WriteSecrets,
+            ViewStatus,
+            Observe,
+        ];
         let expect = |cn: &str, allowed: &[Permission]| {
             for perm in all {
                 assert_eq!(
@@ -324,11 +358,65 @@ mod tests {
             }
         };
         expect("node1", &[ClusterRpc]);
-        expect("root", &[Admin, ViewStatus]);
+        expect("root", &[Admin, ViewStatus, Observe]);
         expect("app-r", &[ReadSecrets, ViewStatus]);
         expect("app-w", &[ReadSecrets, WriteSecrets, ViewStatus]);
+        expect("watcher", &[Observe]);
         expect("stranger", &[]);
         expect("", &[]);
+    }
+
+    #[test]
+    fn a_monitor_cannot_see_the_dashboard_because_it_shows_audit_events() {
+        let p = Policy::new(&standard(), true).unwrap();
+        assert!(p.allows("watcher", Permission::Observe));
+        assert!(
+            !p.allows("watcher", Permission::ViewStatus),
+            "the dashboard lists audit events, which name secrets and identities"
+        );
+        for perm in [
+            Permission::ReadSecrets,
+            Permission::WriteSecrets,
+            Permission::Admin,
+            Permission::ClusterRpc,
+        ] {
+            assert!(!p.allows("watcher", perm), "{perm:?}");
+        }
+    }
+
+    #[test]
+    fn only_monitors_and_admins_may_observe() {
+        let p = Policy::new(&standard(), true).unwrap();
+        for cn in ["app-r", "app-w", "node1", "node2", "stranger"] {
+            assert!(!p.allows(cn, Permission::Observe), "{cn}");
+        }
+        for cn in ["watcher", "root"] {
+            assert!(p.allows(cn, Permission::Observe), "{cn}");
+        }
+    }
+
+    #[test]
+    fn a_node_certificate_cannot_double_as_a_monitor() {
+        let mut c = standard();
+        c.monitor_cns.push("node1".into());
+        assert_eq!(
+            Policy::new(&c, true).err(),
+            Some(PolicyError::PeerIsAlsoClient("node1".into()))
+        );
+    }
+
+    #[test]
+    fn a_monitor_that_can_also_read_secrets_is_warned_about() {
+        let mut c = standard();
+        c.monitor_cns.push("app-r".into());
+        let p = Policy::new(&c, true).unwrap();
+        assert!(
+            p.warnings()
+                .iter()
+                .any(|w| w.contains("monitor") && w.contains("app-r")),
+            "{:?}",
+            p.warnings()
+        );
     }
 
     #[test]

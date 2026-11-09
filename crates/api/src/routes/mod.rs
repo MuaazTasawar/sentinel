@@ -2,9 +2,9 @@ use axum::Router;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 
-use crate::handlers::{cluster, dashboard, raft, secrets, unseal};
+use crate::handlers::{cluster, dashboard, ops, raft, secrets, unseal};
 use crate::middleware::authz::{
-    require_admin, require_cluster_rpc, require_read, require_view, require_write,
+    require_admin, require_cluster_rpc, require_observe, require_read, require_view, require_write,
 };
 use crate::state::AppState;
 
@@ -41,6 +41,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sys/seal", post(unseal::seal))
         .route_layer(from_fn_with_state(state.clone(), require_admin));
 
+    // Health, readiness and metrics: monitors and admins. Deliberately a
+    // separate role from the dashboard: monitors never see audit events.
+    let observe = Router::new()
+        .route("/healthz", get(ops::healthz))
+        .route("/readyz", get(ops::readyz))
+        .route("/metrics", get(ops::metrics))
+        .route_layer(from_fn_with_state(state.clone(), require_observe));
+
     // Cluster-internal RPCs: peers only.
     let cluster_rpc = Router::new()
         .route("/raft/vote", post(raft::raft_vote))
@@ -53,6 +61,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(reads)
         .merge(writes)
         .merge(sys)
+        .merge(observe)
         .merge(cluster_rpc)
         .with_state(state)
 }
@@ -78,11 +87,37 @@ mod tests {
                 admin_cns: list(&["root"]),
                 writer_cns: list(&["app-w"]),
                 reader_cns: list(&["app-r"]),
+                monitor_cns: list(&["watcher"]),
                 ..Default::default()
             },
             true,
         )
         .unwrap()
+    }
+
+    /// Like `call`, but also returns the response body.
+    async fn call_body(
+        state: &AppState,
+        cn: Option<&str>,
+        method: Method,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut router = build_router(state.clone());
+        if let Some(cn) = cn {
+            router = router.layer(axum::Extension(ClientIdentity(cn.to_string())));
+        }
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Sends one request as the given certificate identity.
@@ -153,6 +188,148 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(router.clone().oneshot(del).await.unwrap().status(), 503);
+    }
+
+    #[tokio::test]
+    async fn the_monitoring_routes_belong_to_monitors_and_admins_and_nobody_else() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+
+        for path in ["/healthz", "/readyz", "/metrics"] {
+            for cn in ["watcher", "root"] {
+                assert_eq!(
+                    call(&state, Some(cn), Method::GET, path, "").await,
+                    StatusCode::OK,
+                    "{cn} may call {path}"
+                );
+            }
+            for cn in ["app-r", "app-w", "node2", "stranger"] {
+                assert_eq!(
+                    call(&state, Some(cn), Method::GET, path, "").await,
+                    StatusCode::FORBIDDEN,
+                    "{cn} must not call {path}"
+                );
+            }
+            assert_eq!(
+                call(&state, None, Method::GET, path, "").await,
+                StatusCode::FORBIDDEN,
+                "a request with no identity must not call {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_monitor_is_refused_everything_that_is_not_monitoring() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+
+        for (method, path) in [
+            (Method::GET, "/secrets"),
+            (Method::GET, "/secrets/k"),
+            (Method::PUT, "/secrets/k"),
+            (Method::DELETE, "/secrets/k"),
+            (Method::GET, "/"),
+            (Method::GET, "/api/status"),
+            (Method::GET, "/cluster/status"),
+            (Method::POST, "/sys/seal"),
+            (Method::POST, "/sys/unseal"),
+            (Method::DELETE, "/sys/unseal"),
+            (Method::POST, "/raft/vote"),
+            (Method::POST, "/raft/append-entries"),
+            (Method::POST, "/raft/seal-request"),
+        ] {
+            assert_eq!(
+                call(&state, Some("watcher"), method.clone(), path, "{}").await,
+                StatusCode::FORBIDDEN,
+                "a monitor must not reach {method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_count_real_events_and_never_name_identities_or_secrets() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+
+        let put = call(
+            &state,
+            Some("app-w"),
+            Method::PUT,
+            "/secrets/db-password",
+            "hunter2",
+        )
+        .await;
+        assert_eq!(put, StatusCode::OK);
+        let (s, body) = call_body(
+            &state,
+            Some("app-r"),
+            Method::GET,
+            "/secrets/db-password",
+            "",
+        )
+        .await;
+        assert_eq!((s, body.as_str()), (StatusCode::OK, "hunter2"));
+        // A miss does not count as a read, and a refusal is counted as a denial.
+        assert_eq!(
+            call(&state, Some("app-r"), Method::GET, "/secrets/nope", "").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            call(
+                &state,
+                Some("watcher"),
+                Method::GET,
+                "/secrets/db-password",
+                ""
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &state,
+                Some("app-w"),
+                Method::DELETE,
+                "/secrets/db-password",
+                ""
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+
+        let (status, text) = call_body(&state, Some("watcher"), Method::GET, "/metrics", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let value = |name: &str| -> f64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing in:\n{text}"))
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(value("sentinel_secret_writes_total"), 1.0);
+        assert_eq!(
+            value("sentinel_secret_reads_total"),
+            1.0,
+            "the 404 must not count"
+        );
+        assert_eq!(value("sentinel_secret_deletes_total"), 1.0);
+        assert_eq!(value("sentinel_authz_denials_total"), 1.0);
+        assert_eq!(value("sentinel_sealed"), 0.0);
+
+        for leaked in [
+            "app-w",
+            "app-r",
+            "watcher",
+            "root",
+            "db-password",
+            "hunter2",
+            "nope",
+        ] {
+            assert!(
+                !text.contains(leaked),
+                "/metrics must not contain {leaked:?}:\n{text}"
+            );
+        }
     }
 
     #[tokio::test]

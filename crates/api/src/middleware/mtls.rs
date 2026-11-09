@@ -1,7 +1,9 @@
 use std::path::Path;
 use std::sync::{Arc, Once};
 
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem as pki_pem;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[derive(thiserror::Error, Debug)]
 pub enum MtlsError {
@@ -46,32 +48,48 @@ pub fn ensure_crypto_provider_installed() {
     });
 }
 
+/// PEM parsing errors are mostly not I/O errors, but `MtlsError` reports file
+/// problems as I/O; keep the real I/O error when there is one and describe the
+/// rest as invalid data.
+fn pem_io_error(e: pki_pem::Error) -> std::io::Error {
+    match e {
+        pki_pem::Error::Io(e) => e,
+        other => std::io::Error::new(std::io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
+
 fn load_cert_chain(path: &Path) -> Result<Vec<CertificateDer<'static>>, MtlsError> {
     let mut reader =
         std::io::BufReader::new(std::fs::File::open(path).map_err(|e| MtlsError::Io {
             path: path.display().to_string(),
             source: e,
         })?);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| MtlsError::Io {
             path: path.display().to_string(),
-            source: e,
+            source: pem_io_error(e),
         })
 }
 
-fn load_private_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>, MtlsError> {
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, MtlsError> {
     let mut reader =
         std::io::BufReader::new(std::fs::File::open(path).map_err(|e| MtlsError::Io {
             path: path.display().to_string(),
             source: e,
         })?);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| MtlsError::Io {
+    // The first private key in the file, in any of the usual formats (PKCS#8,
+    // PKCS#1, SEC1); other PEM sections, such as certificates, are skipped.
+    match PrivateKeyDer::from_pem_reader(&mut reader) {
+        Ok(key) => Ok(key),
+        Err(pki_pem::Error::NoItemsFound) => {
+            Err(MtlsError::NoPrivateKey(path.display().to_string()))
+        }
+        Err(e) => Err(MtlsError::Io {
             path: path.display().to_string(),
-            source: e,
-        })?
-        .ok_or_else(|| MtlsError::NoPrivateKey(path.display().to_string()))
+            source: pem_io_error(e),
+        }),
+    }
 }
 
 /// Builds a `rustls::ServerConfig` that requires every client to present
@@ -178,6 +196,77 @@ mod tests {
             .unwrap()
             .write_all(pem.to_string().as_bytes())
             .unwrap();
+    }
+
+    fn temp_file(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sentinel-mtls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_pem_file_with_several_certificates_loads_all_of_them_in_order() {
+        let (ca_cert, ca_key) = make_ca();
+        let a = make_leaf(&ca_cert, &ca_key, "first");
+        let b = make_leaf(&ca_cert, &ca_key, "second");
+        let pem_of = |c: &TestCert| {
+            pem::Pem::new("CERTIFICATE".to_string(), c.cert_der.to_vec()).to_string()
+        };
+        let path = temp_file("chain.pem", &format!("{}{}", pem_of(&a), pem_of(&b)));
+        let chain = load_cert_chain(&path).expect("two certificates");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0], a.cert_der);
+        assert_eq!(chain[1], b.cert_der);
+    }
+
+    #[test]
+    fn a_file_with_no_private_key_in_it_is_reported_as_such() {
+        let (ca_cert, ca_key) = make_ca();
+        let a = make_leaf(&ca_cert, &ca_key, "a");
+        // A certificate is valid PEM but not a key.
+        let path = temp_file(
+            "not-a-key.pem",
+            &pem::Pem::new("CERTIFICATE".to_string(), a.cert_der.to_vec()).to_string(),
+        );
+        assert!(matches!(
+            load_private_key(&path),
+            Err(MtlsError::NoPrivateKey(_))
+        ));
+        let empty = temp_file("empty.pem", "");
+        assert!(matches!(
+            load_private_key(&empty),
+            Err(MtlsError::NoPrivateKey(_))
+        ));
+    }
+
+    #[test]
+    fn a_private_key_is_loaded_in_the_format_the_pki_tool_writes() {
+        let (ca_cert, ca_key) = make_ca();
+        let a = make_leaf(&ca_cert, &ca_key, "a");
+        let path = temp_file(
+            "key.pem",
+            &pem::Pem::new("PRIVATE KEY".to_string(), a.key_der.clone()).to_string(),
+        );
+        match load_private_key(&path).expect("a PKCS#8 key") {
+            PrivateKeyDer::Pkcs8(k) => assert_eq!(k.secret_pkcs8_der(), a.key_der.as_slice()),
+            other => panic!("expected PKCS#8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_in_a_pem_file_is_an_error_and_never_a_panic() {
+        let bad = temp_file(
+            "bad.pem",
+            "-----BEGIN CERTIFICATE-----\n!!!this is not base64!!!\n-----END CERTIFICATE-----\n",
+        );
+        assert!(matches!(load_cert_chain(&bad), Err(MtlsError::Io { .. })));
+        let truncated = temp_file("truncated.pem", "-----BEGIN PRIVATE KEY-----\nAAAA\n");
+        assert!(matches!(
+            load_private_key(&truncated),
+            Err(MtlsError::Io { .. })
+        ));
     }
 
     #[test]

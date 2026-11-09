@@ -2,6 +2,7 @@ mod bootstrap;
 mod config;
 mod errors;
 mod handlers;
+mod metrics;
 mod middleware;
 mod routes;
 mod state;
@@ -153,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         applied,
         commit_timeout: Duration::from_millis(cfg.commit_timeout_ms),
         policy: policy.clone(),
+        metrics: Arc::new(metrics::Metrics::default()),
         seal_forwarder,
         allow_canary_bootstrap: cfg.allow_canary_bootstrap,
     };

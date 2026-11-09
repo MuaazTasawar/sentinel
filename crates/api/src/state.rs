@@ -43,6 +43,8 @@ pub struct AppState {
     pub commit_timeout: Duration,
     /// Who may call what.
     pub policy: Arc<Policy>,
+    /// Event counters exposed by `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
     /// How this node asks the leader to seal the cluster when it cannot do so itself.
     pub seal_forwarder: Arc<dyn SealForwarder>,
     /// Development only: let the first unseal of an empty vault define the key
@@ -168,6 +170,7 @@ pub mod test_support {
             applied,
             commit_timeout,
             policy: Arc::new(Policy::allow_any()),
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             seal_forwarder: Arc::new(crate::transport::NoForwarder),
             allow_canary_bootstrap: true,
         };
