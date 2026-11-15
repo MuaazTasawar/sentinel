@@ -40,6 +40,12 @@ pub enum PersistError {
 pub struct PersistedState {
     pub term: u64,
     pub voted_for: Option<u64>,
+    /// Index and term of the last entry covered by the durable snapshot
+    /// (both 0 if there is none). The snapshot is authoritative: `entries`
+    /// may overlap or contradict it after a crash mid-compaction, and
+    /// `RaftState::restore` reconciles the two.
+    pub snapshot_index: u64,
+    pub snapshot_term: u64,
     pub entries: Vec<LogEntry>,
 }
 
@@ -55,10 +61,12 @@ pub trait RaftStore: Send {
     fn apply_log_ops(&mut self, ops: &[LogOp]) -> Result<(), PersistError>;
 }
 
-fn apply_op_to_vec(entries: &mut Vec<LogEntry>, op: &LogOp) -> Result<(), PersistError> {
+/// Applies one journaled operation to a stored log whose first entry has
+/// index `base + 1` (`base` is 0 until a snapshot has trimmed the log).
+fn apply_op_to_vec(entries: &mut Vec<LogEntry>, base: u64, op: &LogOp) -> Result<(), PersistError> {
     match op {
         LogOp::Append(e) => {
-            let expected = entries.len() as u64 + 1;
+            let expected = base + entries.len() as u64 + 1;
             if e.index != expected {
                 return Err(PersistError::Corrupt(format!(
                     "append of index {} but log ends at {}",
@@ -69,10 +77,12 @@ fn apply_op_to_vec(entries: &mut Vec<LogEntry>, op: &LogOp) -> Result<(), Persis
             entries.push(e.clone());
         }
         LogOp::TruncateFrom(i) => {
-            if *i == 0 {
-                return Err(PersistError::Corrupt("truncate from index 0".into()));
+            if *i <= base {
+                return Err(PersistError::Corrupt(format!(
+                    "truncate from index {i}, which is not above the snapshot base {base}"
+                )));
             }
-            entries.truncate(*i as usize - 1);
+            entries.truncate((*i - base - 1) as usize);
         }
     }
     Ok(())
@@ -131,7 +141,7 @@ impl RaftStore for MemoryStore {
             return Err(PersistError::Injected);
         }
         for op in ops {
-            apply_op_to_vec(&mut inner.state.entries, op)?;
+            apply_op_to_vec(&mut inner.state.entries, 0, op)?;
         }
         Ok(())
     }
@@ -247,7 +257,7 @@ impl RaftStore for FileStore {
                 Ok(op) => op,
                 Err(_) => break,
             };
-            apply_op_to_vec(&mut entries, &op)?;
+            apply_op_to_vec(&mut entries, 0, &op)?;
             pos = end;
         }
 
@@ -266,6 +276,7 @@ impl RaftStore for FileStore {
             term,
             voted_for,
             entries,
+            ..PersistedState::default()
         })
     }
 
@@ -318,6 +329,28 @@ mod tests {
             index,
             command: vec![index as u8; 3],
         }
+    }
+
+    #[test]
+    fn replaying_operations_onto_a_log_trimmed_to_a_snapshot_uses_the_base() {
+        let entry = |i: u64| LogEntry {
+            term: 1,
+            index: i,
+            command: vec![],
+        };
+        let mut log: Vec<LogEntry> = Vec::new();
+        // A log whose first 3 entries live in a snapshot continues at 4.
+        apply_op_to_vec(&mut log, 3, &LogOp::Append(entry(4))).unwrap();
+        apply_op_to_vec(&mut log, 3, &LogOp::Append(entry(5))).unwrap();
+        assert_eq!(log.len(), 2);
+        // A gap, or an index inside the snapshot, is corruption.
+        assert!(apply_op_to_vec(&mut log, 3, &LogOp::Append(entry(7))).is_err());
+        assert!(apply_op_to_vec(&mut log, 3, &LogOp::Append(entry(2))).is_err());
+        // Truncation is relative to the base, and cannot reach into the snapshot.
+        apply_op_to_vec(&mut log, 3, &LogOp::TruncateFrom(5)).unwrap();
+        assert_eq!(log.len(), 1);
+        assert!(apply_op_to_vec(&mut log, 3, &LogOp::TruncateFrom(3)).is_err());
+        assert!(apply_op_to_vec(&mut log, 0, &LogOp::TruncateFrom(0)).is_err());
     }
 
     #[test]

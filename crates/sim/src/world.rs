@@ -5,8 +5,9 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use sentinel_consensus::{
-    AppendEntriesRequest, AppendEntriesResponse, ConsensusError, LogEntry, PersistedState,
-    RaftState, RequestVoteRequest, RequestVoteResponse, Role,
+    AppendEntriesRequest, AppendEntriesResponse, ConsensusError, InstallSnapshotRequest,
+    InstallSnapshotResponse, LogEntry, PersistedState, RaftState, RequestVoteRequest,
+    RequestVoteResponse, Role,
 };
 
 use crate::mock_clock::SimTime;
@@ -47,6 +48,71 @@ enum Event {
         sent_prev: u64,
         sent_len: u64,
     },
+    InstallSnapshot {
+        to: u64,
+        from: u64,
+        req: InstallSnapshotRequest,
+    },
+    InstallSnapshotResp {
+        to: u64,
+        from: u64,
+        resp: InstallSnapshotResponse,
+        sent_term: u64,
+        sent_index: u64,
+    },
+}
+
+/// A node's durable snapshot: its state machine as of `index`. In the
+/// simulator the state machine is the ordered list of entries applied, so the
+/// image is simply the first `index` of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotImage {
+    pub index: u64,
+    pub term: u64,
+    pub entries: Vec<LogEntry>,
+}
+
+/// A tiny explicit encoding for the snapshot payload that travels in
+/// `InstallSnapshot` (the real node serializes its store; the simulator only
+/// needs bytes that round-trip exactly).
+fn encode_snapshot(entries: &[LogEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend((entries.len() as u64).to_le_bytes());
+    for e in entries {
+        out.extend(e.term.to_le_bytes());
+        out.extend(e.index.to_le_bytes());
+        out.extend((e.command.len() as u32).to_le_bytes());
+        out.extend(&e.command);
+    }
+    out
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<Vec<LogEntry>, String> {
+    fn take<'a>(bytes: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], String> {
+        let end = at.checked_add(n).filter(|&e| e <= bytes.len());
+        let end = end.ok_or("snapshot payload is truncated")?;
+        let slice = &bytes[*at..end];
+        *at = end;
+        Ok(slice)
+    }
+    let mut at = 0;
+    let count = u64::from_le_bytes(take(bytes, &mut at, 8)?.try_into().unwrap());
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        let term = u64::from_le_bytes(take(bytes, &mut at, 8)?.try_into().unwrap());
+        let index = u64::from_le_bytes(take(bytes, &mut at, 8)?.try_into().unwrap());
+        let len = u32::from_le_bytes(take(bytes, &mut at, 4)?.try_into().unwrap()) as usize;
+        let command = take(bytes, &mut at, len)?.to_vec();
+        entries.push(LogEntry {
+            term,
+            index,
+            command,
+        });
+    }
+    if at != bytes.len() {
+        return Err("snapshot payload has trailing bytes".into());
+    }
+    Ok(entries)
 }
 
 struct Scheduled {
@@ -115,6 +181,15 @@ pub struct SimWorld {
     /// by any node, including replays after a restart, must match it.
     committed: BTreeMap<u64, LogEntry>,
     violations: Vec<String>,
+    /// Each node's durable snapshot (survives a crash, like the real snapshot file).
+    snapshots: HashMap<u64, SnapshotImage>,
+    /// Nodes that will crash in the middle of installing the next snapshot
+    /// they are sent: the snapshot reaches disk, the old log is not yet replaced.
+    crash_on_next_install: HashSet<u64>,
+    pub snapshots_taken: u64,
+    pub snapshots_installed: u64,
+    /// Nodes that crashed in the middle of installing a snapshot.
+    pub install_crashes: u64,
 }
 
 impl SimWorld {
@@ -151,6 +226,11 @@ impl SimWorld {
             applied: node_ids.iter().map(|&id| (id, Vec::new())).collect(),
             committed: BTreeMap::new(),
             violations: Vec::new(),
+            snapshots: HashMap::new(),
+            crash_on_next_install: HashSet::new(),
+            snapshots_taken: 0,
+            snapshots_installed: 0,
+            install_crashes: 0,
         };
         for &id in node_ids {
             world.reset_election_timer(id);
@@ -263,15 +343,28 @@ impl SimWorld {
         if !self.up.remove(&node) {
             return;
         }
+        let persisted = self.persist_of(node);
+        self.persisted.insert(node, persisted);
+    }
+
+    /// What is durable for `node` right now: hard state, whatever log it still
+    /// holds, and its snapshot. After a crash in the middle of a compaction
+    /// the log and the snapshot overlap or disagree; `RaftState::restore`
+    /// reconciles them, exactly as the real node does at startup.
+    fn persist_of(&self, node: u64) -> PersistedState {
         let state = &self.nodes[&node];
-        self.persisted.insert(
-            node,
-            PersistedState {
-                term: state.current_term,
-                voted_for: state.voted_for,
-                entries: state.log.entries_from(0),
-            },
-        );
+        let (snapshot_index, snapshot_term) = self
+            .snapshots
+            .get(&node)
+            .map(|i| (i.index, i.term))
+            .unwrap_or((0, 0));
+        PersistedState {
+            term: state.current_term,
+            voted_for: state.voted_for,
+            snapshot_index,
+            snapshot_term,
+            entries: state.log.entries_from(0),
+        }
     }
 
     /// Boots a crashed node from its persisted state. It comes back as a
@@ -288,7 +381,14 @@ impl SimWorld {
         let state = RaftState::restore(node, persisted)
             .expect("what a node persisted is always a valid log");
         self.nodes.insert(node, state);
-        self.applied.insert(node, Vec::new());
+        // The state machine comes back from its snapshot, then replays the
+        // log entries it learns are committed.
+        let restored = self
+            .snapshots
+            .get(&node)
+            .map(|image| image.entries.clone())
+            .unwrap_or_default();
+        self.applied.insert(node, restored);
         self.up.insert(node);
         self.reset_election_timer(node);
     }
@@ -325,6 +425,137 @@ impl SimWorld {
     }
 
     // ------------------------------------------------------------------
+    // Snapshots
+    // ------------------------------------------------------------------
+
+    /// The snapshot `node` would take now: its state machine up to
+    /// `last_applied - keep_tail` (so the last `keep_tail` applied entries stay
+    /// in the log for slightly-behind followers).
+    fn prepare_snapshot(&self, node: u64, keep_tail: u64) -> Result<SnapshotImage, String> {
+        if !self.up.contains(&node) {
+            return Err(format!("node {node} is down"));
+        }
+        let state = &self.nodes[&node];
+        let upto = state.last_applied.saturating_sub(keep_tail);
+        if upto <= state.snapshot_index() {
+            return Err(format!(
+                "node {node} has nothing new to snapshot (applied {}, snapshot at {})",
+                state.last_applied,
+                state.snapshot_index()
+            ));
+        }
+        let applied = &self.applied[&node];
+        if (applied.len() as u64) < upto {
+            return Err(format!("node {node}: state machine model is behind {upto}"));
+        }
+        Ok(SnapshotImage {
+            index: upto,
+            term: state.log.term_at(upto),
+            entries: applied[..upto as usize].to_vec(),
+        })
+    }
+
+    /// Takes a snapshot of `node`'s state machine and compacts its log, in the
+    /// real order: the snapshot is made durable first, then the log is trimmed.
+    /// Returns the index the snapshot covers.
+    pub fn snapshot(&mut self, node: u64, keep_tail: u64) -> Result<u64, String> {
+        let image = self.prepare_snapshot(node, keep_tail)?;
+        let upto = image.index;
+        self.snapshots.insert(node, image);
+        self.nodes
+            .get_mut(&node)
+            .unwrap()
+            .compact(upto)
+            .map_err(|e| e.to_string())?;
+        self.snapshots_taken += 1;
+        Ok(upto)
+    }
+
+    /// The nasty half of a compaction: the snapshot reaches disk, and the node
+    /// dies before it trims its log. The restart must cope with a log that
+    /// still holds entries the snapshot already covers.
+    pub fn snapshot_then_crash(&mut self, node: u64, keep_tail: u64) -> Result<u64, String> {
+        let image = self.prepare_snapshot(node, keep_tail)?;
+        let upto = image.index;
+        self.snapshots.insert(node, image);
+        self.snapshots_taken += 1;
+        self.crash(node);
+        Ok(upto)
+    }
+
+    /// Arranges for `node` to crash while installing the next snapshot a
+    /// leader sends it: the snapshot reaches disk, but the old log is not yet
+    /// replaced, and no acknowledgement is sent.
+    pub fn crash_on_next_install(&mut self, node: u64) {
+        self.crash_on_next_install.insert(node);
+    }
+
+    /// Cancels every pending `crash_on_next_install`. Used when a test's
+    /// faults stop, so that a crash armed earlier cannot fire during recovery.
+    pub fn disarm_install_crashes(&mut self) {
+        self.crash_on_next_install.clear();
+    }
+
+    /// Decodes an incoming snapshot and checks it against everything the
+    /// cluster has committed. Returns `None` (after recording a violation) if
+    /// it is malformed or contradicts a committed entry.
+    fn check_incoming_snapshot(
+        &mut self,
+        to: u64,
+        req: &InstallSnapshotRequest,
+    ) -> Option<SnapshotImage> {
+        let entries = match decode_snapshot(&req.data) {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.violations
+                    .push(format!("snapshot to node {to} is malformed: {e}"));
+                return None;
+            }
+        };
+        if entries.len() as u64 != req.last_included_index
+            || entries.last().map(|e| e.term).unwrap_or(0) != req.last_included_term
+        {
+            self.violations.push(format!(
+                "snapshot to node {to} claims index {} term {} but carries {} entries ending in term {}",
+                req.last_included_index,
+                req.last_included_term,
+                entries.len(),
+                entries.last().map(|e| e.term).unwrap_or(0)
+            ));
+            return None;
+        }
+        for (pos, entry) in entries.iter().enumerate() {
+            if entry.index != pos as u64 + 1 {
+                self.violations.push(format!(
+                    "snapshot to node {to} is not contiguous at position {pos} (index {})",
+                    entry.index
+                ));
+                return None;
+            }
+            match self.committed.get(&entry.index) {
+                Some(existing) if existing != entry => {
+                    self.violations.push(format!(
+                        "state machine safety: a snapshot installed on node {to} holds {:?} at index {} but the cluster committed {:?}",
+                        String::from_utf8_lossy(&entry.command),
+                        entry.index,
+                        String::from_utf8_lossy(&existing.command)
+                    ));
+                    return None;
+                }
+                Some(_) => {}
+                None => {
+                    self.committed.insert(entry.index, entry.clone());
+                }
+            }
+        }
+        Some(SnapshotImage {
+            index: req.last_included_index,
+            term: req.last_included_term,
+            entries,
+        })
+    }
+
+    // ------------------------------------------------------------------
     // The event loop
     // ------------------------------------------------------------------
 
@@ -347,6 +578,33 @@ impl SimWorld {
     }
 
     fn replicate_to(&mut self, leader: u64, peer: u64) {
+        if self.nodes[&leader].needs_snapshot(peer) {
+            // The entries this peer needs were compacted away.
+            let sent = match self.snapshots.get(&leader) {
+                Some(image) if image.index == self.nodes[&leader].snapshot_index() => {
+                    let data = encode_snapshot(&image.entries);
+                    self.nodes[&leader].build_install_snapshot(peer, data)
+                }
+                _ => {
+                    self.violations.push(format!(
+                        "snapshot bookkeeping: leader {leader} must send {peer} a snapshot but its stored snapshot does not match its log base"
+                    ));
+                    None
+                }
+            };
+            if let Some(req) = sent {
+                self.send(
+                    leader,
+                    peer,
+                    Event::InstallSnapshot {
+                        to: peer,
+                        from: leader,
+                        req,
+                    },
+                );
+            }
+            return;
+        }
         let Some(req) = self.nodes[&leader].build_append_entries(peer) else {
             return;
         };
@@ -387,7 +645,15 @@ impl SimWorld {
     fn check_leader_completeness(&mut self, leader: u64) {
         let state = &self.nodes[&leader];
         for (index, entry) in &self.committed {
-            if state.log.get(*index) != Some(entry) {
+            // Entries the leader has compacted live in its snapshot instead.
+            let held = if *index <= state.log.snapshot_index() {
+                self.snapshots
+                    .get(&leader)
+                    .and_then(|image| image.entries.get(*index as usize - 1))
+            } else {
+                state.log.get(*index)
+            };
+            if held != Some(entry) {
                 self.violations.push(format!(
                     "leader completeness: node {leader} won term {} without committed entry {index} ({:?})",
                     state.current_term,
@@ -535,6 +801,86 @@ impl SimWorld {
                 }
             }
 
+            Event::InstallSnapshot { to, from, req } => {
+                if !self.up.contains(&to) {
+                    return;
+                }
+                let (sent_term, sent_index) = (req.term, req.last_included_index);
+                let from_live_leader = req.term >= self.nodes[&to].current_term;
+                // What is on disk before this message is processed.
+                let before = self.persist_of(to);
+                let decision = self
+                    .nodes
+                    .get_mut(&to)
+                    .unwrap()
+                    .handle_install_snapshot(&req);
+                if from_live_leader {
+                    self.reset_election_timer(to);
+                }
+                if decision.install {
+                    let Some(image) = self.check_incoming_snapshot(to, &req) else {
+                        return;
+                    };
+                    if self.crash_on_next_install.remove(&to) {
+                        // The snapshot was written; the node died before it
+                        // replaced its log or acknowledged anything.
+                        let state = &self.nodes[&to];
+                        let mut persisted = before;
+                        persisted.term = state.current_term;
+                        persisted.voted_for = state.voted_for;
+                        persisted.snapshot_index = image.index;
+                        persisted.snapshot_term = image.term;
+                        self.snapshots.insert(to, image);
+                        self.up.remove(&to);
+                        self.persisted.insert(to, persisted);
+                        self.install_crashes += 1;
+                        return;
+                    }
+                    self.applied.insert(to, image.entries.clone());
+                    self.snapshots.insert(to, image);
+                    self.snapshots_installed += 1;
+                    self.drain_applied(to);
+                }
+                self.send(
+                    to,
+                    from,
+                    Event::InstallSnapshotResp {
+                        to: from,
+                        from: to,
+                        resp: decision.response,
+                        sent_term,
+                        sent_index,
+                    },
+                );
+            }
+
+            Event::InstallSnapshotResp {
+                to,
+                from,
+                resp,
+                sent_term,
+                sent_index,
+            } => {
+                if !self.up.contains(&to) {
+                    return;
+                }
+                let was_leader = self.nodes[&to].role == Role::Leader;
+                let outcome = self
+                    .nodes
+                    .get_mut(&to)
+                    .unwrap()
+                    .handle_install_snapshot_response(from, sent_term, sent_index, resp);
+                if was_leader && self.nodes[&to].role != Role::Leader {
+                    self.reset_election_timer(to);
+                }
+                if outcome.commit_advanced {
+                    self.drain_applied(to);
+                }
+                if outcome.retry_now {
+                    self.replicate_to(to, from);
+                }
+            }
+
             Event::HeartbeatTick { node } => {
                 if !self.up.contains(&node) || self.nodes[&node].role != Role::Leader {
                     return;
@@ -597,6 +943,11 @@ impl SimWorld {
         self.drain_applied(node);
     }
 
+    /// Test hook: the first `n` entries the cluster committed, in order.
+    pub fn committed_prefix_for_tests(&self, n: u64) -> Vec<LogEntry> {
+        (1..=n).map(|i| self.committed[&i].clone()).collect()
+    }
+
     /// Raft's Election Safety property: at most one leader per term,
     /// cluster-wide, for the entire run.
     pub fn check_election_safety(&self) -> Result<(), String> {
@@ -626,7 +977,10 @@ impl SimWorld {
                 let (la, lb) = (&self.nodes[&a].log, &self.nodes[&b].log);
                 let shared = la.last_index().min(lb.last_index());
                 let mut diverged_at: Option<u64> = None;
-                for idx in 1..=shared {
+                // Compacted entries can no longer be compared here; they are
+                // covered by the snapshot checks.
+                let lowest = la.first_index().max(lb.first_index());
+                for idx in lowest..=shared {
                     let (ea, eb) = (la.get(idx).unwrap(), lb.get(idx).unwrap());
                     if ea.term == eb.term && ea.command != eb.command {
                         return Err(format!(
@@ -680,11 +1034,115 @@ impl SimWorld {
         Ok(())
     }
 
+    /// Snapshot consistency: every stored snapshot holds exactly the entries
+    /// the cluster committed, is well formed, and agrees with the node's log.
+    pub fn check_snapshot_consistency(&self) -> Result<(), String> {
+        // A node's state machine has applied exactly what Raft says it has: no
+        // more, no fewer. (A snapshot install replaces the state machine and
+        // must move Raft's applied index with it.)
+        let mut up: Vec<u64> = self.up.iter().copied().collect();
+        up.sort_unstable();
+        for node in up {
+            let held = self.applied[&node].len() as u64;
+            let applied = self.nodes[&node].last_applied;
+            if held != applied {
+                return Err(format!(
+                    "node {node}: its state machine holds {held} entries but Raft says {applied} are applied"
+                ));
+            }
+        }
+        for (&node, image) in &self.snapshots {
+            if image.entries.len() as u64 != image.index {
+                return Err(format!(
+                    "snapshot of node {node} claims index {} but holds {} entries",
+                    image.index,
+                    image.entries.len()
+                ));
+            }
+            for (pos, entry) in image.entries.iter().enumerate() {
+                if entry.index != pos as u64 + 1 {
+                    return Err(format!(
+                        "snapshot of node {node} is not contiguous at position {pos} (index {})",
+                        entry.index
+                    ));
+                }
+                match self.committed.get(&entry.index) {
+                    Some(c) if c == entry => {}
+                    Some(c) => {
+                        return Err(format!(
+                            "snapshot of node {node} holds {:?} at index {} but the cluster committed {:?}",
+                            String::from_utf8_lossy(&entry.command),
+                            entry.index,
+                            String::from_utf8_lossy(&c.command)
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "snapshot of node {node} holds index {}, which the cluster never committed",
+                            entry.index
+                        ));
+                    }
+                }
+            }
+            if image.entries.last().map(|e| e.term).unwrap_or(0) != image.term {
+                return Err(format!(
+                    "snapshot of node {node}: recorded term {} is not the term of its last entry",
+                    image.term
+                ));
+            }
+            if self.up.contains(&node) {
+                let state = &self.nodes[&node];
+                if state.log.snapshot_index() != image.index {
+                    return Err(format!(
+                        "node {node}: its log is compacted to {} but its snapshot covers {}",
+                        state.log.snapshot_index(),
+                        image.index
+                    ));
+                }
+                if state.last_applied < image.index {
+                    return Err(format!(
+                        "node {node}: applied {} which is behind its own snapshot ({})",
+                        state.last_applied, image.index
+                    ));
+                }
+            }
+        }
+        for (&node, state) in &self.nodes {
+            if self.up.contains(&node)
+                && state.log.snapshot_index() > 0
+                && !self.snapshots.contains_key(&node)
+            {
+                return Err(format!(
+                    "node {node}: its log is compacted to {} but it has no snapshot",
+                    state.log.snapshot_index()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The snapshot `node` holds, if any.
+    pub fn snapshot_image(&self, node: u64) -> Option<&SnapshotImage> {
+        self.snapshots.get(&node)
+    }
+
+    /// How many log entries `node` still holds (compacted ones do not count).
+    pub fn retained_log_entries(&self, node: u64) -> usize {
+        let log = &self.nodes[&node].log;
+        (log.last_index() - log.snapshot_index()) as usize
+    }
+
+    /// The index `node`'s log has been compacted up to (0 if never).
+    pub fn log_base(&self, node: u64) -> u64 {
+        self.nodes[&node].log.snapshot_index()
+    }
+
     /// Every safety property at once.
     pub fn check_all(&self) -> Result<(), String> {
         self.check_election_safety()?;
         self.check_log_matching()?;
-        self.check_state_machine_safety()
+        self.check_state_machine_safety()?;
+        self.check_snapshot_consistency()
     }
 }
 
@@ -836,5 +1294,201 @@ mod tests {
             w.propose(2, b"x".to_vec()),
             Err(ConsensusError::Stopped)
         ));
+    }
+
+    // ---- snapshot checkers ------------------------------------------------
+
+    /// A 3-node world with `n` commands committed and applied everywhere.
+    fn world_with_commits(n: usize) -> SimWorld {
+        let mut w = quiet_world();
+        w.run_until(SimTime(600));
+        for i in 0..n {
+            w.propose_to_leader(format!("cmd{i}").into_bytes())
+                .expect("a leader exists");
+            let t = w.now().advance(100);
+            w.run_until(t);
+        }
+        let t = w.now().advance(1_500);
+        w.run_until(t);
+        assert!(w.check_all().is_ok(), "{:?}", w.check_all());
+        w
+    }
+
+    #[test]
+    fn a_healthy_snapshot_passes_every_check_including_the_leaders_compacted_entries() {
+        let mut w = world_with_commits(6);
+        let leader = w.current_leaders()[0];
+        let upto = w.snapshot(leader, 1).unwrap();
+        assert!(upto > 1);
+        assert_eq!(w.log_base(leader), upto);
+        assert!(w.check_all().is_ok());
+
+        // The leader no longer holds entries 1..=upto in its log, but they
+        // live in its snapshot, so winning an election with them is fine.
+        w.check_leader_completeness(leader);
+        assert!(w.violations().is_empty(), "{:?}", w.violations());
+    }
+
+    #[test]
+    fn snapshot_consistency_catches_a_snapshot_that_disagrees_with_what_was_committed() {
+        let mut w = world_with_commits(6);
+        w.snapshot(2, 1).unwrap();
+        w.snapshots.get_mut(&2).unwrap().entries[0].command = b"forged".to_vec();
+        let err = w.check_snapshot_consistency().unwrap_err();
+        assert!(err.contains("committed") && err.contains("forged"), "{err}");
+        assert!(w.check_all().is_err());
+    }
+
+    #[test]
+    fn snapshot_consistency_catches_a_state_machine_that_disagrees_with_rafts_applied_index() {
+        let mut w = world_with_commits(6);
+        assert!(w.check_snapshot_consistency().is_ok());
+        w.state_mut_for_tests(1).last_applied -= 1;
+        let err = w.check_snapshot_consistency().unwrap_err();
+        assert!(err.contains("state machine holds"), "{err}");
+    }
+
+    #[test]
+    fn snapshot_consistency_catches_a_wrong_length_or_term() {
+        let mut w = world_with_commits(6);
+        w.snapshot(2, 1).unwrap();
+        w.snapshots.get_mut(&2).unwrap().index += 1;
+        assert!(
+            w.check_snapshot_consistency()
+                .unwrap_err()
+                .contains("claims index")
+        );
+        w.snapshots.get_mut(&2).unwrap().index -= 1;
+        w.snapshots.get_mut(&2).unwrap().term += 1;
+        assert!(
+            w.check_snapshot_consistency()
+                .unwrap_err()
+                .contains("recorded term")
+        );
+    }
+
+    #[test]
+    fn snapshot_consistency_catches_a_log_that_is_not_compacted_to_its_snapshot() {
+        let mut w = world_with_commits(6);
+        let upto = w.snapshot(2, 1).unwrap();
+
+        // A snapshot one entry shorter than the log's base is well formed on
+        // its own, but the node's log says otherwise.
+        let image = w.snapshots.get_mut(&2).unwrap();
+        image.entries.pop();
+        image.index = upto - 1;
+        image.term = image.entries.last().unwrap().term;
+        let err = w.check_snapshot_consistency().unwrap_err();
+        assert!(err.contains("log is compacted to"), "{err}");
+
+        // And a compacted log with no snapshot at all.
+        w.snapshots.remove(&2);
+        assert!(
+            w.check_snapshot_consistency()
+                .unwrap_err()
+                .contains("no snapshot")
+        );
+    }
+
+    #[test]
+    fn leader_completeness_catches_a_leader_whose_snapshot_lacks_a_committed_entry() {
+        let mut w = world_with_commits(6);
+        let leader = w.current_leaders()[0];
+        w.snapshot(leader, 1).unwrap();
+        w.snapshots.get_mut(&leader).unwrap().entries[0].command = b"forged".to_vec();
+        w.check_leader_completeness(leader);
+        assert!(
+            w.violations()
+                .iter()
+                .any(|v| v.contains("leader completeness")),
+            "{:?}",
+            w.violations()
+        );
+    }
+
+    #[test]
+    fn an_incoming_snapshot_that_contradicts_a_committed_entry_is_refused_and_recorded() {
+        let mut w = world_with_commits(4);
+        let mut entries = w.committed_prefix_for_tests(3);
+        entries[0].command = b"forged".to_vec();
+        let last_term = entries.last().unwrap().term;
+        let req = InstallSnapshotRequest {
+            term: 1,
+            leader_id: 1,
+            last_included_index: 3,
+            last_included_term: last_term,
+            data: encode_snapshot(&entries),
+        };
+        assert!(w.check_incoming_snapshot(2, &req).is_none());
+        assert!(
+            w.violations()
+                .iter()
+                .any(|v| v.contains("state machine safety") && v.contains("forged")),
+            "{:?}",
+            w.violations()
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_misdescribed_incoming_snapshot_is_refused_and_recorded() {
+        let mut w = world_with_commits(4);
+        let entries = w.committed_prefix_for_tests(3);
+        let garbage = InstallSnapshotRequest {
+            term: 1,
+            leader_id: 1,
+            last_included_index: 3,
+            last_included_term: 1,
+            data: vec![1, 2, 3],
+        };
+        assert!(w.check_incoming_snapshot(2, &garbage).is_none());
+        assert!(w.violations().last().unwrap().contains("malformed"));
+
+        // The request claims index 5 but carries 3 entries.
+        let lying = InstallSnapshotRequest {
+            last_included_index: 5,
+            last_included_term: entries.last().unwrap().term,
+            data: encode_snapshot(&entries),
+            ..garbage
+        };
+        assert!(w.check_incoming_snapshot(2, &lying).is_none());
+        assert!(w.violations().last().unwrap().contains("claims index 5"));
+    }
+
+    #[test]
+    fn the_snapshot_encoding_round_trips_and_rejects_damage() {
+        let entries = vec![entry(1, 1, "a"), entry(2, 2, ""), entry(2, 3, "ccc")];
+        let bytes = encode_snapshot(&entries);
+        assert_eq!(decode_snapshot(&bytes).unwrap(), entries);
+        assert_eq!(decode_snapshot(&encode_snapshot(&[])).unwrap(), vec![]);
+        assert!(decode_snapshot(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_snapshot(&trailing).is_err());
+        assert!(decode_snapshot(&[]).is_err());
+    }
+
+    #[test]
+    fn a_crash_between_writing_a_snapshot_and_trimming_the_log_restarts_with_the_snapshot_in_charge()
+     {
+        let mut w = world_with_commits(8);
+        let victim = [1u64, 2, 3]
+            .into_iter()
+            .find(|n| !w.current_leaders().contains(n))
+            .unwrap();
+        let before_applied = w.applied_commands(victim);
+        let upto = w.snapshot_then_crash(victim, 2).unwrap();
+        w.restart(victim);
+
+        // The log was never trimmed before the crash; the restart trims it.
+        assert_eq!(w.log_base(victim), upto);
+        assert_eq!(
+            w.applied_commands(victim).len() as u64,
+            upto - 1,
+            "the state machine is restored from the snapshot (no-ops are not counted)"
+        );
+        let t = w.now().advance(1_500);
+        w.run_until(t);
+        assert!(w.check_all().is_ok(), "{:?}", w.check_all());
+        assert_eq!(w.applied_commands(victim), before_applied);
     }
 }

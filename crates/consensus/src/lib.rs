@@ -11,9 +11,12 @@ pub use actor::{
 pub use log::{LogEntry, LogError, LogOp, ReplicatedLog};
 pub use persist::{FileStore, MemoryStore, PersistError, PersistedState, RaftStore};
 pub use rpc::{
-    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    RequestVoteRequest, RequestVoteResponse,
 };
-pub use state::{MAX_ENTRIES_PER_APPEND, RaftState, ReplicationOutcome, Role};
+pub use state::{
+    MAX_ENTRIES_PER_APPEND, RaftState, ReplicationOutcome, Role, SnapshotDecision, SnapshotError,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConsensusError {
