@@ -4,13 +4,35 @@ use crate::ConsensusError;
 use crate::log::{LogEntry, LogError, ReplicatedLog};
 use crate::persist::PersistedState;
 use crate::rpc::{
-    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    RequestVoteRequest, RequestVoteResponse,
 };
 
 /// Upper bound on entries carried by one AppendEntries message, so a
 /// far-behind follower is caught up in bounded chunks rather than one
 /// enormous request.
 pub const MAX_ENTRIES_PER_APPEND: usize = 64;
+
+/// Why a local snapshot could not be taken.
+#[derive(thiserror::Error, Debug)]
+pub enum SnapshotError {
+    #[error("cannot snapshot to index {upto}: only entries up to {last_applied} have been applied")]
+    NotApplied { upto: u64, last_applied: u64 },
+    #[error(transparent)]
+    Log(#[from] LogError),
+}
+
+/// What to do about a snapshot a leader sent us.
+#[derive(Debug, Clone)]
+pub struct SnapshotDecision {
+    pub response: InstallSnapshotResponse,
+    /// `true`: the snapshot moved this node forward, and the caller must (in
+    /// this order) make it durable, replace the state machine with its data,
+    /// and only then send `response`. `false`: nothing changes, either
+    /// because the request was stale or because this node had already
+    /// applied at least that far.
+    pub install: bool,
+}
 
 /// What the actor should do after the leader processed a follower's reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -74,7 +96,15 @@ impl RaftState {
         let mut state = Self::new(node_id);
         state.current_term = persisted.term;
         state.voted_for = persisted.voted_for;
-        state.log = ReplicatedLog::from_entries(persisted.entries)?;
+        state.log = ReplicatedLog::reconcile_with_snapshot(
+            persisted.snapshot_index,
+            persisted.snapshot_term,
+            persisted.entries,
+        )?;
+        // The snapshot covers committed entries, and the state machine is
+        // restored to it, so everything up to there counts as applied.
+        state.commit_index = state.log.snapshot_index();
+        state.last_applied = state.log.snapshot_index();
         Ok(state)
     }
 
@@ -241,6 +271,11 @@ impl RaftState {
             return None;
         }
         let next = *self.next_index.get(&peer)?;
+        if next <= self.log.snapshot_index() {
+            // The entries this follower needs were compacted away: it needs
+            // a snapshot instead (see `needs_snapshot`).
+            return None;
+        }
         let prev_log_index = next.saturating_sub(1);
         Some(AppendEntriesRequest {
             term: self.current_term,
@@ -302,6 +337,163 @@ impl RaftState {
             outcome.retry_now = true;
         }
         outcome
+    }
+
+    // -----------------------------------------------------------------
+    // Snapshots and log compaction
+    // -----------------------------------------------------------------
+
+    /// Index of the last log entry covered by this node's snapshot (0 if none).
+    pub fn snapshot_index(&self) -> u64 {
+        self.log.snapshot_index()
+    }
+
+    /// Records that the state machine has taken a snapshot covering the log
+    /// up to `upto`, and discards those entries. Only entries that have been
+    /// **applied** may be compacted: the snapshot is the state machine's
+    /// state, so it cannot cover anything the state machine has not seen.
+    /// Compacting at or below the current base does nothing.
+    ///
+    /// The snapshot itself must already be durable before this is called;
+    /// this only forgets the log entries it replaces.
+    pub fn compact(&mut self, upto: u64) -> Result<(), SnapshotError> {
+        if upto <= self.log.snapshot_index() {
+            return Ok(());
+        }
+        if upto > self.last_applied {
+            return Err(SnapshotError::NotApplied {
+                upto,
+                last_applied: self.last_applied,
+            });
+        }
+        let term = self.log.term_at(upto);
+        self.log.compact_to(upto, term)?;
+        Ok(())
+    }
+
+    /// Leader-only: does `peer` need a snapshot because the entries it is
+    /// missing were compacted away? When this is true,
+    /// [`build_append_entries`](Self::build_append_entries) returns `None`.
+    pub fn needs_snapshot(&self, peer: u64) -> bool {
+        self.role == Role::Leader
+            && self
+                .next_index
+                .get(&peer)
+                .is_some_and(|&next| next <= self.log.snapshot_index())
+    }
+
+    /// Leader-only: the snapshot message for `peer`, carrying `data` (the
+    /// state machine as of this node's snapshot index, which the caller
+    /// holds). `None` if this node is not the leader or `peer` does not need
+    /// one.
+    pub fn build_install_snapshot(
+        &self,
+        peer: u64,
+        data: Vec<u8>,
+    ) -> Option<InstallSnapshotRequest> {
+        if !self.needs_snapshot(peer) {
+            return None;
+        }
+        Some(InstallSnapshotRequest {
+            term: self.current_term,
+            leader_id: self.node_id,
+            last_included_index: self.log.snapshot_index(),
+            last_included_term: self.log.snapshot_term(),
+            data,
+        })
+    }
+
+    /// Leader-only: folds a follower's reply to a snapshot into replication
+    /// progress. `sent_term` and `sent_index` describe the request being
+    /// answered, so late or duplicated replies are harmless.
+    pub fn handle_install_snapshot_response(
+        &mut self,
+        peer: u64,
+        sent_term: u64,
+        sent_index: u64,
+        resp: InstallSnapshotResponse,
+    ) -> ReplicationOutcome {
+        let mut outcome = ReplicationOutcome::default();
+        self.step_down_if_stale(resp.term);
+        if self.role != Role::Leader
+            || sent_term != self.current_term
+            || resp.term != self.current_term
+            || !resp.success
+        {
+            return outcome;
+        }
+        let (Some(matched), Some(next)) = (
+            self.match_index.get_mut(&peer),
+            self.next_index.get_mut(&peer),
+        ) else {
+            return outcome;
+        };
+        // Conservative on both sides: never more than we actually sent, and
+        // never more than the follower claims to hold.
+        let acked = sent_index.min(resp.match_index);
+        if acked > *matched {
+            *matched = acked;
+        }
+        if *matched + 1 > *next {
+            *next = *matched + 1;
+        }
+        let matched_now = *matched;
+        outcome.commit_advanced = self.advance_commit_index();
+        outcome.retry_now = self.log.last_index() > matched_now;
+        outcome
+    }
+
+    /// Follower-side: decides what a leader's snapshot means for this node.
+    ///
+    /// * A stale term is rejected.
+    /// * A snapshot at or below what this node has already **applied** is
+    ///   acknowledged and ignored: installing it would roll the state machine
+    ///   back, and the log already holds what is needed.
+    /// * Otherwise the snapshot moves the node forward. The log keeps its
+    ///   entries after the snapshot if it agrees with the snapshot's last
+    ///   entry, and is discarded entirely if not; the commit and applied
+    ///   indices jump to the snapshot's index. The caller must then install
+    ///   `req.data` (see [`SnapshotDecision::install`]).
+    pub fn handle_install_snapshot(&mut self, req: &InstallSnapshotRequest) -> SnapshotDecision {
+        self.step_down_if_stale(req.term);
+        let index = req.last_included_index;
+
+        if req.term < self.current_term {
+            return SnapshotDecision {
+                response: InstallSnapshotResponse {
+                    term: self.current_term,
+                    success: false,
+                    match_index: 0,
+                },
+                install: false,
+            };
+        }
+        // A valid leader for this term.
+        self.role = Role::Follower;
+
+        if index <= self.last_applied {
+            return SnapshotDecision {
+                response: InstallSnapshotResponse {
+                    term: self.current_term,
+                    success: true,
+                    match_index: index,
+                },
+                install: false,
+            };
+        }
+
+        self.log
+            .install_snapshot_base(index, req.last_included_term);
+        self.commit_index = self.commit_index.max(index);
+        self.last_applied = index;
+        SnapshotDecision {
+            response: InstallSnapshotResponse {
+                term: self.current_term,
+                success: true,
+                match_index: index,
+            },
+            install: true,
+        }
     }
 
     /// Leader-only: moves `commit_index` to the highest index replicated on
@@ -605,6 +797,7 @@ mod tests {
                     command: vec![2],
                 },
             ],
+            ..PersistedState::default()
         };
         let s = RaftState::restore(1, persisted).unwrap();
         assert_eq!(
@@ -623,6 +816,7 @@ mod tests {
                 term: 4,
                 voted_for: Some(2),
                 entries: vec![],
+                ..PersistedState::default()
             },
         )
         .unwrap();
@@ -920,6 +1114,416 @@ mod tests {
             s.replication_progress(2).unwrap().1,
             0,
             "match_index must restart from zero"
+        );
+    }
+
+    // ---- snapshots and log compaction ----------------------------------
+
+    fn e(term: u64, index: u64) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            command: vec![index as u8],
+        }
+    }
+
+    /// A leader at term 1 over peers 2 and 3 whose log holds the no-op plus
+    /// five commands (indices 1..=6), all committed through peer 2 and applied.
+    fn leader_with_applied_log() -> RaftState {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        for c in 1..=5u8 {
+            s.append_as_leader(vec![c]).unwrap();
+        }
+        s.handle_append_entries_response(2, 1, 0, 6, ok(6, 1));
+        assert_eq!(s.commit_index, 6);
+        assert_eq!(s.take_newly_committed().len(), 6);
+        s
+    }
+
+    /// A follower at `term` holding `terms` as log entries 1.., nothing
+    /// committed or applied yet.
+    fn follower_with(term: u64, terms: &[u64]) -> RaftState {
+        let entries = terms
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| e(t, i as u64 + 1))
+            .collect();
+        RaftState::restore(
+            2,
+            PersistedState {
+                term,
+                entries,
+                ..PersistedState::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn snapshot_req(term: u64, index: u64, last_term: u64) -> InstallSnapshotRequest {
+        InstallSnapshotRequest {
+            term,
+            leader_id: 1,
+            last_included_index: index,
+            last_included_term: last_term,
+            data: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn only_applied_entries_may_be_compacted() {
+        let mut s = leader_of(1, 1, &[2, 3]);
+        for c in 1..=5u8 {
+            s.append_as_leader(vec![c]).unwrap();
+        }
+        s.handle_append_entries_response(2, 1, 0, 6, ok(6, 1));
+        assert_eq!(s.commit_index, 6);
+
+        // Committed but not yet handed to the state machine.
+        assert!(matches!(
+            s.compact(3),
+            Err(SnapshotError::NotApplied {
+                upto: 3,
+                last_applied: 0
+            })
+        ));
+        assert_eq!(
+            s.snapshot_index(),
+            0,
+            "a refused compaction changes nothing"
+        );
+
+        s.take_newly_committed();
+        s.compact(4).unwrap();
+        assert_eq!(s.snapshot_index(), 4);
+        assert!(matches!(
+            s.compact(9),
+            Err(SnapshotError::NotApplied { upto: 9, .. })
+        ));
+        s.compact(4).unwrap(); // idempotent
+        s.compact(2).unwrap(); // already covered: nothing to do
+        assert_eq!(s.snapshot_index(), 4);
+    }
+
+    #[test]
+    fn replication_carries_on_normally_after_compaction() {
+        let mut s = leader_with_applied_log();
+        s.compact(6).unwrap();
+        let idx = s.append_as_leader(b"after".to_vec()).unwrap();
+        assert_eq!(idx, 7, "numbering continues past the compacted prefix");
+
+        // Peer 2 is at 6, so it gets an ordinary AppendEntries whose prev
+        // entry is the snapshot's last entry.
+        assert!(!s.needs_snapshot(2));
+        let req = s.build_append_entries(2).unwrap();
+        assert_eq!((req.prev_log_index, req.prev_log_term), (6, 1));
+        assert_eq!(req.entries.len(), 1);
+
+        let out = s.handle_append_entries_response(2, 1, 6, 1, ok(7, 1));
+        assert!(out.commit_advanced);
+        assert_eq!(s.commit_index, 7);
+    }
+
+    #[test]
+    fn a_follower_behind_the_snapshot_is_sent_a_snapshot_not_log_entries() {
+        let mut s = leader_with_applied_log();
+        s.compact(4).unwrap();
+
+        // Peer 3 never acknowledged anything: it still needs entry 1.
+        assert!(s.needs_snapshot(3));
+        assert!(
+            s.build_append_entries(3).is_none(),
+            "there is no way to send it entries 1..=4 any more"
+        );
+        let req = s.build_install_snapshot(3, vec![9, 9]).unwrap();
+        assert_eq!(
+            (req.term, req.last_included_index, req.last_included_term),
+            (1, 4, 1)
+        );
+        assert_eq!(req.data, vec![9, 9]);
+
+        // Peer 2 is caught up, so no snapshot for it; and only leaders send them.
+        assert!(!s.needs_snapshot(2));
+        assert!(s.build_install_snapshot(2, vec![]).is_none());
+        assert!(!s.needs_snapshot(99), "unknown peer");
+        assert!(!RaftState::new(1).needs_snapshot(2), "not a leader");
+    }
+
+    #[test]
+    fn a_snapshot_reply_moves_the_follower_forward_and_replication_resumes() {
+        let mut s = leader_with_applied_log();
+        s.compact(4).unwrap();
+        let ack = InstallSnapshotResponse {
+            term: 1,
+            success: true,
+            match_index: 4,
+        };
+        let out = s.handle_install_snapshot_response(3, 1, 4, ack);
+        assert!(out.retry_now, "entries 5 and 6 still have to follow");
+        assert_eq!(s.replication_progress(3), Some((5, 4)));
+        assert!(!s.needs_snapshot(3));
+
+        let req = s.build_append_entries(3).unwrap();
+        assert_eq!((req.prev_log_index, req.prev_log_term), (4, 1));
+        assert_eq!(req.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_snapshot_reply_never_credits_more_than_was_sent_or_claimed() {
+        let mut s = leader_with_applied_log();
+        s.compact(4).unwrap();
+        // The follower claims it holds up to 6, but we only sent up to 4.
+        let boastful = InstallSnapshotResponse {
+            term: 1,
+            success: true,
+            match_index: 6,
+        };
+        s.handle_install_snapshot_response(3, 1, 4, boastful);
+        assert_eq!(s.replication_progress(3), Some((5, 4)));
+    }
+
+    #[test]
+    fn stale_or_rejected_snapshot_replies_change_nothing_and_a_higher_term_deposes() {
+        let mut s = leader_with_applied_log();
+        s.compact(4).unwrap();
+        let before = s.replication_progress(3);
+
+        let ok_reply = |term| InstallSnapshotResponse {
+            term,
+            success: true,
+            match_index: 4,
+        };
+        // A reply for an earlier leadership (wrong sent_term).
+        s.handle_install_snapshot_response(3, 0, 4, ok_reply(1));
+        // A rejection.
+        let rejected = InstallSnapshotResponse {
+            term: 1,
+            success: false,
+            match_index: 0,
+        };
+        s.handle_install_snapshot_response(3, 1, 4, rejected);
+        assert_eq!(s.replication_progress(3), before);
+
+        // A reply from a newer term ends our leadership.
+        s.handle_install_snapshot_response(3, 1, 4, ok_reply(9));
+        assert_eq!(s.role, Role::Follower);
+        assert_eq!(s.current_term, 9);
+    }
+
+    #[test]
+    fn a_snapshot_from_a_stale_term_is_rejected() {
+        let mut f = follower_with(5, &[1, 1]);
+        let d = f.handle_install_snapshot(&snapshot_req(4, 10, 4));
+        assert!(!d.install && !d.response.success);
+        assert_eq!(d.response.term, 5, "the sender learns the newer term");
+        assert_eq!(f.log.last_index(), 2, "nothing changed");
+        assert_eq!(f.last_applied, 0);
+    }
+
+    #[test]
+    fn a_snapshot_ahead_of_everything_replaces_the_log() {
+        let mut f = follower_with(2, &[1, 1]);
+        let d = f.handle_install_snapshot(&snapshot_req(2, 10, 2));
+        assert!(d.install && d.response.success);
+        assert_eq!(d.response.match_index, 10);
+        assert_eq!((f.log.snapshot_index(), f.log.snapshot_term()), (10, 2));
+        assert_eq!(f.log.last_index(), 10);
+        assert!(f.log.entries_from(0).is_empty());
+        assert_eq!((f.commit_index, f.last_applied), (10, 10));
+        assert!(
+            f.take_newly_committed().is_empty(),
+            "the snapshot IS the applied state; nothing is replayed"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_inside_a_matching_log_keeps_the_entries_after_it() {
+        let mut f = follower_with(3, &[1, 1, 2, 2, 3]);
+        let d = f.handle_install_snapshot(&snapshot_req(3, 3, 2));
+        assert!(d.install);
+        assert_eq!(f.log.snapshot_index(), 3);
+        assert_eq!(f.log.last_index(), 5, "entries 4 and 5 agree and are kept");
+        assert_eq!((f.commit_index, f.last_applied), (3, 3));
+    }
+
+    #[test]
+    fn a_snapshot_that_contradicts_the_log_discards_all_of_it() {
+        let mut f = follower_with(3, &[1, 1, 2, 2, 3]);
+        let d = f.handle_install_snapshot(&snapshot_req(3, 3, 9));
+        assert!(d.install);
+        assert!(f.log.entries_from(0).is_empty(), "even entries 4 and 5 go");
+        assert_eq!((f.log.last_index(), f.log.last_term()), (3, 9));
+    }
+
+    #[test]
+    fn a_snapshot_at_or_below_what_is_applied_is_acknowledged_and_ignored() {
+        let mut f = follower_with(1, &[1, 1, 1, 1, 1]);
+        // Commit and apply up to 4 via the normal path.
+        let hb = AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 5,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 4,
+        };
+        assert!(f.handle_append_entries(hb).success);
+        assert_eq!(f.take_newly_committed().len(), 4);
+
+        for index in [3, 4] {
+            let d = f.handle_install_snapshot(&snapshot_req(1, index, 1));
+            assert!(
+                !d.install,
+                "installing at {index} would roll the state back"
+            );
+            assert!(d.response.success);
+            assert_eq!(d.response.match_index, index);
+        }
+        assert_eq!(f.log.snapshot_index(), 0);
+        assert_eq!(f.last_applied, 4);
+
+        // One past what is applied does install.
+        assert!(f.handle_install_snapshot(&snapshot_req(1, 5, 1)).install);
+    }
+
+    #[test]
+    fn a_snapshot_never_moves_the_commit_index_back_and_replays_what_it_does_not_cover() {
+        // Entries 1..=5 are committed here but not yet applied.
+        let mut f = follower_with(1, &[1, 1, 1, 1, 1]);
+        let hb = AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 5,
+            prev_log_term: 1,
+            entries: vec![],
+            leader_commit: 5,
+        };
+        assert!(f.handle_append_entries(hb).success);
+        assert_eq!((f.commit_index, f.last_applied), (5, 0));
+
+        // A snapshot at 3 replaces the state machine up to 3. Entries 4 and 5
+        // are still committed, so exactly those two must be applied next.
+        assert!(f.handle_install_snapshot(&snapshot_req(1, 3, 1)).install);
+        assert_eq!(f.commit_index, 5, "commit never goes backwards");
+        assert_eq!(f.last_applied, 3);
+        let replay: Vec<u64> = f.take_newly_committed().iter().map(|x| x.index).collect();
+        assert_eq!(replay, vec![4, 5]);
+    }
+
+    #[test]
+    fn a_snapshot_from_the_current_leader_makes_a_candidate_a_follower_and_a_newer_term_resets_the_vote()
+     {
+        let mut f = follower_with(2, &[1]);
+        f.become_candidate();
+        assert_eq!(f.role, Role::Candidate);
+        let term = f.current_term;
+        assert!(
+            f.handle_install_snapshot(&snapshot_req(term, 5, term))
+                .install
+        );
+        assert_eq!(f.role, Role::Follower);
+
+        let mut g = follower_with(2, &[1]);
+        g.voted_for = Some(7);
+        g.handle_install_snapshot(&snapshot_req(6, 5, 6));
+        assert_eq!(g.current_term, 6);
+        assert_eq!(g.voted_for, None, "a newer term clears the old vote");
+    }
+
+    #[test]
+    fn restoring_with_a_snapshot_starts_applied_and_committed_at_the_snapshot() {
+        let mut s = RaftState::restore(
+            2,
+            PersistedState {
+                term: 5,
+                snapshot_index: 7,
+                snapshot_term: 3,
+                entries: vec![e(3, 8), e(4, 9)],
+                ..PersistedState::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((s.commit_index, s.last_applied), (7, 7));
+        assert_eq!((s.log.last_index(), s.log.last_term()), (9, 4));
+        assert!(s.take_newly_committed().is_empty());
+    }
+
+    #[test]
+    fn restoring_repairs_a_crash_between_writing_a_snapshot_and_trimming_the_log() {
+        let terms = [1, 1, 2, 2, 3];
+        let stored: Vec<LogEntry> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| e(t, i as u64 + 1))
+            .collect();
+
+        // The log still holds everything, and agrees with the snapshot.
+        let agrees = RaftState::restore(
+            2,
+            PersistedState {
+                term: 3,
+                snapshot_index: 3,
+                snapshot_term: 2,
+                entries: stored.clone(),
+                ..PersistedState::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(agrees.log.snapshot_index(), 3);
+        assert_eq!(agrees.log.last_index(), 5);
+        assert_eq!(agrees.last_applied, 3);
+
+        // The log is from a different history: the snapshot wins entirely.
+        let contradicts = RaftState::restore(
+            2,
+            PersistedState {
+                term: 3,
+                snapshot_index: 3,
+                snapshot_term: 9,
+                entries: stored,
+                ..PersistedState::default()
+            },
+        )
+        .unwrap();
+        assert!(contradicts.log.entries_from(0).is_empty());
+        assert_eq!(contradicts.log.last_term(), 9);
+        assert!(
+            !contradicts.is_log_up_to_date(2, 5),
+            "its log is now the snapshot's, whose last term is 9"
+        );
+    }
+
+    #[test]
+    fn a_leader_unaware_of_our_snapshot_can_still_replicate_to_us() {
+        let mut f = RaftState::restore(
+            2,
+            PersistedState {
+                term: 1,
+                snapshot_index: 3,
+                snapshot_term: 1,
+                entries: vec![e(1, 4), e(1, 5)],
+                ..PersistedState::default()
+            },
+        )
+        .unwrap();
+        // The leader believes we are at index 1, and resends 2..=6.
+        let req = AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: (2..=6).map(|i| e(1, i)).collect(),
+            leader_commit: 6,
+        };
+        let resp = f.handle_append_entries(req);
+        assert!(resp.success);
+        assert_eq!(resp.match_index, Some(6));
+        assert_eq!(f.log.last_index(), 6);
+        assert_eq!(f.log.snapshot_index(), 3);
+        let applied: Vec<u64> = f.take_newly_committed().iter().map(|x| x.index).collect();
+        assert_eq!(
+            applied,
+            vec![4, 5, 6],
+            "only entries above the snapshot are applied"
         );
     }
 }
