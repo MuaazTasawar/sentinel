@@ -363,6 +363,7 @@ impl SimWorld {
             voted_for: state.voted_for,
             snapshot_index,
             snapshot_term,
+            snapshot_data: Vec::new(),
             entries: state.log.entries_from(0),
         }
     }

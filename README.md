@@ -12,7 +12,7 @@ durable hash-chained audit log · statistical auto-seal · deterministic simulat
 ![Axum](https://img.shields.io/badge/HTTP-Axum%200.8-5b21b6)
 ![TLS](https://img.shields.io/badge/TLS-rustls%20mTLS-2ea043)
 ![Crypto](https://img.shields.io/badge/AEAD-AES--256--GCM-0f766e)
-![Tests](https://img.shields.io/badge/tests-364%20passing-2ea043)
+![Tests](https://img.shields.io/badge/tests-382%20passing-2ea043)
 ![Crates](https://img.shields.io/badge/workspace-9%20crates-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -66,7 +66,7 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (364 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (382 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
@@ -92,7 +92,8 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | CLI survives a closed pipe (`sentinel-cli ... \| head`) with unchanged exit codes | ✅ | Unit tests + an integration test that runs the real binary with a reader-less stdout |
 | **YubiKey PIV decryption on real hardware** | ⚠️ **Unverified, probably wrong** | Never run on a device; see [§13](#13-known-limitations--findings) |
 | **Raft log compaction and snapshots, library level** (log base offset, local compaction, `InstallSnapshot` decisions, crash-safe reconciliation of a log with its snapshot) | ✅ in `sentinel-consensus`, **not yet in the node** | 35 new unit tests; 6 simulator scenarios and 200 random fault schedules with crashes mid-compaction and mid-install; 12 mutation checks (§11.2) |
-| Snapshots **in the running node** (persisting them, the `InstallSnapshot` RPC, the real state machine, configuration) | ❌ | Next step: the node's log and WAL still grow without bound |
+| **Durable snapshots and WAL trimming in the Raft store** (snapshot file, atomic trimmed WAL, crash-safe load) | ✅ in `sentinel-consensus` (`FileStore`, `MemoryStore`), **not yet called by the actor or the node** | 18 new unit tests including a restart from every crash point of a compaction; 25 mutation checks (§11.2) |
+| Snapshots **in the running node** (the actor driving them, the `InstallSnapshot` RPC, the real state machine, configuration) | ❌ | Next steps: the node's log and WAL still grow without bound |
 | Dynamic membership | ❌ | Not implemented |
 
 > **Bottom line:** you can provision a vault, run a 3-node mTLS cluster, unseal every node with a quorum of passphrase-protected shares, write secrets that are only acknowledged once a majority holds them, kill every node with `kill -9`, restart, and find the data, the audit chain and the cluster intact. What is *not* proven: the hardware-key path, and anything beyond a handful of nodes on a single machine. See [§13](#13-known-limitations--findings) for the full, honest list.
@@ -676,7 +677,15 @@ Without compaction the Raft log grows with every write and a node that was offli
   After an install the commit and applied indices jump to the snapshot's index; if the follower's commit index was already further ahead, the entries between are applied from the log exactly once.
 - **Crash safety by reconciliation, not by a new log format.** A compaction is two steps: make the snapshot durable, then trim the stored log. A crash between them leaves a log that overlaps the snapshot. An install has the same gap. Rather than journaling compaction, loading **reconciles** the two (`ReplicatedLog::reconcile_with_snapshot`): the snapshot is authoritative, and stored entries are kept only where they provably agree with it (the log holds the snapshot's last entry with the same term, or already starts right after it). A log that stops short of the snapshot, or contradicts it, is discarded; a log that cannot be joined to the snapshot is reported as damaged. This is pure logic, so the simulator runs the same code after crashes injected at exactly those two moments.
 
-**What does not exist yet:** persisting the snapshot and trimming the stored WAL (the store still never shrinks), the `InstallSnapshot` HTTP route and transport, the node's state machine producing and restoring snapshots, the configuration (`snapshot_threshold`) and metrics, and chunked transfer for snapshots larger than one message. Until those land, a real node never compacts; this section describes the verified building block.
+**Persistence (phase 20b, step 1).** The store can now hold a snapshot, and it is the part where a crash costs data if it is done in the wrong order. `RaftStore` gained two calls that must be made in this order: `save_snapshot` (a `snapshot` file, written to a temporary file, fsynced, renamed over the old one, directory fsynced; carries a CRC and the term and index it covers) and then `rewrite_log` (the WAL is rewritten with only the entries after the snapshot, by the same temp-and-rename dance). Properties, each with a test:
+
+- **A crash at any point loses nothing.** One test copies the data directory at five moments of a compaction (before, snapshot temp file half written, snapshot durable but log untouched, trimmed-log temp file half written, log trimmed) and restarts a node from every copy: all of them come back with the same log and the same retained entries.
+- **The WAL says where it starts.** A trimmed WAL begins at `snapshot + 1`, an untrimmed one at 1; `load` reads the first record to tell which. No new record format and no migration: a WAL written before this phase loads exactly as before, and a WAL that starts anywhere other than 1 with no snapshot to explain it is refused as corrupt.
+- **A damaged snapshot is a refusal to start.** Unlike a torn WAL tail, which is simply cut off, a snapshot that fails its checksum, is truncated, has an unknown format, covers nothing or cannot be read is an error, because the WAL no longer holds what it covered and starting "fresh" would silently drop committed data.
+- **Leftover `*.tmp` files are ignored** and removed at startup; the real files are never half-written.
+- **A snapshot cannot move backwards**, cannot exceed `MAX_SNAPSHOT_BYTES` (64 MiB, so that it can travel in one message and a corrupt file cannot make a node allocate without bound; larger fails loudly with `SnapshotTooLarge`), and the retained log must continue exactly after it.
+
+**What does not exist yet:** the Raft actor calling these (so the WAL still never shrinks in a running node), the `InstallSnapshot` HTTP route and transport, the node's state machine producing and restoring snapshots, the configuration (`snapshot_threshold`) and metrics, and chunked transfer for snapshots larger than one message. Until those land, a real node never compacts; this section describes the verified building block.
 
 ---
 
@@ -687,14 +696,14 @@ Without compaction the Raft log grows with every write and a node that was offli
 | `sentinel-crypto` | `crates/crypto` | Cryptographic primitives | `envelope::{encrypt, decrypt, EnvelopeCiphertext}`, `shamir::{split_secret, combine_shares, ShamirShare}`, `canary::{create, verify}`, `kdf::{derive_kek_argon2, derive_key_hkdf, random_salt}`, `SecretBytes` | 25 + 7 property |
 | `sentinel-storage` | `crates/storage` | Pluggable ciphertext store | `trait Storage { get, put, delete, list }`, `SledStorage` | 4 |
 | `sentinel-audit` | `crates/audit` | Tamper-evident, **durable** log | `AuditChain::{append, verify, tip_hash, is_healthy}`, `open_persistent`, `parse_log`, `AuditSink`, `FileSink` | 19 |
-| `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence, snapshot/compaction logic | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `RaftHandle::{propose, propose_and_wait, inspect, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 109 |
+| `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence, snapshot/compaction logic | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `RaftHandle::{propose, propose_and_wait, inspect, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 127 |
 | `sentinel-hardware` | `crates/hardware` | Quorum + YubiKey (**hardware path unverified**; the `yubikey` feature, on by default, is off for the server) | `QuorumUnseal`, `UnsealFragment`, `YubiKeyUnsealer` | 5 |
 | `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 18 |
 | `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 94 |
 | `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld::{propose, crash, restart, check_all, ...}`, `NetworkConditions` | 26 + 8 + 7 + 8 |
 | `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 32 + 2 |
 
-**Total: 364 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
+**Total: 382 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
 
 Key dependencies (resolved in `Cargo.lock`): `axum 0.8`, `tokio 1.53`, `rustls 0.23`, `tokio-rustls 0.26`, `hyper-util 0.1`, `reqwest 0.12` (rustls), `x509-parser 0.16`, `rcgen 0.13`, `aes-gcm 0.10`, `argon2 0.5`, `hkdf 0.12`, `sled 0.34`, `yubikey 0.8`, `zeroize 1.9`, `proptest 1.11`, `chrono 0.4`.
 
@@ -999,6 +1008,17 @@ The checkers are themselves tested: each has a test that deliberately corrupts a
 
 Eight of the twelve are caught only by unit tests. For most that is expected, because the simulator never produces the situation (it never sends a stale-term snapshot, never compacts unapplied entries). One deserves a note: "an install does not advance `last_applied`" is, in the simulator, almost an *equivalent* mutant, because the next apply step skips the compacted entries and `last_applied` catches up within the same event. It is only harmful when a follower already holds the snapshot's last entry in its log but has not applied it, which is exactly what the unit test `a_snapshot_never_moves_the_commit_index_back_and_replays_what_it_does_not_cover` builds deterministically and which 200 random schedules never reached.
 
+**Snapshot persistence mutation results (phase 20b, step 1).** Deliberate breakages of the store's snapshot code, each run against the persistence tests. The first pass ran 26 and caught 21; five survived (four distinct causes), which was informative:
+
+| Survivor of the first pass | What it was | What was done |
+|---|---|---|
+| The WAL start is inferred even without a snapshot | Equivalent: a later check ("the WAL may not start after the snapshot") rejects the same input | The redundant guard was removed from the code |
+| A damaged snapshot is treated as "none" | A real gap: only checksum damage was tested, not a snapshot file that cannot be read | Test added (a directory where the file should be) |
+| A snapshot covering index 0 is accepted, on load and on save | A real gap: the test setups were rejected by *other* checks first | Two tests added that isolate it |
+| The result of replacing the WAL is ignored | A real gap: no test made the replacement fail | Test added (the temp name is occupied) |
+
+After that, all 25 remaining mutants are caught (the redundant-guard mutant no longer exists, since the code it targeted is gone). The mutants include: no WAL base inference, always the snapshot index as base, checksum or magic not checked, a damaged snapshot ignored, temp files not removed, the contiguity check skipped, a backwards snapshot allowed, the size limit absent or off by one, the reopened WAL not positioned at its end (which would overwrite the log), and the same kind of breakage in `MemoryStore`. They were run against the persistence unit tests only (not the simulator, which does not use these stores).
+
 ### 11.3 What has *not* been executed
 
 | Item | Why |
@@ -1007,7 +1027,9 @@ Eight of the twelve are caught only by unit tests. For most that is expected, be
 | Long `cargo-fuzz` campaigns | Needs nightly. A **non-blocking** CI job (`continue-on-error`) fuzzes each of the three targets for 45 s. In CI run #8 the individual steps were checked and ticked (the fuzz step took 2 min 46 s) and no crash was reported. 45 s per target is a smoke test, not a campaign: it shows the targets build and survive a short run, not that `decrypt` and friends are robust. Since the job is non-blocking, check its steps (not just the overall tick) after any change to the crypto crate |
 | Miri | Needs nightly; the crypto crate calls `mlock`/`VirtualLock`, which Miri cannot execute |
 | Clusters larger than 5 nodes, real multi-host networks, sustained load | Only single-machine, loopback runs |
-| macOS | A **non-blocking** CI job builds and tests it, but it had not been observed to run when this was written. Until it has been seen green, treat macOS as unsupported |
+| macOS | The **non-blocking** CI job built and tested phase 20a green, checked step by step on the pull request (not just the overall tick). It has been seen on one change only, and nobody has run the node on a Mac |
+| Real power loss and the fsync-before-rename ordering of snapshot and WAL replacement | The crash tests copy the data directory between the steps; they cannot cut power or reorder disk writes. The ordering is correct by construction (and was reviewed), but not something a test here can prove |
+| The weekly 10-minute `fuzz-long` workflow | Has never run |
 
 ### 11.4 Bugs found by adversarial testing and real runs
 
@@ -1095,7 +1117,7 @@ The original list of problems in this project (functional gaps, security finding
 ### 13.2 Remaining
 
 1. **The YubiKey path is unverified and probably wrong.** `sentinel-hardware` calls PIV `decrypt_data` with an **ECC P-256** key. On a PIV card, ECC keys perform ECDH key agreement; they do not decrypt. The author has no device to confirm. Fixing it needs a device and a design decision (an RSA slot, or ECDH with a hybrid scheme). Until then use passphrase-protected shares from `init`; they are a weaker second factor than hardware.
-2. **The running node does not compact its log.** The Raft library can compact and install snapshots (§5.13), verified under chaos in the simulator, but none of it is wired into the node yet: the WAL and the in-memory log still grow with every write, and a node offline for a long time still replays everything. Remaining: persisting snapshots and trimming the stored WAL, the `InstallSnapshot` route and transport, the node's state machine producing and restoring snapshots, configuration and metrics. Snapshots also travel in a single message, so a very large vault would need chunked transfer.
+2. **The running node does not compact its log.** The Raft library can compact and install snapshots (§5.13), verified under chaos in the simulator, and the store can now persist them crash-safely, but the actor and the node do not use any of it yet: the WAL and the in-memory log still grow with every write, and a node offline for a long time still replays everything. Remaining: the actor driving snapshots, the `InstallSnapshot` route and transport, the node's state machine producing and restoring snapshots, configuration and metrics. Snapshots also travel in a single message, so a very large vault would need chunked transfer.
 3. **No dynamic membership.** The peer set is static; no joint consensus.
 4. **Per-node audit logs.** Each node records what it saw; they are not merged or replicated. Tail truncation is detectable only against an externally recorded tip.
 5. **Reads are not linearizable.** They are served from the node's own storage, so a lagging follower can return an older value.
@@ -1118,7 +1140,8 @@ The original list of problems in this project (functional gaps, security finding
 - [ ] Resolve the hardware-key design on a real device (see §13.2-1), then re-enable hardware shares in `init`. This also removes the two accepted advisories (§13.2-13).
 - [ ] Plan the `bincode` 1.x format migration and a replacement for the `sled` backend (§13.2-14).
 - [x] Snapshot and compaction **logic** in the Raft library, verified in the simulator (phase 20a).
-- [ ] Wire snapshots into the node: persistence and WAL trimming, `InstallSnapshot` RPC, state machine integration, `snapshot_threshold`, metrics (phase 20b).
+- [x] Durable snapshot file and crash-safe WAL trimming in the Raft store (phase 20b, step 1).
+- [ ] Wire snapshots into the node: the actor driving them, `InstallSnapshot` RPC, state machine integration, `snapshot_threshold`, metrics (phase 20b, steps 2-4).
 - [ ] Linearizable reads (read-index or lease reads) as an option.
 - [ ] Replicate or merge audit logs; periodic external tip anchoring.
 - [ ] Dynamic membership (joint consensus).
