@@ -9,7 +9,9 @@ pub use actor::{
     spawn_raft_actor_persistent, spawn_raft_actor_with_apply,
 };
 pub use log::{LogEntry, LogError, LogOp, ReplicatedLog};
-pub use persist::{FileStore, MemoryStore, PersistError, PersistedState, RaftStore};
+pub use persist::{
+    FileStore, MAX_SNAPSHOT_BYTES, MemoryStore, PersistError, PersistedState, RaftStore,
+};
 pub use rpc::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     RequestVoteRequest, RequestVoteResponse,
