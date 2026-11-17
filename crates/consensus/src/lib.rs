@@ -5,8 +5,8 @@ pub mod rpc;
 pub mod state;
 
 pub use actor::{
-    ElectionTimeoutRange, RaftHandle, Transport, TransportError, spawn_raft_actor,
-    spawn_raft_actor_persistent, spawn_raft_actor_with_apply,
+    ApplyItem, ElectionTimeoutRange, RaftHandle, SnapshotStatus, Transport, TransportError,
+    spawn_raft_actor, spawn_raft_actor_persistent, spawn_raft_actor_with_apply,
 };
 pub use log::{LogEntry, LogError, LogOp, ReplicatedLog};
 pub use persist::{
@@ -36,6 +36,9 @@ pub enum ConsensusError {
     LeadershipLost,
     #[error("empty commands are reserved for leader no-ops")]
     EmptyCommand,
+    /// A snapshot was refused (too large, or not yet applied); nothing changed.
+    #[error("snapshot refused: {0}")]
+    SnapshotRefused(String),
     #[error("the raft actor has stopped")]
     Stopped,
 }
