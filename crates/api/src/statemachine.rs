@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use bincode::Options;
 use sentinel_audit::AuditChain;
-use sentinel_consensus::LogEntry;
+use sentinel_consensus::{ApplyItem, LogEntry};
 use sentinel_crypto::SecretBytes;
 use sentinel_storage::{Storage, StorageError};
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,7 @@ impl Command {
 /// so a handler that just got its entry committed can wait until its own node
 /// has applied it too (read-your-writes on the node that took the write).
 pub fn spawn_apply_loop(
-    mut committed: mpsc::UnboundedReceiver<LogEntry>,
+    mut committed: mpsc::UnboundedReceiver<ApplyItem>,
     storage: Arc<dyn Storage>,
     kek: Arc<Mutex<Option<SecretBytes>>>,
     audit: Arc<Mutex<AuditChain>>,
@@ -111,7 +111,26 @@ pub fn spawn_apply_loop(
         };
         advance(&applied_tx, applied);
 
-        while let Some(entry) = committed.recv().await {
+        while let Some(item) = committed.recv().await {
+            let entry = match item {
+                ApplyItem::Entry(entry) => entry,
+                ApplyItem::Snapshot { index, .. } if index <= applied => {
+                    // Already reflected in storage (replayed after a restart).
+                    advance(&applied_tx, index);
+                    continue;
+                }
+                ApplyItem::Snapshot { index, .. } => {
+                    // Restoring from a snapshot is not implemented in the node
+                    // yet. Nothing compacts the log today, so none can arrive;
+                    // if one ever does, carrying on would silently diverge.
+                    tracing::error!(
+                        index,
+                        applied,
+                        "received a snapshot this node cannot install; stopping the state machine"
+                    );
+                    break;
+                }
+            };
             if entry.index <= applied {
                 // Already reflected in storage (we are replaying after a restart).
                 advance(&applied_tx, entry.index);
@@ -239,7 +258,7 @@ mod tests {
     }
 
     struct Harness {
-        tx: mpsc::UnboundedSender<LogEntry>,
+        tx: mpsc::UnboundedSender<ApplyItem>,
         storage: Arc<dyn Storage>,
         kek: Arc<Mutex<Option<SecretBytes>>>,
         audit: Arc<Mutex<AuditChain>>,
@@ -271,12 +290,12 @@ mod tests {
         }
     }
 
-    fn entry(index: u64, cmd: &Command) -> LogEntry {
-        LogEntry {
+    fn entry(index: u64, cmd: &Command) -> ApplyItem {
+        ApplyItem::Entry(LogEntry {
             term: 1,
             index,
             command: cmd.encode(),
-        }
+        })
     }
 
     async fn wait_applied(h: &Harness, index: u64) {
@@ -387,11 +406,11 @@ mod tests {
     #[tokio::test]
     async fn an_undecodable_committed_entry_is_skipped_visibly_without_stalling() {
         let h = harness_with_applied(None).await;
-        h.tx.send(LogEntry {
+        h.tx.send(ApplyItem::Entry(LogEntry {
             term: 1,
             index: 1,
             command: b"not a command".to_vec(),
-        })
+        }))
         .unwrap();
         h.tx.send(entry(
             2,
@@ -593,5 +612,42 @@ mod tests {
                 "node {id}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_already_covered_is_skipped_and_one_that_is_not_stops_the_loop_loudly() {
+        let h = harness_with_applied(Some(5)).await;
+        let snap = |index| ApplyItem::Snapshot {
+            index,
+            term: 1,
+            data: vec![1, 2, 3],
+        };
+        // At or below the checkpoint: nothing to do, and the loop carries on.
+        h.tx.send(snap(3)).unwrap();
+        h.tx.send(snap(5)).unwrap();
+        h.tx.send(entry(
+            6,
+            &Command::Put {
+                key: "k".into(),
+                value: vec![1],
+            },
+        ))
+        .unwrap();
+        wait_applied(&h, 6).await;
+
+        // Ahead of it: this node cannot restore one, so it must stop, not
+        // quietly skip state it does not have.
+        h.tx.send(snap(9)).unwrap();
+        h.tx.send(entry(
+            10,
+            &Command::Put {
+                key: "never".into(),
+                value: vec![2],
+            },
+        ))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*h.applied.borrow(), 6);
+        assert!(h.storage.get("secrets/never").await.is_err());
     }
 }

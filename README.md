@@ -12,7 +12,7 @@ durable hash-chained audit log · statistical auto-seal · deterministic simulat
 ![Axum](https://img.shields.io/badge/HTTP-Axum%200.8-5b21b6)
 ![TLS](https://img.shields.io/badge/TLS-rustls%20mTLS-2ea043)
 ![Crypto](https://img.shields.io/badge/AEAD-AES--256--GCM-0f766e)
-![Tests](https://img.shields.io/badge/tests-382%20passing-2ea043)
+![Tests](https://img.shields.io/badge/tests-399%20passing-2ea043)
 ![Crates](https://img.shields.io/badge/workspace-9%20crates-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -66,7 +66,7 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (382 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (399 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
@@ -92,8 +92,9 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | CLI survives a closed pipe (`sentinel-cli ... \| head`) with unchanged exit codes | ✅ | Unit tests + an integration test that runs the real binary with a reader-less stdout |
 | **YubiKey PIV decryption on real hardware** | ⚠️ **Unverified, probably wrong** | Never run on a device; see [§13](#13-known-limitations--findings) |
 | **Raft log compaction and snapshots, library level** (log base offset, local compaction, `InstallSnapshot` decisions, crash-safe reconciliation of a log with its snapshot) | ✅ in `sentinel-consensus`, **not yet in the node** | 35 new unit tests; 6 simulator scenarios and 200 random fault schedules with crashes mid-compaction and mid-install; 12 mutation checks (§11.2) |
-| **Durable snapshots and WAL trimming in the Raft store** (snapshot file, atomic trimmed WAL, crash-safe load) | ✅ in `sentinel-consensus` (`FileStore`, `MemoryStore`), **not yet called by the actor or the node** | 18 new unit tests including a restart from every crash point of a compaction; 25 mutation checks (§11.2) |
-| Snapshots **in the running node** (the actor driving them, the `InstallSnapshot` RPC, the real state machine, configuration) | ❌ | Next steps: the node's log and WAL still grow without bound |
+| **Durable snapshots and WAL trimming in the Raft store** (snapshot file, atomic trimmed WAL, crash-safe load) | ✅ in `sentinel-consensus` (`FileStore`, `MemoryStore`) | 18 new unit tests including a restart from every crash point of a compaction; 25 mutation checks (§11.2) |
+| **The Raft actor driving snapshots** (compaction on request, `InstallSnapshot` to far-behind followers, durable-before-reply installs, redelivery after a restart) | ✅ in `sentinel-consensus`, **not yet used by the node** | 16 new actor tests including a 3-node catch-up; 33 mutation checks (§11.2) |
+| Snapshots **in the running node** (the state machine producing and restoring images, the `InstallSnapshot` HTTP route and transport, configuration, metrics) | ❌ | Next steps: nothing in the node calls `compact` yet, so its log and WAL still grow without bound |
 | Dynamic membership | ❌ | Not implemented |
 
 > **Bottom line:** you can provision a vault, run a 3-node mTLS cluster, unseal every node with a quorum of passphrase-protected shares, write secrets that are only acknowledged once a majority holds them, kill every node with `kill -9`, restart, and find the data, the audit chain and the cluster intact. What is *not* proven: the hardware-key path, and anything beyond a handful of nodes on a single machine. See [§13](#13-known-limitations--findings) for the full, honest list.
@@ -685,7 +686,16 @@ Without compaction the Raft log grows with every write and a node that was offli
 - **Leftover `*.tmp` files are ignored** and removed at startup; the real files are never half-written.
 - **A snapshot cannot move backwards**, cannot exceed `MAX_SNAPSHOT_BYTES` (64 MiB, so that it can travel in one message and a corrupt file cannot make a node allocate without bound; larger fails loudly with `SnapshotTooLarge`), and the retained log must continue exactly after it.
 
-**What does not exist yet:** the Raft actor calling these (so the WAL still never shrinks in a running node), the `InstallSnapshot` HTTP route and transport, the node's state machine producing and restoring snapshots, the configuration (`snapshot_threshold`) and metrics, and chunked transfer for snapshots larger than one message. Until those land, a real node never compacts; this section describes the verified building block.
+**The actor (phase 20b, step 2).** The Raft actor now drives all of this, still only inside the library:
+
+- **One ordered stream.** The state machine receives `ApplyItem::Entry` and `ApplyItem::Snapshot` on the same channel, so a snapshot arrives exactly between the entries before and after it. A state machine already at or past a snapshot's index ignores it.
+- **Compaction is requested from outside.** Only the state machine can serialize itself, so after applying entry N it calls `RaftHandle::compact(N, image)`. Entries up to N are dropped and the image is kept to serve to followers. A request ahead of what was applied, or an image over 64 MiB, is refused and changes nothing; an index at or below the current snapshot is a no-op. If the disk fails the node stops, as for any other write.
+- **Durable before visible.** A follower that is sent a snapshot saves it and trims its WAL *before* handing it to the state machine and *before* replying, so a leader never counts a snapshot the follower could lose. A local compaction saves the snapshot before trimming the log.
+- **Restart redelivers.** A node with a snapshot on disk hands it to the state machine first, before any entry, because the state machine may not have installed it before the crash.
+- **Leaders serve them.** When a follower's next entry has been compacted away, the leader sends the snapshot instead (also from heartbeats). It is one message per peer at a time, a failed send is retried only after a one-second delay (a 64 MiB message at heartbeat speed to a dead peer would be a self-inflicted outage), and a send that never returns is abandoned after 60 seconds. A node that was itself caught up by a snapshot, or restarted with one, can serve it when it leads.
+- **A transport must opt in.** `Transport::send_install_snapshot` defaults to "unsupported", so existing transports compile, and a leader whose transport cannot carry snapshots keeps serving the followers that do not need one.
+
+**What does not exist yet:** the `InstallSnapshot` HTTP route and `HttpTransport` method (so a real node's transport still answers "unsupported"), the node's state machine producing and restoring snapshots (until then it stops itself loudly if one ever reaches it), the configuration (`snapshot_threshold`) and metrics, and chunked transfer for snapshots larger than one message. Nothing in the node calls `compact` yet, so a real node never compacts; this section describes the verified building blocks.
 
 ---
 
@@ -696,14 +706,14 @@ Without compaction the Raft log grows with every write and a node that was offli
 | `sentinel-crypto` | `crates/crypto` | Cryptographic primitives | `envelope::{encrypt, decrypt, EnvelopeCiphertext}`, `shamir::{split_secret, combine_shares, ShamirShare}`, `canary::{create, verify}`, `kdf::{derive_kek_argon2, derive_key_hkdf, random_salt}`, `SecretBytes` | 25 + 7 property |
 | `sentinel-storage` | `crates/storage` | Pluggable ciphertext store | `trait Storage { get, put, delete, list }`, `SledStorage` | 4 |
 | `sentinel-audit` | `crates/audit` | Tamper-evident, **durable** log | `AuditChain::{append, verify, tip_hash, is_healthy}`, `open_persistent`, `parse_log`, `AuditSink`, `FileSink` | 19 |
-| `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence, snapshot/compaction logic | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `RaftHandle::{propose, propose_and_wait, inspect, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 127 |
+| `sentinel-consensus` | `crates/consensus` | Raft: elections, replication, persistence, snapshot/compaction logic | `RaftState`, `spawn_raft_actor{,_with_apply,_persistent}`, `ApplyItem`, `RaftHandle::{propose, propose_and_wait, inspect, compact, install_snapshot, snapshot_status, shutdown}`, `RaftStore` (`FileStore`, `MemoryStore`), `Transport` | 143 |
 | `sentinel-hardware` | `crates/hardware` | Quorum + YubiKey (**hardware path unverified**; the `yubikey` feature, on by default, is off for the server) | `QuorumUnseal`, `UnsealFragment`, `YubiKeyUnsealer` | 5 |
 | `sentinel-anomaly` | `crates/anomaly` | Access-rate detection | `AnomalyDetector::{record_access, snapshot}`, `AnomalyReport`, `SealCommand` | 18 |
-| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 94 |
+| `sentinel-node` | `crates/api` | The server binary | mTLS listener, guarded Axum router, `Policy`, replicated state machine (`statemachine`), `HttpTransport`, `NodeConfig` | 95 |
 | `sentinel-sim` | `crates/sim` | Deterministic chaos harness | `SimWorld::{propose, crash, restart, check_all, ...}`, `NetworkConditions` | 26 + 8 + 7 + 8 |
 | `sentinel-cli` | `crates/cli` | Admin and provisioning tool | `init`, `pki`, `unseal-file`, `submit-share`, `seal`, `reset-unseal`, `verify`, `unseal` | 32 + 2 |
 
-**Total: 382 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
+**Total: 399 tests, all passing; `cargo clippy --workspace --all-targets -- -D warnings` is clean.**
 
 Key dependencies (resolved in `Cargo.lock`): `axum 0.8`, `tokio 1.53`, `rustls 0.23`, `tokio-rustls 0.26`, `hyper-util 0.1`, `reqwest 0.12` (rustls), `x509-parser 0.16`, `rcgen 0.13`, `aes-gcm 0.10`, `argon2 0.5`, `hkdf 0.12`, `sled 0.34`, `yubikey 0.8`, `zeroize 1.9`, `proptest 1.11`, `chrono 0.4`.
 
@@ -1019,6 +1029,18 @@ Eight of the twelve are caught only by unit tests. For most that is expected, be
 
 After that, all 25 remaining mutants are caught (the redundant-guard mutant no longer exists, since the code it targeted is gone). The mutants include: no WAL base inference, always the snapshot index as base, checksum or magic not checked, a damaged snapshot ignored, temp files not removed, the contiguity check skipped, a backwards snapshot allowed, the size limit absent or off by one, the reopened WAL not positioned at its end (which would overwrite the log), and the same kind of breakage in `MemoryStore`. They were run against the persistence unit tests only (not the simulator, which does not use these stores).
 
+**Snapshot actor mutation results (phase 20b, step 2).** Thirty-three deliberate breakages of the actor's snapshot code, each run against the actor tests: skipping or reordering the durable steps (log trimmed before the snapshot saved, snapshot delivered before it is durable, a failed save that does not stop the node), forgetting the held image, the startup redelivery, the one-at-a-time and retry-delay rules, the size limits, the counters, and the fallback from entries to snapshot. The first pass caught 27 and left five:
+
+| Survivor | What it was | What was done |
+|---|---|---|
+| A follower does not reset its election timer on a snapshot | A real gap: a leader sending only snapshots would not keep a follower quiet | Test added; caught |
+| The journal is not drained after a snapshot is persisted | Equivalent: the journal is flushed after every message, so it is already empty there. The line stays as a guard | Left, documented here |
+| Entries are not drained after an install | Equivalent: the commit index is raised to the snapshot index, so nothing newly committed can be pending | Left, documented here |
+| The "held image matches the compacted log" check | Equivalent while the code keeps that invariant; it exists to turn a future bug into a loud log line instead of a wrong snapshot | Left, documented here |
+| Peers that need no snapshot are not excluded early | Equivalent: `build_install_snapshot` already returns nothing for them | Left, documented here |
+
+One more mutant (restart redelivery) failed to apply the first time because of an indentation slip in my pattern; it was retargeted and caught. So 29 of 33 are caught and 4 are equivalent. After a later refactor (bundling two arguments into one struct to satisfy clippy's `too_many_arguments`) the four mutants around that code were rerun and are caught. The mutation runs cover the actor tests only, not the simulator.
+
 ### 11.3 What has *not* been executed
 
 | Item | Why |
@@ -1117,7 +1139,7 @@ The original list of problems in this project (functional gaps, security finding
 ### 13.2 Remaining
 
 1. **The YubiKey path is unverified and probably wrong.** `sentinel-hardware` calls PIV `decrypt_data` with an **ECC P-256** key. On a PIV card, ECC keys perform ECDH key agreement; they do not decrypt. The author has no device to confirm. Fixing it needs a device and a design decision (an RSA slot, or ECDH with a hybrid scheme). Until then use passphrase-protected shares from `init`; they are a weaker second factor than hardware.
-2. **The running node does not compact its log.** The Raft library can compact and install snapshots (§5.13), verified under chaos in the simulator, and the store can now persist them crash-safely, but the actor and the node do not use any of it yet: the WAL and the in-memory log still grow with every write, and a node offline for a long time still replays everything. Remaining: the actor driving snapshots, the `InstallSnapshot` route and transport, the node's state machine producing and restoring snapshots, configuration and metrics. Snapshots also travel in a single message, so a very large vault would need chunked transfer.
+2. **The running node does not compact its log.** The Raft library can compact and install snapshots (§5.13), verified under chaos in the simulator, the store persists them crash-safely and the actor drives them, but the node does not use any of it yet: the WAL and the in-memory log still grow with every write, and a node offline for a long time still replays everything. Remaining: the `InstallSnapshot` route and `HttpTransport` method, the node's state machine producing and restoring snapshots, configuration and metrics. Snapshots also travel in a single message, so a very large vault would need chunked transfer.
 3. **No dynamic membership.** The peer set is static; no joint consensus.
 4. **Per-node audit logs.** Each node records what it saw; they are not merged or replicated. Tail truncation is detectable only against an externally recorded tip.
 5. **Reads are not linearizable.** They are served from the node's own storage, so a lagging follower can return an older value.
@@ -1141,7 +1163,8 @@ The original list of problems in this project (functional gaps, security finding
 - [ ] Plan the `bincode` 1.x format migration and a replacement for the `sled` backend (§13.2-14).
 - [x] Snapshot and compaction **logic** in the Raft library, verified in the simulator (phase 20a).
 - [x] Durable snapshot file and crash-safe WAL trimming in the Raft store (phase 20b, step 1).
-- [ ] Wire snapshots into the node: the actor driving them, `InstallSnapshot` RPC, state machine integration, `snapshot_threshold`, metrics (phase 20b, steps 2-4).
+- [x] The Raft actor driving snapshots: compaction on request, `InstallSnapshot` to far-behind followers, durable-before-reply installs (phase 20b, step 2).
+- [ ] Wire snapshots into the node: `InstallSnapshot` route and `HttpTransport` method, state machine producing and restoring images, `snapshot_threshold`, metrics (phase 20b, steps 3-4).
 - [ ] Linearizable reads (read-index or lease reads) as an option.
 - [ ] Replicate or merge audit logs; periodic external tip anchoring.
 - [ ] Dynamic membership (joint consensus).
