@@ -5,6 +5,7 @@ mod handlers;
 mod metrics;
 mod middleware;
 mod routes;
+mod snapshot;
 mod state;
 mod statemachine;
 mod transport;
@@ -128,8 +129,25 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(dir = %raft_dir.display(), "raft state loaded");
 
     // The only code path that changes the secret store: committed log entries.
-    let applied =
-        statemachine::spawn_apply_loop(committed, storage.clone(), kek.clone(), audit.clone());
+    let snapshot_policy = (cfg.snapshot_threshold > 0)
+        .then(|| snapshot::SnapshotPolicy::new(raft.clone(), cfg.snapshot_threshold));
+    match &snapshot_policy {
+        Some(p) => tracing::info!(
+            threshold = p.threshold,
+            tail = p.tail,
+            "snapshots on: the Raft log is trimmed after this many applied entries"
+        ),
+        None => tracing::warn!(
+            "snapshot_threshold is 0: this node never trims its Raft log, which grows without bound"
+        ),
+    }
+    let applied = statemachine::spawn_apply_loop_with_snapshots(
+        committed,
+        storage.clone(),
+        kek.clone(),
+        audit.clone(),
+        snapshot_policy,
+    );
 
     // 1 bucket/second, 60-second rolling baseline, flag anything more
     // than 3 standard deviations above recent normal traffic. These are

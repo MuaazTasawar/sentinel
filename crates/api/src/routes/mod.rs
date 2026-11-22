@@ -1,4 +1,5 @@
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 
@@ -53,6 +54,12 @@ pub fn build_router(state: AppState) -> Router {
     let cluster_rpc = Router::new()
         .route("/raft/vote", post(raft::raft_vote))
         .route("/raft/append-entries", post(raft::raft_append_entries))
+        .route(
+            "/raft/install-snapshot",
+            // The one route whose body may exceed axum's 2 MiB default.
+            post(raft::raft_install_snapshot)
+                .layer(DefaultBodyLimit::max(crate::snapshot::MAX_REQUEST_BODY)),
+        )
         .route("/raft/seal-request", post(raft::seal_request))
         .route_layer(from_fn_with_state(state.clone(), require_cluster_rpc));
 
@@ -236,6 +243,7 @@ mod tests {
             (Method::DELETE, "/sys/unseal"),
             (Method::POST, "/raft/vote"),
             (Method::POST, "/raft/append-entries"),
+            (Method::POST, "/raft/install-snapshot"),
             (Method::POST, "/raft/seal-request"),
         ] {
             assert_eq!(
@@ -408,6 +416,18 @@ mod tests {
                     Some(intruder),
                     Method::POST,
                     "/raft/append-entries",
+                    "{}"
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "{intruder}"
+            );
+            assert_eq!(
+                call(
+                    &state,
+                    Some(intruder),
+                    Method::POST,
+                    "/raft/install-snapshot",
                     "{}"
                 )
                 .await,
@@ -630,5 +650,208 @@ mod tests {
             .await,
             StatusCode::MISDIRECTED_REQUEST
         );
+    }
+
+    // ---- the snapshot route ----
+
+    use crate::snapshot::{Image, MAX_REQUEST_BODY, encode_image, encode_request};
+    use sentinel_consensus::{InstallSnapshotRequest, MAX_SNAPSHOT_BYTES};
+
+    /// A well-formed snapshot message from "the leader" holding one secret
+    /// of `value_len` bytes, at log index 5.
+    fn snapshot_body(value_len: usize) -> Vec<u8> {
+        let data = encode_image(
+            &Image {
+                last_seal_index: 0,
+                secrets: vec![("secrets/big".into(), vec![7u8; value_len])],
+            },
+            MAX_SNAPSHOT_BYTES,
+        )
+        .unwrap();
+        encode_request(&InstallSnapshotRequest {
+            term: 99,
+            leader_id: 2,
+            last_included_index: 5,
+            last_included_term: 1,
+            data,
+        })
+        .unwrap()
+    }
+
+    /// A snapshot's reply means "durable and handed over"; the state machine
+    /// installs it a moment later. A test must not end (and delete its data
+    /// directory) while that is still going on.
+    async fn installed_by_the_state_machine(state: &AppState, index: u64) {
+        let mut applied = state.applied.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            applied.wait_for(|&v| v >= index),
+        )
+        .await
+        .expect("the state machine installs the snapshot")
+        .unwrap();
+    }
+
+    async fn call_raw(
+        state: &AppState,
+        cn: Option<&str>,
+        uri: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
+        call_typed(state, cn, uri, "application/octet-stream", body).await
+    }
+
+    async fn call_typed(
+        state: &AppState,
+        cn: Option<&str>,
+        uri: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut router = build_router(state.clone());
+        if let Some(cn) = cn {
+            router = router.layer(axum::Extension(ClientIdentity(cn.to_string())));
+        }
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", content_type)
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    }
+
+    #[tokio::test]
+    async fn a_peer_can_send_a_snapshot_through_the_real_router_and_it_is_installed() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+        let (status, body) = call_raw(
+            &state,
+            Some("node2"),
+            "/raft/install-snapshot",
+            snapshot_body(10),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reply["success"], true, "{reply}");
+        assert_eq!(reply["match_index"], 5);
+        assert_eq!(state.raft.snapshot_status().await.unwrap().installed, 1);
+        installed_by_the_state_machine(&state, 5).await;
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_route_lifts_the_default_body_limit_but_has_one_of_its_own() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+        // 3 MiB is past axum's 2 MiB default for every other route.
+        let (status, body) = call_raw(
+            &state,
+            Some("node2"),
+            "/raft/install-snapshot",
+            snapshot_body(3 * 1024 * 1024),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        installed_by_the_state_machine(&state, 5).await;
+        // The ordinary routes keep the default.
+        let (status, _) = call_typed(
+            &state,
+            Some("node2"),
+            "/raft/seal-request",
+            "application/json",
+            vec![b' '; 3 * 1024 * 1024],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        // And the snapshot route has a ceiling: the cap plus a little slack.
+        let (status, _) = call_raw(
+            &state,
+            Some("node2"),
+            "/raft/install-snapshot",
+            vec![0u8; MAX_REQUEST_BODY + 1],
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn garbage_is_a_400_and_a_non_peer_is_a_403_even_with_a_valid_snapshot() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+        for garbage in [vec![], b"{}".to_vec(), vec![0xFF; 64], {
+            let mut cut = snapshot_body(10);
+            cut.truncate(20);
+            cut
+        }] {
+            let (status, _) =
+                call_raw(&state, Some("node2"), "/raft/install-snapshot", garbage).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        for intruder in ["app-w", "app-r", "root", "watcher", "stranger"] {
+            let (status, _) = call_raw(
+                &state,
+                Some(intruder),
+                "/raft/install-snapshot",
+                snapshot_body(10),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{intruder}");
+        }
+        let (status, _) = call_raw(&state, None, "/raft/install-snapshot", snapshot_body(10)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "no identity at all");
+        assert_eq!(
+            state.raft.snapshot_status().await.unwrap().installed,
+            0,
+            "nothing above may have been installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_metrics_report_a_snapshot_this_node_installed() {
+        let (mut state, _dir) = unsealed_state().await;
+        state.policy = Arc::new(real_policy());
+        let (status, _) = call_raw(
+            &state,
+            Some("node2"),
+            "/raft/install-snapshot",
+            snapshot_body(10),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        installed_by_the_state_machine(&state, 5).await;
+
+        let router = build_router(state.clone())
+            .layer(axum::Extension(ClientIdentity("watcher".to_string())));
+        let req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri("/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let value = |name: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name} missing in\n{text}"))
+                .to_string()
+        };
+        assert_eq!(value("sentinel_raft_snapshot_index"), "5");
+        assert_eq!(value("sentinel_raft_snapshots_installed_total"), "1");
+        assert_eq!(value("sentinel_raft_snapshots_taken_total"), "0");
+        assert_eq!(value("sentinel_raft_snapshots_sent_total"), "0");
     }
 }

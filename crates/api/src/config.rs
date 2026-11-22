@@ -86,6 +86,13 @@ pub struct NodeConfig {
     /// value greater than N. Must be at least 1.
     #[serde(default = "default_anomaly_min_burst")]
     pub anomaly_min_burst: u32,
+    /// Take a snapshot of the secrets, and let Raft forget the log entries it
+    /// replaces, after this many applied entries since the last snapshot.
+    /// Without it the Raft log (and its WAL) grows forever. 0 turns taking
+    /// snapshots off; installing ones a leader sends is always on. Default
+    /// 1000.
+    #[serde(default = "default_snapshot_threshold")]
+    pub snapshot_threshold: u64,
 }
 
 fn default_unseal_threshold() -> u8 {
@@ -98,6 +105,10 @@ fn default_commit_timeout_ms() -> u64 {
 
 fn default_anomaly_min_burst() -> u32 {
     10
+}
+
+fn default_snapshot_threshold() -> u64 {
+    1000
 }
 
 impl NodeConfig {
@@ -358,6 +369,25 @@ mod tests {
         );
         assert_eq!(cfg.canary_file.as_deref(), Some("/etc/sentinel/canary.bin"));
         assert!(cfg.allow_canary_bootstrap);
+    }
+
+    #[test]
+    fn the_snapshot_threshold_defaults_to_a_thousand_and_can_be_changed_or_turned_off() {
+        let cfg = NodeConfig::build(None, Some(base_env())).unwrap();
+        assert_eq!(cfg.snapshot_threshold, 1000);
+        for (value, expected) in [("250", 250), ("0", 0)] {
+            let mut env = base_env();
+            env.insert("SENTINEL__SNAPSHOT_THRESHOLD".into(), value.into());
+            assert_eq!(
+                NodeConfig::build(None, Some(env))
+                    .unwrap()
+                    .snapshot_threshold,
+                expected
+            );
+        }
+        let mut env = base_env();
+        env.insert("SENTINEL__SNAPSHOT_THRESHOLD".into(), "lots".into());
+        assert!(NodeConfig::build(None, Some(env)).is_err());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sentinel_consensus::{
-    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
-    Transport, TransportError,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    RequestVoteRequest, RequestVoteResponse, Transport, TransportError,
 };
 
 /// Sends Raft RPCs to peers over mTLS using the same client identity
@@ -125,7 +126,37 @@ impl Transport for HttpTransport {
             .await
             .map_err(|_| TransportError::Unreachable(peer_id))
     }
+
+    async fn send_install_snapshot(
+        &self,
+        peer_id: u64,
+        req: InstallSnapshotRequest,
+    ) -> Result<InstallSnapshotResponse, TransportError> {
+        let unreachable = |_| TransportError::Unreachable(peer_id);
+        let url = format!("{}/raft/install-snapshot", self.base_url(peer_id)?);
+        let body = crate::snapshot::encode_request(&req)
+            .map_err(|_| TransportError::Unreachable(peer_id))?;
+        let resp = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            // The shared client gives a request five seconds; a snapshot is
+            // much bigger than an append and gets its own allowance.
+            .timeout(SNAPSHOT_REQUEST_TIMEOUT)
+            .body(body)
+            .send()
+            .await
+            .map_err(unreachable)?;
+        if !resp.status().is_success() {
+            tracing::warn!(peer = peer_id, status = %resp.status(), "peer refused a snapshot");
+            return Err(TransportError::Unreachable(peer_id));
+        }
+        resp.json().await.map_err(unreachable)
+    }
 }
+
+/// How long one snapshot upload may take before it is abandoned.
+const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[cfg(test)]
 mod tests {
@@ -197,5 +228,142 @@ mod tests {
     #[tokio::test]
     async fn no_forwarder_accepts_nothing() {
         assert_eq!(NoForwarder.forward_seal("x").await, 0);
+    }
+
+    // ---- snapshots over real HTTP ----
+
+    use crate::middleware::mtls::ClientIdentity;
+    use crate::state::test_support::unsealed_state;
+
+    /// The node's real router (real snapshot route and body limits) served on
+    /// a local socket, with every request authenticated as peer "node2".
+    async fn serve_real_node() -> (String, crate::state::AppState, tempfile::TempDir) {
+        let (state, dir) = unsealed_state().await;
+        let app = crate::routes::build_router(state.clone())
+            .layer(axum::Extension(ClientIdentity("node2".into())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), state, dir)
+    }
+
+    fn snapshot_request(value_len: usize) -> InstallSnapshotRequest {
+        use crate::snapshot::{Image, encode_image};
+        InstallSnapshotRequest {
+            term: 99,
+            leader_id: 2,
+            last_included_index: 5,
+            last_included_term: 1,
+            data: encode_image(
+                &Image {
+                    last_seal_index: 0,
+                    secrets: vec![("secrets/big".into(), vec![9u8; value_len])],
+                },
+                sentinel_consensus::MAX_SNAPSHOT_BYTES,
+            )
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_larger_than_the_default_body_limit_travels_to_the_real_route() {
+        let (url, state, _dir) = serve_real_node().await;
+        let transport = HttpTransport::new(reqwest::Client::new(), HashMap::from([(7, url)]));
+        let resp = transport
+            .send_install_snapshot(7, snapshot_request(5 * 1024 * 1024))
+            .await
+            .expect("delivered");
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 5);
+        assert_eq!(state.raft.snapshot_status().await.unwrap().installed, 1);
+        // The reply means "durable and handed over"; the state machine
+        // installs it a moment later. Let it finish before the test (and its
+        // data directory) goes away.
+        let mut applied = state.applied.clone();
+        tokio::time::timeout(Duration::from_secs(30), applied.wait_for(|&v| v >= 5))
+            .await
+            .expect("the state machine installs the snapshot")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_refuses_a_snapshot_or_is_not_there_is_reported_as_unreachable() {
+        // An HTTP error answer is a failure even when its body looks like
+        // a success.
+        let app = Router::new().route(
+            "/raft/install-snapshot",
+            post(|| async {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(InstallSnapshotResponse {
+                        term: 1,
+                        success: true,
+                        match_index: 5,
+                    }),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let transport = HttpTransport::new(
+            reqwest::Client::new(),
+            HashMap::from([(7, format!("http://{addr}"))]),
+        );
+        assert!(matches!(
+            transport
+                .send_install_snapshot(7, snapshot_request(10))
+                .await,
+            Err(TransportError::Unreachable(7))
+        ));
+        // An unknown peer id.
+        assert!(
+            transport
+                .send_install_snapshot(8, snapshot_request(10))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_upload_gets_longer_than_the_shared_clients_timeout() {
+        // The node's shared client allows a request 5 s; a snapshot must not
+        // be held to that. Same shape, scaled down: 300 ms against a peer
+        // that takes 800 ms to answer.
+        let app = Router::new().route(
+            "/raft/install-snapshot",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                axum::Json(InstallSnapshotResponse {
+                    term: 1,
+                    success: true,
+                    match_index: 5,
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let transport = HttpTransport::new(client, HashMap::from([(7, format!("http://{addr}"))]));
+        // An append is held to the client's timeout...
+        let append = AppendEntriesRequest {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        };
+        assert!(transport.send_append_entries(7, append).await.is_err());
+        // ...a snapshot is not.
+        let resp = transport
+            .send_install_snapshot(7, snapshot_request(10))
+            .await
+            .expect("the slow upload is waited for");
+        assert!(resp.success);
     }
 }
