@@ -1,10 +1,12 @@
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::Deserialize;
 
 use sentinel_consensus::{
-    AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotResponse, RequestVoteRequest,
+    RequestVoteResponse,
 };
 
 use crate::errors::AppError;
@@ -27,6 +29,21 @@ pub async fn raft_append_entries(
     Json(req): Json<AppendEntriesRequest>,
 ) -> Json<AppendEntriesResponse> {
     Json(state.raft.append_entries(req).await)
+}
+
+/// A leader sends this node a snapshot because it fell behind the leader's
+/// trimmed log. The body is bincode (see `snapshot::encode_request`), not
+/// JSON, and the route lifts axum's 2 MiB default body limit to the snapshot
+/// size cap. Peer-only, like the other `/raft/*` routes. When the reply says
+/// success, the snapshot is already on this node's disk and with its state
+/// machine.
+pub async fn raft_install_snapshot(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<InstallSnapshotResponse>, AppError> {
+    let req =
+        crate::snapshot::decode_request(&body).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(state.raft.install_snapshot(req).await))
 }
 
 const MAX_REASON_LEN: usize = 512;

@@ -172,6 +172,37 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         );
     }
 
+    if let Ok(Some(snap)) =
+        tokio::time::timeout(RAFT_PROBE_TIMEOUT, state.raft.snapshot_status()).await
+    {
+        metric(
+            &mut out,
+            "sentinel_raft_snapshot_index",
+            "gauge",
+            "Log index the Raft log is trimmed to (0: never trimmed).",
+            snap.snapshot_index,
+        );
+        for (name, help, value) in [
+            (
+                "sentinel_raft_snapshots_taken_total",
+                "Snapshots this node took of its own state.",
+                snap.taken,
+            ),
+            (
+                "sentinel_raft_snapshots_installed_total",
+                "Snapshots this node installed because a leader sent them.",
+                snap.installed,
+            ),
+            (
+                "sentinel_raft_snapshots_sent_total",
+                "Snapshots this node sent as leader and a follower acknowledged.",
+                snap.sent,
+            ),
+        ] {
+            metric(&mut out, name, "counter", help, value);
+        }
+    }
+
     let m = &state.metrics;
     for (name, help, counter) in [
         (
@@ -366,6 +397,14 @@ mod tests {
         assert_eq!(sample(&text, "sentinel_raft_responsive"), Some(1.0));
         assert_eq!(sample(&text, "sentinel_raft_is_leader"), Some(1.0));
         assert!(sample(&text, "sentinel_raft_term").unwrap() >= 1.0);
+        for name in [
+            "sentinel_raft_snapshot_index",
+            "sentinel_raft_snapshots_taken_total",
+            "sentinel_raft_snapshots_installed_total",
+            "sentinel_raft_snapshots_sent_total",
+        ] {
+            assert_eq!(sample(&text, name), Some(0.0), "{name}");
+        }
         for counter in [
             "sentinel_secret_reads_total",
             "sentinel_secret_writes_total",
