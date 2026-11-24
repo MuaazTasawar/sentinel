@@ -235,7 +235,7 @@ flowchart LR
 | Storage | `storage_path` | `sled` embedded KV store. Only the Raft apply loop writes secrets into it. |
 | Raft state | `raft_dir` (default `<storage_path>.raft`) | CRC-checked write-ahead log + atomically replaced vote file; fsync'd before the node replies. |
 | Audit log | `audit_path` (default `<storage_path>.audit.jsonl`) | JSON lines, one hash-chained entry per line, fsync'd per entry, verified at startup. |
-| Logging | stdout, JSON lines | `tracing` + `EnvFilter` (`RUST_LOG=info`). |
+| Logging | stdout, JSON lines | `tracing` + `EnvFilter`. The default level is `info` (start-up lines, warnings, errors); `RUST_LOG` overrides it (`RUST_LOG=warn` is quieter, `RUST_LOG=debug` is louder). A `RUST_LOG` that does not parse falls back to `info` with a message on stderr. |
 
 ### 3.5 Node lifecycle
 
@@ -1097,7 +1097,7 @@ Everything about snapshots had been verified in-process. This run used the real 
 
 | What was done | What was observed |
 |---|---|
-| Started three nodes and read the start-up log | `snapshots on: ... threshold 10, tail 1`: the `main.rs` wiring, which no unit test covers, is live. (With `RUST_LOG` unset the node prints errors only, so that line is invisible by default.) |
+| Started three nodes and read the start-up log | `snapshots on: ... threshold 10, tail 1`: the `main.rs` wiring, which no unit test covers, is live. (This run set `RUST_LOG=info`. Before phase 20c an unset `RUST_LOG` printed errors only, so that line was invisible by default; `info` is now the default.) |
 | Wrote 25 secrets through the leader | All 25 acknowledged. Every node took snapshots on its own (index 20 at applied 26); the leader's WAL was 1 KB next to a 2.6 KB snapshot file |
 | `kill -9` a follower; wrote 40 more and deleted two while it was down; restarted it | The survivors trimmed to index 60 while it was away. After the restart it caught up in about a second by snapshot (`installed=1`; the leader reported `sent=1`), came back sealed (503) as designed, served the right values after unsealing, and the two deleted keys were 404. Its audit log recorded `state restored from a snapshot at log index 60 (this node had applied up to 26)` and its hash chain verified |
 | Paused a follower (`SIGSTOP`) while it was unsealed; asked the leader, as a peer, to seal the whole cluster; re-unsealed the others; wrote 40 more so their logs were trimmed past the seal; resumed it | It caught up by snapshot (index 104) and **became sealed** (503) although it had never seen the seal command. Its audit log: `vault SEALED: the snapshot installed here covers a cluster-wide seal (log index 74) that this node had not applied`. This is the seal-through-snapshot case that had only been tested in-process |
