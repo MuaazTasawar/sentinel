@@ -20,10 +20,32 @@ use middleware::mtls::{self, ClientIdentity};
 use state::AppState;
 use transport::HttpTransport;
 
+/// The level used when `RUST_LOG` is unset, empty, or not a valid filter.
+const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Builds the log filter from the value of `RUST_LOG`.
+///
+/// `EnvFilter::from_default_env()` defaults to errors only, which hid every
+/// start-up line (listening address, snapshot policy, raft state loaded). An
+/// operator could not tell from the output whether the node had started. The
+/// default is now `info`; an explicit `RUST_LOG` still wins, and a value that
+/// does not parse falls back to `info` with a message on stderr rather than
+/// silently logging nothing.
+fn log_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    match rust_log.map(str::trim) {
+        None | Some("") => EnvFilter::new(DEFAULT_LOG_LEVEL),
+        Some(spec) => EnvFilter::try_new(spec).unwrap_or_else(|e| {
+            eprintln!("RUST_LOG is not a valid filter ({e}); using \"{DEFAULT_LOG_LEVEL}\"");
+            EnvFilter::new(DEFAULT_LOG_LEVEL)
+        }),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .json()
         .init();
 
@@ -261,4 +283,51 @@ fn build_mtls_reqwest_client(cfg: &NodeConfig) -> anyhow::Result<reqwest::Client
         .use_rustls_tls()
         .timeout(Duration::from_secs(5))
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_filter;
+    use tracing_subscriber::filter::LevelFilter;
+
+    #[test]
+    fn unset_or_empty_rust_log_defaults_to_info() {
+        assert_eq!(log_filter(None).max_level_hint(), Some(LevelFilter::INFO));
+        assert_eq!(
+            log_filter(Some("")).max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+        assert_eq!(
+            log_filter(Some("  ")).max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+    }
+
+    #[test]
+    fn an_explicit_rust_log_wins() {
+        assert_eq!(
+            log_filter(Some("error")).max_level_hint(),
+            Some(LevelFilter::ERROR)
+        );
+        assert_eq!(
+            log_filter(Some("warn")).max_level_hint(),
+            Some(LevelFilter::WARN)
+        );
+        assert_eq!(
+            log_filter(Some("debug")).max_level_hint(),
+            Some(LevelFilter::DEBUG)
+        );
+        assert_eq!(
+            log_filter(Some(" off ")).max_level_hint(),
+            Some(LevelFilter::OFF)
+        );
+    }
+
+    #[test]
+    fn an_invalid_rust_log_falls_back_to_info_instead_of_logging_nothing() {
+        assert_eq!(
+            log_filter(Some("sentinel_node=notalevel")).max_level_hint(),
+            Some(LevelFilter::INFO)
+        );
+    }
 }
