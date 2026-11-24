@@ -94,7 +94,7 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | **Raft log compaction and snapshots, library level** (log base offset, local compaction, `InstallSnapshot` decisions, crash-safe reconciliation of a log with its snapshot) | ✅ in `sentinel-consensus`, **not yet in the node** | 35 new unit tests; 6 simulator scenarios and 200 random fault schedules with crashes mid-compaction and mid-install; 12 mutation checks (§11.2) |
 | **Durable snapshots and WAL trimming in the Raft store** (snapshot file, atomic trimmed WAL, crash-safe load) | ✅ in `sentinel-consensus` (`FileStore`, `MemoryStore`) | 18 new unit tests including a restart from every crash point of a compaction; 25 mutation checks (§11.2) |
 | **The Raft actor driving snapshots** (compaction on request, `InstallSnapshot` to far-behind followers, durable-before-reply installs, redelivery after a restart) | ✅ in `sentinel-consensus`, **not yet used by the node** | 16 new actor tests including a 3-node catch-up; 33 mutation checks (§11.2) |
-| **Snapshots in the running node** (the state machine takes and restores images, the `InstallSnapshot` HTTP route and `HttpTransport` method, `snapshot_threshold`, metrics) | ✅ in `sentinel-node`, **verified in-process only** | 24 new node tests including a 3-node catch-up that also carries a missed cluster-wide seal; 28 mutation checks (§11.2). **Not yet run over real mTLS between real processes** |
+| **Snapshots in the running node** (the state machine takes and restores images, the `InstallSnapshot` HTTP route and `HttpTransport` method, `snapshot_threshold`, metrics) | ✅ in `sentinel-node`, verified in-process **and** on real processes over mTLS (Linux, one host; §11.5) | 24 new node tests including a 3-node catch-up that also carries a missed cluster-wide seal; 28 mutation checks (§11.2); a real 3-node run with kills, pauses and a cold restart (§11.5). **Not run on Windows or across hosts** |
 | Dynamic membership | ❌ | Not implemented |
 
 > **Bottom line:** you can provision a vault, run a 3-node mTLS cluster, unseal every node with a quorum of passphrase-protected shares, write secrets that are only acknowledged once a majority holds them, kill every node with `kill -9`, restart, and find the data, the audit chain and the cluster intact. What is *not* proven: the hardware-key path, and anything beyond a handful of nodes on a single machine. See [§13](#13-known-limitations--findings) for the full, honest list.
@@ -704,7 +704,7 @@ Without compaction the Raft log grows with every write and a node that was offli
 - **On the wire.** `POST /raft/install-snapshot` takes a bincode body, with its own body limit and its own 120-second upload allowance (the shared client gives a request 5 seconds). The reply means "durable on this node's Raft disk and handed to the state machine", not "restored": the state machine installs it a moment later.
 - **Metrics.** `sentinel_raft_snapshot_index` (gauge) and `sentinel_raft_snapshots_{taken,installed,sent}_total`, numbers only like the others.
 
-**What does not exist yet, or is not verified:** chunked transfer for state larger than one message (so a vault whose encrypted secrets exceed 64 MiB cannot be snapshotted); a run of real `sentinel-node` processes over real mTLS around a snapshot (phase 20b, step 4); and a mixed-version cluster: an old node has no `/raft/install-snapshot` route, so a new leader's snapshot to it would fail and be retried once a second. Upgrade every node before relying on snapshots, or set `snapshot_threshold = 0` meanwhile. Snapshots are **on by default**, a behaviour change for existing deployments.
+**What does not exist yet, or is not verified:** chunked transfer for state larger than one message (so a vault whose encrypted secrets exceed 64 MiB cannot be snapshotted); a real-process run on Windows or across several hosts (the real-process run in §11.5 was Linux, one host); and a mixed-version cluster: an old node has no `/raft/install-snapshot` route, so a new leader's snapshot to it would fail and be retried once a second. Upgrade every node before relying on snapshots, or set `snapshot_threshold = 0` meanwhile. Snapshots are **on by default**, a behaviour change for existing deployments.
 
 ---
 
@@ -1069,8 +1069,9 @@ Two findings from building it, neither a mutation result: a hang in my own HTTP 
 | macOS | The **non-blocking** CI job built and tested phase 20a green, checked step by step on the pull request (not just the overall tick). It has been seen on one change only, and nobody has run the node on a Mac |
 | Real power loss and the fsync-before-rename ordering of snapshot and WAL replacement | The crash tests copy the data directory between the steps; they cannot cut power or reorder disk writes. The ordering is correct by construction (and was reviewed), but not something a test here can prove |
 | The weekly 10-minute `fuzz-long` workflow | Has never run |
-| Snapshots between real `sentinel-node` processes over mTLS | Everything about snapshots in the node is verified in-process (real router, real HTTP transport on a local socket, real storage, in-process Raft). The real binaries, real certificates and real restarts around a snapshot have not been exercised yet (phase 20b, step 4) |
+| Snapshots between real `sentinel-node` processes on **Windows**, or across **several hosts** | The real-process run (§11.5) used Linux and three nodes on one machine over loopback. Nothing about snapshots has been run with the real binaries on Windows, over a real network, with real latency or a firewall, or with the YubiKey share format instead of plain shares |
 | A cluster of mixed versions during an upgrade | Not tried; see §5.13 |
+
 
 ### 11.4 Bugs found by adversarial testing and real runs
 
@@ -1089,6 +1090,23 @@ Two findings from building it, neither a mutation result: a hang in my own HTTP 
 13. **A test that listed permissions by hand silently skipped a new one**: `each_role_gets_exactly_its_permissions` iterated a fixed array of permissions, so adding `Observe` would not have been checked by it at all. It was found while adding the monitor role, before it mattered; the array now includes `Observe`, and a mutation that lets readers observe is caught by three tests. Worth remembering for the next permission.
 
 ---
+
+### 11.5 A real-process run of snapshots (phase 20b, step 4)
+
+Everything about snapshots had been verified in-process. This run used the real `sentinel-node` and `sentinel-cli` binaries as three separate processes with real certificates from `sentinel-cli pki`, real mTLS, real sled storage and real files, driven with `curl` and `sentinel-cli submit-share`. It ran on Linux, on one machine over loopback, with `snapshot_threshold = 10` so a few dozen writes cross it, plain-format shares (development only), and the anomaly detector's burst floor raised so that the verification reads could not trip an auto-seal.
+
+| What was done | What was observed |
+|---|---|
+| Started three nodes and read the start-up log | `snapshots on: ... threshold 10, tail 1`: the `main.rs` wiring, which no unit test covers, is live. (With `RUST_LOG` unset the node prints errors only, so that line is invisible by default.) |
+| Wrote 25 secrets through the leader | All 25 acknowledged. Every node took snapshots on its own (index 20 at applied 26); the leader's WAL was 1 KB next to a 2.6 KB snapshot file |
+| `kill -9` a follower; wrote 40 more and deleted two while it was down; restarted it | The survivors trimmed to index 60 while it was away. After the restart it caught up in about a second by snapshot (`installed=1`; the leader reported `sent=1`), came back sealed (503) as designed, served the right values after unsealing, and the two deleted keys were 404. Its audit log recorded `state restored from a snapshot at log index 60 (this node had applied up to 26)` and its hash chain verified |
+| Paused a follower (`SIGSTOP`) while it was unsealed; asked the leader, as a peer, to seal the whole cluster; re-unsealed the others; wrote 40 more so their logs were trimmed past the seal; resumed it | It caught up by snapshot (index 104) and **became sealed** (503) although it had never seen the seal command. Its audit log: `vault SEALED: the snapshot installed here covers a cluster-wide seal (log index 74) that this node had not applied`. This is the seal-through-snapshot case that had only been tested in-process |
+| An 80-second chaos run: a writer recording every acknowledged write, while nodes were killed with `kill -9` and restarted (re-unsealed each time) or paused for 3 s, 9 kills and 6 pauses, leadership term rising to 54 | 1,287 writes acknowledged. The cluster stayed available throughout except while no unsealed leader existed |
+| The sandbox VM was snapshotted and restored after the chaos run, killing every process at once (the environment's doing, not an experiment of mine); all three nodes were restarted cold from their data directories | Identical raft directories (1 KB WAL, 191 KB snapshot), a leader elected, applied index 1423 on all three (the value seen before the restore). **Every one of the 1,287 acknowledged writes was present on all three nodes with the right value**; the three key sets were identical (1,390 keys, the exact expected number); no applied-but-unacknowledged chaos writes. All three audit hash chains verified. At least eight snapshot restores are recorded across the audit logs |
+
+A mistake in the harness, for the record: one step used a stale leader address, so a seal request and 40 writes were refused with 421 "not the leader" and changed nothing; they were redone against the real leader. That was the script's fault, not the node's.
+
+What this run does **not** show: Windows; several hosts or a real network; a realistic threshold or state size (values were tiny); a mixed-version cluster; the YubiKey share path; sustained load; recovery from a *torn* write (the cold restart followed a sandbox-level stop, not a crash at a chosen instruction, and what the disk held at that instant is not known). The pauses and kills show that a stopped or killed node recovers, not that every crash point is safe; the crash points of compaction itself are covered by the persistence and simulator tests (§11.2).
 
 ## 12. Security Model
 
@@ -1158,7 +1176,7 @@ The original list of problems in this project (functional gaps, security finding
 ### 13.2 Remaining
 
 1. **The YubiKey path is unverified and probably wrong.** `sentinel-hardware` calls PIV `decrypt_data` with an **ECC P-256** key. On a PIV card, ECC keys perform ECDH key agreement; they do not decrypt. The author has no device to confirm. Fixing it needs a device and a design decision (an RSA slot, or ECDH with a hybrid scheme). Until then use passphrase-protected shares from `init`; they are a weaker second factor than hardware.
-2. **Snapshots have only been exercised in-process.** The node trims its Raft log (`snapshot_threshold`, default 1000) and catches far-behind followers up by snapshot, verified in the simulator, with real storage and a real HTTP transport on a local socket, but not yet between real processes over mTLS. Snapshots travel in one message, so state over 64 MiB cannot be snapshotted (chunked transfer is not built), and an upgrade needs every node on the new version (§5.13).
+2. **Snapshots are verified in-process and on one Linux host, not beyond.** The node trims its Raft log (`snapshot_threshold`, default 1000) and catches far-behind followers up by snapshot; this was verified in the simulator, in-process, and with three real `sentinel-node` processes over mTLS (§11.5), but only with a tiny threshold (10), small values, loopback networking and plain-format shares. Snapshots travel in one message, so state over 64 MiB cannot be snapshotted (chunked transfer is not built), and an upgrade needs every node on the new version (§5.13).
 3. **No dynamic membership.** The peer set is static; no joint consensus.
 4. **Per-node audit logs.** Each node records what it saw; they are not merged or replicated. Tail truncation is detectable only against an externally recorded tip.
 5. **Reads are not linearizable.** They are served from the node's own storage, so a lagging follower can return an older value.
@@ -1184,7 +1202,8 @@ The original list of problems in this project (functional gaps, security finding
 - [x] Durable snapshot file and crash-safe WAL trimming in the Raft store (phase 20b, step 1).
 - [x] The Raft actor driving snapshots: compaction on request, `InstallSnapshot` to far-behind followers, durable-before-reply installs (phase 20b, step 2).
 - [x] Snapshots in the node: `InstallSnapshot` route and `HttpTransport` method, state machine producing and restoring images (carrying cluster-wide seals), `snapshot_threshold`, metrics (phase 20b, step 3).
-- [ ] A real multi-node run with the real binaries that kills nodes around a snapshot (phase 20b, step 4).
+- [x] A real multi-node run with the real binaries that kills nodes around a snapshot (phase 20b, step 4; §11.5).
+- [ ] The same run on Windows and across hosts, with a realistic threshold and larger state.
 - [ ] Linearizable reads (read-index or lease reads) as an option.
 - [ ] Replicate or merge audit logs; periodic external tip anchoring.
 - [ ] Dynamic membership (joint consensus).
