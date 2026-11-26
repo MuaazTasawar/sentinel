@@ -66,7 +66,7 @@ It is also a **learning artifact**: the code is heavily commented with the *why*
 
 ## 2. Project Status — What Works Today
 
-Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (423 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
+Everything below is implemented, tested, and — for the cluster behaviour — exercised against real `sentinel-node` binaries over real mTLS. Test counts come from `cargo test --workspace` (426 tests, 0 failures, 0 clippy warnings), run on Linux in CI and on the author's Windows machine.
 
 | Layer | Status | Evidence |
 |---|:-:|---|
@@ -94,7 +94,7 @@ Everything below is implemented, tested, and — for the cluster behaviour — e
 | **Raft log compaction and snapshots, library level** (log base offset, local compaction, `InstallSnapshot` decisions, crash-safe reconciliation of a log with its snapshot) | ✅ in `sentinel-consensus`, **not yet in the node** | 35 new unit tests; 6 simulator scenarios and 200 random fault schedules with crashes mid-compaction and mid-install; 12 mutation checks (§11.2) |
 | **Durable snapshots and WAL trimming in the Raft store** (snapshot file, atomic trimmed WAL, crash-safe load) | ✅ in `sentinel-consensus` (`FileStore`, `MemoryStore`) | 18 new unit tests including a restart from every crash point of a compaction; 25 mutation checks (§11.2) |
 | **The Raft actor driving snapshots** (compaction on request, `InstallSnapshot` to far-behind followers, durable-before-reply installs, redelivery after a restart) | ✅ in `sentinel-consensus`, **not yet used by the node** | 16 new actor tests including a 3-node catch-up; 33 mutation checks (§11.2) |
-| **Snapshots in the running node** (the state machine takes and restores images, the `InstallSnapshot` HTTP route and `HttpTransport` method, `snapshot_threshold`, metrics) | ✅ in `sentinel-node`, verified in-process **and** on real processes over mTLS (Linux, one host; §11.5) | 24 new node tests including a 3-node catch-up that also carries a missed cluster-wide seal; 28 mutation checks (§11.2); a real 3-node run with kills, pauses and a cold restart (§11.5). **Not run on Windows or across hosts** |
+| **Snapshots in the running node** (the state machine takes and restores images, the `InstallSnapshot` HTTP route and `HttpTransport` method, `snapshot_threshold`, metrics) | ✅ in `sentinel-node`, verified in-process **and** on real processes over mTLS (Linux, §11.5; Windows, §11.6; one host each) | 24 new node tests including a 3-node catch-up that also carries a missed cluster-wide seal; 28 mutation checks (§11.2); a real 3-node run with kills, pauses and a cold restart (§11.5), and the same scenarios as a script on Linux and on Windows (§11.6). **Not run across several hosts or a real network** |
 | Dynamic membership | ❌ | Not implemented |
 
 > **Bottom line:** you can provision a vault, run a 3-node mTLS cluster, unseal every node with a quorum of passphrase-protected shares, write secrets that are only acknowledged once a majority holds them, kill every node with `kill -9`, restart, and find the data, the audit chain and the cluster intact. What is *not* proven: the hardware-key path, and anything beyond a handful of nodes on a single machine. See [§13](#13-known-limitations--findings) for the full, honest list.
@@ -704,7 +704,7 @@ Without compaction the Raft log grows with every write and a node that was offli
 - **On the wire.** `POST /raft/install-snapshot` takes a bincode body, with its own body limit and its own 120-second upload allowance (the shared client gives a request 5 seconds). The reply means "durable on this node's Raft disk and handed to the state machine", not "restored": the state machine installs it a moment later.
 - **Metrics.** `sentinel_raft_snapshot_index` (gauge) and `sentinel_raft_snapshots_{taken,installed,sent}_total`, numbers only like the others.
 
-**What does not exist yet, or is not verified:** chunked transfer for state larger than one message (so a vault whose encrypted secrets exceed 64 MiB cannot be snapshotted); a real-process run on Windows or across several hosts (the real-process run in §11.5 was Linux, one host); and a mixed-version cluster: an old node has no `/raft/install-snapshot` route, so a new leader's snapshot to it would fail and be retried once a second. Upgrade every node before relying on snapshots, or set `snapshot_threshold = 0` meanwhile. Snapshots are **on by default**, a behaviour change for existing deployments.
+**What does not exist yet, or is not verified:** chunked transfer for state larger than one message (so a vault whose encrypted secrets exceed 64 MiB cannot be snapshotted); a real-process run across several hosts or a real network (the runs in §11.5 and §11.6 were on one machine over loopback, on Linux and on Windows); and a mixed-version cluster: an old node has no `/raft/install-snapshot` route, so a new leader's snapshot to it would fail and be retried once a second. Upgrade every node before relying on snapshots, or set `snapshot_threshold = 0` meanwhile. Snapshots are **on by default**, a behaviour change for existing deployments.
 
 ---
 
@@ -1069,7 +1069,7 @@ Two findings from building it, neither a mutation result: a hang in my own HTTP 
 | macOS | The **non-blocking** CI job built and tested phase 20a green, checked step by step on the pull request (not just the overall tick). It has been seen on one change only, and nobody has run the node on a Mac |
 | Real power loss and the fsync-before-rename ordering of snapshot and WAL replacement | The crash tests copy the data directory between the steps; they cannot cut power or reorder disk writes. The ordering is correct by construction (and was reviewed), but not something a test here can prove |
 | The weekly 10-minute `fuzz-long` workflow | Has never run |
-| Snapshots between real `sentinel-node` processes on **Windows**, or across **several hosts** | The real-process run (§11.5) used Linux and three nodes on one machine over loopback. Nothing about snapshots has been run with the real binaries on Windows, over a real network, with real latency or a firewall, or with the YubiKey share format instead of plain shares |
+| Snapshots between real `sentinel-node` processes across **several hosts** | The real-process runs (§11.5 on Linux, §11.6 on Windows) used three nodes on one machine over loopback. Nothing about snapshots has been run with the real binaries over a real network, with real latency or a firewall, or with the YubiKey share format instead of plain shares |
 | A cluster of mixed versions during an upgrade | Not tried; see §5.13 |
 
 
@@ -1106,7 +1106,24 @@ Everything about snapshots had been verified in-process. This run used the real 
 
 A mistake in the harness, for the record: one step used a stale leader address, so a seal request and 40 writes were refused with 421 "not the leader" and changed nothing; they were redone against the real leader. That was the script's fault, not the node's.
 
-What this run does **not** show: Windows; several hosts or a real network; a realistic threshold or state size (values were tiny); a mixed-version cluster; the YubiKey share path; sustained load; recovery from a *torn* write (the cold restart followed a sandbox-level stop, not a crash at a chosen instruction, and what the disk held at that instant is not known). The pauses and kills show that a stopped or killed node recovers, not that every crash point is safe; the crash points of compaction itself are covered by the persistence and simulator tests (§11.2).
+What this run does **not** show: Windows (§11.6 is a Windows run); several hosts or a real network; a realistic threshold or state size (values were tiny); a mixed-version cluster; the YubiKey share path; sustained load; recovery from a *torn* write (the cold restart followed a sandbox-level stop, not a crash at a chosen instruction, and what the disk held at that instant is not known). The pauses and kills show that a stopped or killed node recovers, not that every crash point is safe; the crash points of compaction itself are covered by the persistence and simulator tests (§11.2).
+
+
+### 11.6 The real-process scenarios as a script (phase 21a)
+
+`scripts/cluster-test.ps1` repeats the real-process runs of 11.5 as one script, so they can be run again on any machine, Windows included. It starts three real `sentinel-node` processes on loopback with real certificates, drives them with real client certificates, and runs four scenarios: `smoke` (start-up log, nodes start sealed, unseal, write / read / list / delete, a reader certificate cannot write), `restart` (`kill -9` a follower, write past a snapshot, restart it: caught up by snapshot, comes back sealed, right values, audit entry), `pause` (suspend an unsealed follower, seal the cluster, trim the log past the seal, resume: the node must seal itself from the snapshot) and `chaos` (a timed run of writes with random kills and pauses, then a cold restart of all three nodes and a check that every acknowledged write is on every node with the right value, that the key sets are identical, and that the audit chains verify). Everything is checked by the script and the exit code is 0 only if every check passed.
+
+Run it from the repo root after `cargo build -p sentinel-node -p sentinel-cli`:
+
+```
+powershell -ExecutionPolicy Bypass -File .\scripts\cluster-test.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\cluster-test.ps1 -Scenario restart
+powershell -ExecutionPolicy Bypass -File .\scripts\cluster-test.ps1 -Scenario chaos -ChaosSeconds 120
+```
+
+Windows PowerShell cannot load the PEM keys that `sentinel-cli pki` writes, and the `curl.exe` builds that ship with Windows and with Git for Windows use Schannel, which cannot take separate PEM files either. The script therefore converts each client certificate to a `.pfx` with an `openssl.exe` (the one in Git for Windows is found automatically, or pass `-OpenSsl`) and makes its HTTPS calls through a small embedded C# helper that presents that certificate and accepts only server certificates that chain to the test CA. It uses `NtSuspendProcess` on Windows and `kill -STOP` on Linux to pause a node. All data goes into a fresh `run-<time>` folder (under the temp directory unless `-WorkDir` is given) which the script never deletes.
+
+What has been verified: all scenarios pass against the real binaries on two platforms. On Linux with PowerShell 7 the full run was 44 of 44 checks. On Windows 10 (build 19045) with Windows PowerShell 5.1.19041, three nodes on one machine over loopback, each scenario passed when run on its own (smoke 14, restart 15, pause 16, chaos 11 checks) and then the default run of all four passed 44 of 44. The two Windows chaos runs acknowledged 1,371 of 1,384 writes through 5 kills and 5 pauses (leadership term 33) and 947 of 973 through 2 kills and 7 pauses (term 47). After the cold restart of all three nodes every acknowledged write was present with the right value on all three, the key sets were identical, and all three audit chains verified. That covers PFX loading and client-certificate TLS in Windows PowerShell 5.1, `openssl.exe` from Git for Windows, `Stop-Process -Force` as the kill, process suspension through `NtSuspendProcess`, and Windows paths in the node configuration. The script itself was sabotage-tested on Linux: with snapshots switched off, exactly the four snapshot checks failed; with a node binary in which the seal-from-snapshot code was removed, the pause scenario failed. That second test found a weak check in the first version of the script (it treated `/readyz` returning 503 as "sealed", but 503 also means an unwritable audit log or an unresponsive Raft actor), so every sealed/unsealed claim now reads the `sentinel_sealed` metric. What has **not** been verified: several hosts or a real network, a realistic threshold or state size, a mixed-version cluster, the YubiKey share path, sustained load, a crash at a chosen instruction, and any Windows or PowerShell version other than the one named. The script does not check the server's host name (it is a loopback harness), injects one fault at a time, and writes from a single sequential writer. Only acknowledged writes are checked: a write that was not acknowledged may or may not have been applied, which is why a node can hold more keys than were acknowledged.
 
 ## 12. Security Model
 
@@ -1203,7 +1220,7 @@ The original list of problems in this project (functional gaps, security finding
 - [x] The Raft actor driving snapshots: compaction on request, `InstallSnapshot` to far-behind followers, durable-before-reply installs (phase 20b, step 2).
 - [x] Snapshots in the node: `InstallSnapshot` route and `HttpTransport` method, state machine producing and restoring images (carrying cluster-wide seals), `snapshot_threshold`, metrics (phase 20b, step 3).
 - [x] A real multi-node run with the real binaries that kills nodes around a snapshot (phase 20b, step 4; §11.5).
-- [ ] The same run on Windows and across hosts, with a realistic threshold and larger state.
+- [ ] The same run across hosts, with a realistic threshold and larger state. (Windows on one machine is done: §11.6.)
 - [ ] Linearizable reads (read-index or lease reads) as an option.
 - [ ] Replicate or merge audit logs; periodic external tip anchoring.
 - [ ] Dynamic membership (joint consensus).
@@ -1229,6 +1246,8 @@ sentinel/
 │   └── scheduled.yml             # weekly: 10-minute-per-target fuzzing
 ├── .cargo/audit.toml             # advisories accepted on purpose, each with its reason
 ├── README.md
+├── scripts/
+│   └── cluster-test.ps1          # real-process cluster scenarios; Windows PowerShell 5.1 and PowerShell 7 (§11.6)
 └── crates/
     ├── crypto/       src/{envelope,shamir,kdf,canary,secret}.rs   tests/ (property)   fuzz/ (own workspace)
     ├── storage/      src/{lib,sled_backend}.rs
