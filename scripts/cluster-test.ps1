@@ -213,6 +213,9 @@ function Invoke-Native([string]$Exe, [string[]]$ArgList, $Stdin = $null, [string
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardInput = ($null -ne $Stdin)
+    # Nothing we send may start with a byte-order mark (the share must be bare hex). PowerShell 7 / .NET Core has this property;
+    # Windows PowerShell 5.1 does not, and uses Console.InputEncoding instead (set once at start-up, see the main block).
+    if ($null -ne $Stdin) { try { $psi.StandardInputEncoding = (New-Object System.Text.UTF8Encoding($false)) } catch { } }
     if ($Cwd -ne '') { $psi.WorkingDirectory = $Cwd }
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
@@ -840,6 +843,13 @@ try {
         Log ('console input encoding: {0} (code page {1}, {2} preamble bytes); output encoding: {3}' -f [Console]::InputEncoding.WebName, [Console]::InputEncoding.CodePage, [Console]::InputEncoding.GetPreamble().Length, [Console]::OutputEncoding.WebName)
     }
     catch { Log ('console encoding: not readable (' + $_.Exception.Message + ')') }
+    # First CI run on windows-latest: Windows PowerShell 5.1 reported a UTF-8 console input encoding WITH a 3-byte preamble, and the node rejected
+    # the share ("must be the hex encoding"). 5.1 writes a child's redirected stdin through that encoding, so use one without a preamble.
+    try {
+        [Console]::InputEncoding = (New-Object System.Text.UTF8Encoding($false))
+        Log ('console input encoding set to UTF-8 without a byte-order mark: now {0} preamble bytes' -f [Console]::InputEncoding.GetPreamble().Length)
+    }
+    catch { Log ('could not change the console input encoding (' + $_.Exception.Message + ')') }
     Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
     $plan = @($Scenario)
     if ($Scenario -eq 'all') { $plan = @('smoke', 'restart', 'pause', 'chaos') }
