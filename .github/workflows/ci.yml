@@ -104,6 +104,71 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libpcsclite-dev
       - run: cargo check --workspace --all-targets --locked
 
+  # NOT a gate (continue-on-error). Runs scripts/cluster-test.ps1 (three REAL
+  # sentinel-node processes, real mTLS, kills and pauses; README 11.6) on a
+  # GitHub-hosted Windows machine, once under Windows PowerShell 5.1 (the version
+  # the author verified by hand) and once under PowerShell 7. A pass is a second,
+  # independent Windows machine agreeing; a failure is a lead, not a verdict: it may
+  # be the runner (openssl path, ports, load) rather than the product. Check the
+  # STEPS, not only the overall tick, because continue-on-error hides a red step.
+  # The chaos scenario uses a random fault schedule; its seed is in the step log
+  # (rerun with -Seed <n> to replay it). Logs are uploaded as an artifact.
+  cluster-windows:
+    name: real 3-node cluster scenarios (windows-latest, non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the server and the CLI
+        id: build
+        run: cargo build -p sentinel-node -p sentinel-cli
+
+      # Information only: what this runner actually has.
+      - name: Tools on this runner
+        shell: pwsh
+        run: |
+          Write-Host ("pwsh " + $PSVersionTable.PSVersion)
+          $ps51 = Get-Command powershell.exe -ErrorAction SilentlyContinue
+          if ($ps51) { & powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.ToString()' } else { Write-Host "powershell.exe not found" }
+          $ossl = Join-Path $env:ProgramFiles "Git\usr\bin\openssl.exe"
+          if (Test-Path -LiteralPath $ossl) { & $ossl version } else { Write-Host "Git's openssl.exe not found at $ossl" }
+          Write-Host ("os " + [Environment]::OSVersion.VersionString)
+
+      - name: Scenarios under Windows PowerShell 5.1
+        id: ps51
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\cluster-test.ps1 -WorkDir "$PWD\cluster-out\ps51" -BasePort 18441
+          exit $LASTEXITCODE
+
+      # Runs even if the 5.1 step failed, so both results are always visible.
+      # Another port range, so a node left over from the first run cannot interfere.
+      - name: Scenarios under PowerShell 7
+        id: ps7
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\cluster-test.ps1 -WorkDir "$PWD\cluster-out\ps7" -BasePort 18541
+          exit $LASTEXITCODE
+
+      # Only the text logs (harness and node output, audit logs); not the throw-away
+      # test keys or the sled data.
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-test-logs-windows
+          path: |
+            cluster-out/**/*.log
+            cluster-out/**/*.audit.jsonl
+          retention-days: 14
+          if-no-files-found: ignore
+
   clippy:
     name: clippy (warnings are errors)
     runs-on: ubuntu-latest

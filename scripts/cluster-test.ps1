@@ -639,7 +639,17 @@ function Scenario-Restart {
     Check 'it catches up while sealed' $caught
     $installedAfter = Get-Metric $f 'sentinel_raft_snapshots_installed_total'
     Check 'it was caught up by a snapshot (installed counter went up)' (($null -ne $installedAfter) -and ($installedAfter -ge 1)) "installed $installedBefore -> $installedAfter"
-    Check 'the leader reports having sent a snapshot' (((Get-Metric $leader 'sentinel_raft_snapshots_sent_total') -ge 1))
+    # Leadership can change while the follower is down (seen in repeated runs on a loaded one-core machine),
+    # so the node that sent the snapshot is whichever one led when the follower caught up: ask all of them.
+    $sentTotal = 0
+    $sentBy = @()
+    foreach ($i in 1..3) {
+        $v = Get-Metric $i 'sentinel_raft_snapshots_sent_total'
+        if ($null -eq $v) { $v = 0 }
+        $sentTotal += $v
+        $sentBy += "node $i sent $v"
+    }
+    Check 'a surviving node reports having sent a snapshot' ($sentTotal -ge 1) ($sentBy -join ', ')
     Check 'it can be unsealed again' (Unseal-Node $f)
     $t = Test-NodeHasKeys $f $exp $absent
     Check 'the restarted node serves every right value and 404 for the deleted keys' $t.Ok $t.Sample
