@@ -213,6 +213,9 @@ function Invoke-Native([string]$Exe, [string[]]$ArgList, $Stdin = $null, [string
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardInput = ($null -ne $Stdin)
+    # Nothing we send may start with a byte-order mark (the share must be bare hex). PowerShell 7 / .NET Core has this property;
+    # Windows PowerShell 5.1 does not, and uses Console.InputEncoding instead (set once at start-up, see the main block).
+    if ($null -ne $Stdin) { try { $psi.StandardInputEncoding = (New-Object System.Text.UTF8Encoding($false)) } catch { } }
     if ($Cwd -ne '') { $psi.WorkingDirectory = $Cwd }
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
@@ -519,9 +522,24 @@ function Unseal-Node([int]$i) {
         $r = Invoke-Native $script:Cli @('submit-share', '--node', "https://127.0.0.1:$port",
             '--cert', (P $script:PkiDir 'alice-admin.crt'), '--key', (P $script:PkiDir 'alice-admin.key'),
             '--ca', (P $script:PkiDir 'ca.crt'), '--holder', $holder) $share
-        if ($r.Code -ne 0) { return $false }
+        if ($r.Code -ne 0) {
+            # Say WHY (the first CI run on Windows PowerShell 5.1 failed here without a reason). The share itself is never logged.
+            $c0 = -1
+            if ($share.Length -gt 0) { $c0 = [int][char]$share[0] }
+            $so = ([string]$r.Out).Trim()
+            $se = ([string]$r.Err).Trim()
+            if ($share.Trim().Length -gt 0) { $so = $so.Replace($share.Trim(), '<share>'); $se = $se.Replace($share.Trim(), '<share>') }
+            if ($so.Length -gt 400) { $so = $so.Substring(0, 400) + '...' }
+            if ($se.Length -gt 400) { $se = $se.Substring(0, 400) + '...' }
+            Log ("unseal node {0}: submit-share for '{1}' failed, exit code {2}; stderr: [{3}]; stdout: [{4}]; share file is {5} characters, first character code {6}" -f $i, $holder, $r.Code, $se, $so, $share.Length, $c0)
+            return $false
+        }
     }
-    return (Wait-Until { (Get-Ready $i) -eq 200 } 10)
+    $ready = Wait-Until { (Get-Ready $i) -eq 200 } 10
+    if (-not $ready) {
+        Log ("unseal node {0}: both shares were accepted but /readyz did not become 200 within 10 s (now {1}; {2})" -f $i, (Get-Ready $i), (Get-ReadyDetail $i))
+    }
+    return $ready
 }
 
 function Test-AuditChain([int]$i) {
@@ -639,7 +657,17 @@ function Scenario-Restart {
     Check 'it catches up while sealed' $caught
     $installedAfter = Get-Metric $f 'sentinel_raft_snapshots_installed_total'
     Check 'it was caught up by a snapshot (installed counter went up)' (($null -ne $installedAfter) -and ($installedAfter -ge 1)) "installed $installedBefore -> $installedAfter"
-    Check 'the leader reports having sent a snapshot' (((Get-Metric $leader 'sentinel_raft_snapshots_sent_total') -ge 1))
+    # Leadership can change while the follower is down (seen in repeated runs on a loaded one-core machine),
+    # so the node that sent the snapshot is whichever one led when the follower caught up: ask all of them.
+    $sentTotal = 0
+    $sentBy = @()
+    foreach ($i in 1..3) {
+        $v = Get-Metric $i 'sentinel_raft_snapshots_sent_total'
+        if ($null -eq $v) { $v = 0 }
+        $sentTotal += $v
+        $sentBy += "node $i sent $v"
+    }
+    Check 'a surviving node reports having sent a snapshot' ($sentTotal -ge 1) ($sentBy -join ', ')
     Check 'it can be unsealed again' (Unseal-Node $f)
     $t = Test-NodeHasKeys $f $exp $absent
     Check 'the restarted node serves every right value and 404 for the deleted keys' $t.Ok $t.Sample
@@ -811,6 +839,17 @@ try {
     foreach ($f in @($script:NodeExe, $script:Cli)) {
         Log ('  {0}  sha256 {1}' -f (Split-Path -Leaf $f), (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.Substring(0, 12).ToLower())
     }
+    try {
+        Log ('console input encoding: {0} (code page {1}, {2} preamble bytes); output encoding: {3}' -f [Console]::InputEncoding.WebName, [Console]::InputEncoding.CodePage, [Console]::InputEncoding.GetPreamble().Length, [Console]::OutputEncoding.WebName)
+    }
+    catch { Log ('console encoding: not readable (' + $_.Exception.Message + ')') }
+    # First CI run on windows-latest: Windows PowerShell 5.1 reported a UTF-8 console input encoding WITH a 3-byte preamble, and the node rejected
+    # the share ("must be the hex encoding"). 5.1 writes a child's redirected stdin through that encoding, so use one without a preamble.
+    try {
+        [Console]::InputEncoding = (New-Object System.Text.UTF8Encoding($false))
+        Log ('console input encoding set to UTF-8 without a byte-order mark: now {0} preamble bytes' -f [Console]::InputEncoding.GetPreamble().Length)
+    }
+    catch { Log ('could not change the console input encoding (' + $_.Exception.Message + ')') }
     Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
     $plan = @($Scenario)
     if ($Scenario -eq 'all') { $plan = @('smoke', 'restart', 'pause', 'chaos') }
