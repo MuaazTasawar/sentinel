@@ -519,9 +519,24 @@ function Unseal-Node([int]$i) {
         $r = Invoke-Native $script:Cli @('submit-share', '--node', "https://127.0.0.1:$port",
             '--cert', (P $script:PkiDir 'alice-admin.crt'), '--key', (P $script:PkiDir 'alice-admin.key'),
             '--ca', (P $script:PkiDir 'ca.crt'), '--holder', $holder) $share
-        if ($r.Code -ne 0) { return $false }
+        if ($r.Code -ne 0) {
+            # Say WHY (the first CI run on Windows PowerShell 5.1 failed here without a reason). The share itself is never logged.
+            $c0 = -1
+            if ($share.Length -gt 0) { $c0 = [int][char]$share[0] }
+            $so = ([string]$r.Out).Trim()
+            $se = ([string]$r.Err).Trim()
+            if ($share.Trim().Length -gt 0) { $so = $so.Replace($share.Trim(), '<share>'); $se = $se.Replace($share.Trim(), '<share>') }
+            if ($so.Length -gt 400) { $so = $so.Substring(0, 400) + '...' }
+            if ($se.Length -gt 400) { $se = $se.Substring(0, 400) + '...' }
+            Log ("unseal node {0}: submit-share for '{1}' failed, exit code {2}; stderr: [{3}]; stdout: [{4}]; share file is {5} characters, first character code {6}" -f $i, $holder, $r.Code, $se, $so, $share.Length, $c0)
+            return $false
+        }
     }
-    return (Wait-Until { (Get-Ready $i) -eq 200 } 10)
+    $ready = Wait-Until { (Get-Ready $i) -eq 200 } 10
+    if (-not $ready) {
+        Log ("unseal node {0}: both shares were accepted but /readyz did not become 200 within 10 s (now {1}; {2})" -f $i, (Get-Ready $i), (Get-ReadyDetail $i))
+    }
+    return $ready
 }
 
 function Test-AuditChain([int]$i) {
@@ -821,6 +836,10 @@ try {
     foreach ($f in @($script:NodeExe, $script:Cli)) {
         Log ('  {0}  sha256 {1}' -f (Split-Path -Leaf $f), (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.Substring(0, 12).ToLower())
     }
+    try {
+        Log ('console input encoding: {0} (code page {1}, {2} preamble bytes); output encoding: {3}' -f [Console]::InputEncoding.WebName, [Console]::InputEncoding.CodePage, [Console]::InputEncoding.GetPreamble().Length, [Console]::OutputEncoding.WebName)
+    }
+    catch { Log ('console encoding: not readable (' + $_.Exception.Message + ')') }
     Remove-Item Env:RUST_LOG -ErrorAction SilentlyContinue
     $plan = @($Scenario)
     if ($Scenario -eq 'all') { $plan = @('smoke', 'restart', 'pause', 'chaos') }
